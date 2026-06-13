@@ -25,8 +25,16 @@ class AgentCrashError(RuntimeError):
     """Raised when an agent process exits with a non-zero code.
 
     The orchestrator catches this to treat a crashed agent as a failed phase
-    rather than letting the raw subprocess failure escape.
+    rather than letting the raw subprocess failure escape. The ``phase`` and
+    ``exit_code`` are exposed as attributes so a caller can branch on them
+    (retry, skip, escalate) without parsing the message string.
     """
+
+    def __init__(self, message: str, *, phase: str, exit_code: int) -> None:
+        """Record the failing phase and the process exit code."""
+        super().__init__(message)
+        self.phase = phase
+        self.exit_code = exit_code
 
 
 @runtime_checkable
@@ -153,7 +161,9 @@ class ClaudeRuntime:
                 stderr_text[:500],
             )
             raise AgentCrashError(
-                f"claude crashed during {phase} (exit code {proc.returncode})"
+                f"claude crashed during {phase} (exit code {proc.returncode})",
+                phase=phase,
+                exit_code=proc.returncode,
             )
 
         output = "".join(output_buf) if output_buf else result_text

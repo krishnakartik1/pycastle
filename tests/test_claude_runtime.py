@@ -209,8 +209,12 @@ def test_result_event_is_error_raises_crash(
     ]
     mock_popen.return_value = _fake_proc(events, returncode=0)
 
-    with pytest.raises(AgentCrashError):
+    with pytest.raises(AgentCrashError) as exc_info:
         ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    # A result event flagged is_error is a crash even on a zero process exit.
+    assert exc_info.value.phase == "implement"
+    assert exc_info.value.exit_code == 0
 
 
 def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> None:
@@ -218,8 +222,128 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
     proc.stderr = io.StringIO("boom")
     mock_popen.return_value = proc
 
-    with pytest.raises(AgentCrashError):
+    with pytest.raises(AgentCrashError) as exc_info:
         ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    # The crash carries the failing phase and the process exit code so a caller
+    # can branch on them without parsing the message string.
+    assert exc_info.value.phase == "implement"
+    assert exc_info.value.exit_code == 1
+
+
+def test_nonzero_exit_reads_stderr_for_logging(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # stderr is read after the stdout loop drains; confirm it still surfaces in
+    # the crash log even though stdout closed first.
+    proc = _fake_proc([], returncode=2)
+    proc.stderr = io.StringIO("permission denied\n")
+    mock_popen.return_value = proc
+
+    with caplog.at_level("ERROR", logger="pycastle.runtime"):
+        with pytest.raises(AgentCrashError):
+            ClaudeRuntime().run("p", cwd=tmp_path, phase="review")
+
+    assert "permission denied" in caplog.text
+    proc.wait.assert_called_once()
+
+
+def test_empty_stream_with_clean_exit_does_not_crash(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # No events at all and a zero exit: telemetry degrades to a bare record and
+    # the output is empty rather than raising.
+    mock_popen.return_value = _fake_proc([], returncode=0)
+
+    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="plan")
+
+    assert result.output == ""
+    assert result.telemetry.runtime == "claude"
+    assert result.telemetry.phase == "plan"
+    assert result.telemetry.cost_usd is None
+    assert result.telemetry.num_turns is None
+    assert result.telemetry.usage is None
+    assert result.telemetry.is_error is False
+
+
+def test_assistant_text_without_result_event_degrades_gracefully(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Assistant text streamed but the run ended without a final result event:
+    # keep the text, return bare telemetry, do not crash.
+    events = [
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial work"}]},
+        }
+    ]
+    mock_popen.return_value = _fake_proc(events, returncode=0)
+
+    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "partial work"
+    assert result.telemetry.cost_usd is None
+    assert result.telemetry.duration_ms is None
+    assert result.telemetry.num_turns is None
+    assert result.telemetry.usage is None
+
+
+def test_multiple_assistant_events_concatenate_in_order(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Text blocks from several assistant events are joined in stream order,
+    # including multiple text blocks within a single event.
+    events = [
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "first "}]},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "second "},
+                    {"type": "text", "text": "third "},
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "fourth"}]},
+        },
+        {"type": "result", "result": "ignored", "is_error": False, "num_turns": 2},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "first second third fourth"
+
+
+@pytest.mark.parametrize("usage_value", [None, "not-a-dict", 42, ["a", "b"]])
+def test_result_event_with_non_dict_usage_does_not_throw(
+    mock_popen: MagicMock, tmp_path: Path, usage_value: object
+) -> None:
+    # A result event whose usage is missing, null, or not a mapping must parse
+    # into telemetry with usage=None rather than raising.
+    events = [
+        {
+            "type": "result",
+            "result": "done",
+            "total_cost_usd": 0.02,
+            "duration_ms": 20,
+            "num_turns": 1,
+            "is_error": False,
+            "usage": usage_value,
+        }
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.telemetry.usage is None
+    assert result.telemetry.cost_usd == 0.02
+    assert result.telemetry.num_turns == 1
 
 
 def test_run_works_one_issue_end_to_end_via_claude(
