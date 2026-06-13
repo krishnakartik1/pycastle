@@ -1,0 +1,102 @@
+"""Issue-source selection is pure; the gh boundary is mocked."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from unittest.mock import MagicMock
+
+from pycastle.issues import (
+    GitHubIssueSource,
+    assignee_logins,
+    filter_for_assignee,
+    select_next,
+)
+from pycastle.models import IssueRef
+
+
+def _issue(number: int, assignees: list[str]) -> IssueRef:
+    return IssueRef(number=number, title=f"issue {number}", assignees=assignees)
+
+
+def test_assignee_logins_accepts_raw_and_simplified_shapes() -> None:
+    issue = {"assignees": ["alice", {"login": "bob"}, {"nope": 1}]}
+    assert assignee_logins(issue) == ["alice", "bob"]
+
+
+def test_filter_for_assignee_keeps_only_matching_by_default() -> None:
+    issues = [_issue(1, []), _issue(2, ["krishna"]), _issue(3, ["someone"])]
+    assert [i.number for i in filter_for_assignee(issues, "krishna")] == [2]
+
+
+def test_filter_for_assignee_can_include_unassigned() -> None:
+    issues = [_issue(1, []), _issue(2, ["krishna"]), _issue(3, ["someone"])]
+    kept = filter_for_assignee(issues, "krishna", include_unassigned=True)
+    assert [i.number for i in kept] == [1, 2]
+
+
+def test_select_next_returns_lowest_numbered_eligible() -> None:
+    issues = [_issue(5, ["krishna"]), _issue(3, ["krishna"]), _issue(9, ["other"])]
+    chosen = select_next(issues, assignee="krishna")
+    assert chosen is not None and chosen.number == 3
+
+
+def test_select_next_returns_none_when_nothing_eligible() -> None:
+    issues = [_issue(1, ["other"])]
+    assert select_next(issues, assignee="krishna") is None
+
+
+def test_github_source_parses_list_output() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "do a thing",
+                "body": "details",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "krishna"}],
+            }
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    issues = source.list_ready()
+
+    assert len(issues) == 1
+    assert issues[0].number == 7
+    assert issues[0].labels == ["ready-for-agent"]
+    assert issues[0].assignees == ["krishna"]
+
+
+def test_github_source_handles_empty_output() -> None:
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+    )
+    source = GitHubIssueSource("owner/repo", runner=runner)
+    assert source.list_ready() == []
+
+
+def test_github_source_claim_assigns_and_drops_label() -> None:
+    runner = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    source.claim(42, assignee="krishna")
+
+    runner.assert_called_once_with(
+        [
+            "gh",
+            "issue",
+            "edit",
+            "42",
+            "-R",
+            "owner/repo",
+            "--add-assignee",
+            "krishna",
+            "--remove-label",
+            "ready-for-agent",
+        ],
+        capture=True,
+    )

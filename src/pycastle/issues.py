@@ -1,0 +1,141 @@
+"""The Issue source boundary: where work items come from.
+
+v0.1 ships GitHub Issues via the ``gh`` CLI. The selection and assignee-filter
+logic is pure and lives here, behind the interface, so a different source can
+be added later without touching the runner.
+"""
+
+from __future__ import annotations
+
+import json
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Any
+
+from .commands import run_cmd
+from .models import IssueRef
+
+Runner = Callable[..., Any]
+
+
+def assignee_logins(issue: dict[str, Any]) -> list[str]:
+    """Return assignee logins from gh JSON, accepting raw or simplified shapes."""
+    logins: list[str] = []
+    for assignee in issue.get("assignees") or []:
+        if isinstance(assignee, str):
+            logins.append(assignee)
+        elif isinstance(assignee, dict) and assignee.get("login"):
+            logins.append(str(assignee["login"]))
+    return logins
+
+
+def filter_for_assignee(
+    issues: list[IssueRef],
+    assignee: str,
+    *,
+    include_unassigned: bool = False,
+) -> list[IssueRef]:
+    """Keep issues assigned to ``assignee``, optionally including unassigned ones."""
+    kept: list[IssueRef] = []
+    for issue in issues:
+        if assignee in issue.assignees or (include_unassigned and not issue.assignees):
+            kept.append(issue)
+    return kept
+
+
+def select_next(
+    issues: list[IssueRef],
+    *,
+    assignee: str,
+    include_unassigned: bool = False,
+) -> IssueRef | None:
+    """Return the lowest-numbered eligible issue, or ``None`` if there is none."""
+    eligible = filter_for_assignee(
+        issues, assignee, include_unassigned=include_unassigned
+    )
+    return min(eligible, key=lambda issue: issue.number, default=None)
+
+
+class IssueSource(ABC):
+    """Lists, claims, and labels work items behind a stable interface."""
+
+    @abstractmethod
+    def list_ready(self) -> list[IssueRef]:
+        """Return the open work items ready for an agent."""
+
+    @abstractmethod
+    def claim(self, number: int, *, assignee: str) -> None:
+        """Claim an issue so a second run does not collide on it."""
+
+
+class GitHubIssueSource(IssueSource):
+    """An Issue source backed by GitHub Issues via the ``gh`` CLI."""
+
+    def __init__(
+        self,
+        repo: str,
+        *,
+        label: str = "ready-for-agent",
+        runner: Runner = run_cmd,
+    ) -> None:
+        self.repo = repo
+        self.label = label
+        self._run = runner
+
+    def list_ready(self) -> list[IssueRef]:
+        """Return open issues carrying the ready label."""
+        result = self._run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "open",
+                "--label",
+                self.label,
+                "--limit",
+                "100",
+                "--json",
+                "number,title,body,labels,assignees",
+            ],
+            capture=True,
+        )
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return []
+        issues: list[IssueRef] = []
+        for item in json.loads(raw):
+            labels = [
+                lbl["name"] if isinstance(lbl, dict) else lbl
+                for lbl in item.get("labels", [])
+            ]
+            issues.append(
+                IssueRef(
+                    number=item["number"],
+                    title=item.get("title", ""),
+                    body=item.get("body", ""),
+                    labels=labels,
+                    assignees=assignee_logins(item),
+                )
+            )
+        return issues
+
+    def claim(self, number: int, *, assignee: str) -> None:
+        """Assign the issue and drop the ready label so other runs skip it."""
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                self.repo,
+                "--add-assignee",
+                assignee,
+                "--remove-label",
+                self.label,
+            ],
+            capture=True,
+        )
