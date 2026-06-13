@@ -26,6 +26,42 @@ def test_run_sandbox_defaults_to_host() -> None:
     assert args.sandbox == "host"
 
 
+def test_make_run_id_is_a_timestamp_shape() -> None:
+    # The CLI is where a run id is minted (the orchestrator never reads a clock,
+    # so it stays deterministic in tests). The id is a YYYYMMDD-HHMMSS stamp.
+    run_id = cli._make_run_id()
+    assert len(run_id) == 15
+    date, _, time = run_id.partition("-")
+    assert date.isdigit() and len(date) == 8
+    assert time.isdigit() and len(time) == 6
+
+
+def test_run_passes_a_generated_run_id_to_the_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The orchestrator receives an injected run id from the CLI rather than
+    # generating one itself; here we pin it and assert it is threaded through.
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "20260613-101500")
+
+    captured: dict[str, object] = {}
+
+    def fake_run_loop(*, run_id: str, **_kwargs: object) -> MagicMock:
+        captured["run_id"] = run_id
+        outcome = MagicMock()
+        outcome.issues = []
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--runtime", "stub"]) == 0
+    assert captured["run_id"] == "20260613-101500"
+
+
 def test_parses_run_sandbox_docker() -> None:
     args = build_parser().parse_args(["run", "--sandbox", "docker"])
     assert args.sandbox == "docker"

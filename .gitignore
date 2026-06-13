@@ -18,3 +18,4 @@ venv/
 # PyCastle run output (transient)
 .pycastle/logs/
 .pycastle/runs/
+.pycastle/worktrees/

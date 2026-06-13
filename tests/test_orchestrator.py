@@ -248,6 +248,12 @@ def test_telemetry_and_run_log_are_written_into_the_fixture(
     assert records[0]["phase"] == "implement"
     assert records[0]["num_turns"] == 1
 
+    # Only the telemetry numbers are written: the agent's prose output never
+    # reaches disk, so nothing credential-like leaks into the run directory.
+    raw_telemetry = telemetry_path.read_text()
+    assert "output" not in raw_telemetry
+    assert STUB_MARKER not in raw_telemetry  # the stub's prose mentions the marker
+
     # A human-readable run log is written too.
     log_text = (run_dir / "run.log").read_text()
     assert "Working #2" in log_text
@@ -311,3 +317,45 @@ def test_worktrees_are_cleaned_up_after_the_run(
     assert _calls_containing(runner, "git", "worktree", "prune")
     # The per-issue branch is deleted; the run branch stays (it carries the PR).
     assert _calls_containing(runner, "git", "branch", "-D", "pycastle/issue-2-cleanup")
+
+
+def test_worktrees_are_cleaned_up_even_when_an_issue_is_skipped(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A skipped (conflicting) issue must not leave its worktree behind, and the
+    # run worktree is still torn down once the batch finishes.
+    issues = [
+        IssueRef(number=2, title="Clean", assignees=["krishna"]),
+        IssueRef(number=4, title="Conflicts", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner(merge_fails_for={4})
+
+    orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # Every issue worktree is removed, including the skipped issue's, plus the
+    # run worktree; both per-issue branches are deleted regardless of merge.
+    removed = [
+        call.args[0][3]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "worktree", "remove"]
+    ]
+    assert str(tmp_path / "wt" / "issue-2") in removed
+    assert str(tmp_path / "wt" / "issue-4") in removed
+    assert str(tmp_path / "wt" / "run-20260613-101500") in removed
+    assert _calls_containing(
+        runner, "git", "branch", "-D", "pycastle/issue-4-conflicts"
+    )

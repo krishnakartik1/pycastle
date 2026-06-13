@@ -76,6 +76,27 @@ def test_select_batch_is_empty_for_nonpositive_limit() -> None:
     assert select_batch(issues, assignee="krishna", limit=0) == []
 
 
+def test_select_batch_returns_all_when_limit_equals_eligible() -> None:
+    # The boundary where limit is exactly the eligible count: take all, in order,
+    # with no off-by-one trimming.
+    issues = [_issue(7, ["krishna"]), _issue(2, ["krishna"]), _issue(5, ["krishna"])]
+    chosen = select_batch(issues, assignee="krishna", limit=3)
+    assert [i.number for i in chosen] == [2, 5, 7]
+
+
+def test_select_batch_caps_unassigned_interaction_at_limit() -> None:
+    # include_unassigned widens the eligible set, but the limit still caps the
+    # batch and selection stays lowest-numbered first across both kinds.
+    issues = [
+        _issue(1, []),
+        _issue(2, ["krishna"]),
+        _issue(3, []),
+        _issue(4, ["other"]),
+    ]
+    chosen = select_batch(issues, assignee="krishna", include_unassigned=True, limit=2)
+    assert [i.number for i in chosen] == [1, 2]
+
+
 def test_github_source_parses_list_output() -> None:
     payload = json.dumps(
         [
