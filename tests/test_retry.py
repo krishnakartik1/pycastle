@@ -627,3 +627,56 @@ def test_prior_attempt_block_carries_the_failing_gate_info(
     # The failing-gate output reaches the next attempt's prompt verbatim.
     assert "quality gates reported a failure" in retry_prompt
     assert "Fix the failing gates before finishing." in retry_prompt
+
+
+def test_retry_context_never_reaches_plan_or_review_phases(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """On the default graph the retry block lands in implement alone (#7, #8).
+
+    The retry wrapper re-runs the whole plan → implement → review graph per
+    attempt and keys the prior-attempt context to ``implement``. This drives a
+    real gate-fail retry through that wrapper and proves the isolation end to
+    end: every plan and review prompt across both attempts is free of the
+    "Previous Attempt" block, while only the retried implement prompt carries it.
+    """
+    issue = IssueRef(number=2, title="Three phase retry", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    runner = _git_aware_runner()
+    # First implement attempt's gates fail; the retry passes — so the whole graph
+    # runs twice and the retry context is threaded into the second implement.
+    gate = _gate(False, True)
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    plan_calls = [c for c in runtime.calls if c["phase"] == "plan"]
+    review_calls = [c for c in runtime.calls if c["phase"] == "review"]
+    impl_calls = [c for c in runtime.calls if c["phase"] == "implement"]
+    # The whole graph ran twice (failed attempt + retry): plan and review each
+    # ran on both attempts, implement on both.
+    assert len(plan_calls) == 2
+    assert len(review_calls) == 2
+    assert len(impl_calls) == 2
+    # No plan or review prompt — on either attempt — carried implement's context.
+    assert not any("Previous Attempt" in c["prompt"] for c in plan_calls)
+    assert not any("Previous Attempt" in c["prompt"] for c in review_calls)
+    # The retried implement prompt is the only one that carried it.
+    assert "Previous Attempt" not in impl_calls[0]["prompt"]
+    assert "Previous Attempt" in impl_calls[1]["prompt"]
+    assert outcome.completed == [2]

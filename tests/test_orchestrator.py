@@ -482,3 +482,46 @@ def test_review_changes_are_committed_before_the_merge(
     commit_at = timeline.index("git:commit")
     merge_at = timeline.index("git:merge")
     assert review_at < commit_at < merge_at
+
+
+def test_full_run_interleaves_phases_then_commit_then_merge(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """One timeline pins plan → implement → review → commit → merge, in order.
+
+    The phase-ordering check and the review-before-merge check share a single
+    timeline here, so the whole sequence is asserted at once rather than split
+    across two tests. Because every event is read off one ordered list — not from
+    dict iteration or call counts — the guarantee does not depend on luck: the
+    issue branch is committed only after review runs, and merged only after the
+    commit, so review's improvements are always on the branch at merge time.
+    """
+    issue = IssueRef(number=2, title="Whole cycle", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    timeline: list[str] = []
+    runner = _timeline_runner(timeline)
+
+    outcome = orchestrator.run_batch(
+        runtime=_TimelineRuntime(timeline),
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # The full interleaved order of agent phases and git operations for the issue.
+    assert timeline == [
+        "phase:plan",
+        "phase:implement",
+        "phase:review",
+        "git:commit",
+        "git:merge",
+    ]
+    assert outcome.completed == [2]
