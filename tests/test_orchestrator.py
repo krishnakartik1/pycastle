@@ -1,7 +1,8 @@
-"""The walking skeleton: one ready issue becomes one pull request."""
+"""Batch run: ready issues become per-issue worktrees merged into one PR."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -23,51 +24,290 @@ def _calls_containing(runner: MagicMock, *needles: str) -> bool:
     return False
 
 
-def test_run_works_one_issue_into_one_pr(fixture_dir: Path, tmp_path: Path) -> None:
-    issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
-    source = MagicMock()
-    source.list_ready.return_value = [issue]
-    runner = MagicMock(side_effect=_ok)
+def _git_aware_runner(merge_fails_for: set[int] | None = None) -> MagicMock:
+    """A fake runner that simulates the git side effects the run depends on.
 
-    outcome = orchestrator.run(
+    ``git worktree add <path> <branch>`` creates the worktree directory so the
+    graph's stub runtime has a real ``cwd`` to write its marker into. A merge of
+    a branch whose issue number is in ``merge_fails_for`` returns non-zero so the
+    conflict-skip seam can be exercised. Everything else is a clean success. No
+    real git or gh is ever invoked.
+    """
+    merge_fails_for = merge_fails_for or set()
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        if argv[:2] == ["git", "merge"] and "--abort" not in argv:
+            branch = argv[2]
+            number = int(branch.split("-")[1])
+            if number in merge_fails_for:
+                return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def test_batch_works_up_to_n_issues_into_one_pr(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First slice", assignees=["krishna"]),
+        IssueRef(number=4, title="Second slice", assignees=["krishna"]),
+        IssueRef(number=6, title="Third slice", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
+        run_id="20260613-101500",
+        iterations=2,
         workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
         runner=runner,
     )
 
-    assert outcome.issue is not None and outcome.issue.number == 2
-    assert outcome.branch == "pycastle/issue-2-walking-skeleton"
+    # Up to N (2) of the 3 ready issues are worked, lowest-numbered first.
+    assert [o.issue.number for o in outcome.issues] == [2, 4]
+    assert outcome.completed == [2, 4]
     assert outcome.pr_opened is True
-    source.claim.assert_called_once_with(2, assignee="krishna")
-    assert (tmp_path / STUB_MARKER).is_file()
-    assert _calls_containing(runner, "git", "checkout", "-b", outcome.branch)
-    assert _calls_containing(runner, "gh", "pr", "create")
+    assert outcome.run_branch == "pycastle/run-20260613-101500"
+
+    # Each issue is claimed before work.
+    assert source.claim.call_count == 2
+    source.claim.assert_any_call(2, assignee="krishna")
+    source.claim.assert_any_call(4, assignee="krishna")
 
 
-def test_run_is_a_noop_when_no_issue_is_ready(
+def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    run_branch = "pycastle/run-20260613-101500"
+    issue_branch = "pycastle/issue-2-walking-skeleton"
+
+    # The run branch is cut off the base and added as its own worktree.
+    assert _calls_containing(runner, "git", "branch", run_branch, "main")
+    assert _calls_containing(runner, "git", "worktree", "add", run_branch)
+    # The issue is branched off the *run* branch into its own worktree.
+    assert _calls_containing(runner, "git", "branch", issue_branch, run_branch)
+    assert _calls_containing(runner, "git", "worktree", "add", issue_branch)
+
+    # The main checkout is never switched: no `git checkout` in the workspace.
+    for call in runner.call_args_list:
+        assert call.args[0][:2] != ["git", "checkout"]
+
+    # The stub wrote into the per-issue worktree, not the main checkout.
+    assert not (tmp_path / STUB_MARKER).is_file()
+    assert (tmp_path / "wt" / "issue-2" / STUB_MARKER).is_file()
+    assert outcome.issues[0].branch == issue_branch
+
+
+def test_successful_branches_merge_and_one_pr_is_opened(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # Both issue branches were merged into the run branch.
+    assert _calls_containing(runner, "git", "merge", "pycastle/issue-2-first")
+    assert _calls_containing(runner, "git", "merge", "pycastle/issue-4-second")
+
+    # Exactly one PR is opened, for the run branch, closing every merged issue.
+    pr_calls = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "create"]
+    ]
+    assert len(pr_calls) == 1
+    pr_argv = pr_calls[0]
+    assert "pycastle/run-20260613-101500" in pr_argv
+    body = pr_argv[pr_argv.index("--body") + 1]
+    assert "- Closes #2" in body
+    assert "- Closes #4" in body
+    assert outcome.pr_opened is True
+
+
+def test_failed_merge_is_skipped_and_left_for_issue_8(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="Clean", assignees=["krishna"]),
+        IssueRef(number=4, title="Conflicts", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    # Issue 4's merge does not apply cleanly.
+    runner = _git_aware_runner(merge_fails_for={4})
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # The clean issue merged; the conflicting one was aborted and recorded.
+    assert outcome.completed == [2]
+    merged = {o.issue.number: o.merged for o in outcome.issues}
+    assert merged == {2: True, 4: False}
+    assert _calls_containing(runner, "git", "merge", "--abort")
+    # The PR closes only the merged issue.
+    pr_calls = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "create"]
+    ]
+    body = pr_calls[0][pr_calls[0].index("--body") + 1]
+    assert "- Closes #2" in body
+    assert "#4" not in body
+
+
+def test_telemetry_and_run_log_are_written_into_the_fixture(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="Telemetry", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    run_dir = fixture_dir / "runs" / "20260613-101500"
+    # Per-phase telemetry lands under the ignored .pycastle/runs/<run_id>/ path.
+    telemetry_path = run_dir / "issue-2-telemetry.json"
+    assert telemetry_path.is_file()
+    records = json.loads(telemetry_path.read_text())
+    assert records[0]["runtime"] == "stub"
+    assert records[0]["phase"] == "implement"
+    assert records[0]["num_turns"] == 1
+
+    # A human-readable run log is written too.
+    log_text = (run_dir / "run.log").read_text()
+    assert "Working #2" in log_text
+    assert "Merged #2" in log_text
+
+
+def test_batch_is_a_noop_when_no_issue_is_ready(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
     source = MagicMock()
     source.list_ready.return_value = []
     runner = MagicMock(side_effect=_ok)
 
-    outcome = orchestrator.run(
+    outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
+        run_id="20260613-101500",
+        iterations=3,
         workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
         runner=runner,
     )
 
-    assert outcome.issue is None
+    assert outcome.issues == []
+    assert outcome.completed == []
     assert outcome.pr_opened is False
     source.claim.assert_not_called()
-    runner.assert_not_called()
+    # No branches, worktrees, or PRs when there is nothing to do.
+    assert not _calls_containing(runner, "git", "worktree", "add")
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_worktrees_are_cleaned_up_after_the_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="Cleanup", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # Both the issue worktree and the run worktree are removed and pruned.
+    assert _calls_containing(runner, "git", "worktree", "remove")
+    assert _calls_containing(runner, "git", "worktree", "prune")
+    # The per-issue branch is deleted; the run branch stays (it carries the PR).
+    assert _calls_containing(runner, "git", "branch", "-D", "pycastle/issue-2-cleanup")

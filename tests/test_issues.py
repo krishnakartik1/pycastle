@@ -10,6 +10,7 @@ from pycastle.issues import (
     GitHubIssueSource,
     assignee_logins,
     filter_for_assignee,
+    select_batch,
     select_next,
 )
 from pycastle.models import IssueRef
@@ -44,6 +45,35 @@ def test_select_next_returns_lowest_numbered_eligible() -> None:
 def test_select_next_returns_none_when_nothing_eligible() -> None:
     issues = [_issue(1, ["other"])]
     assert select_next(issues, assignee="krishna") is None
+
+
+def test_select_batch_returns_up_to_limit_lowest_first() -> None:
+    issues = [_issue(5, ["krishna"]), _issue(3, ["krishna"]), _issue(9, ["krishna"])]
+    chosen = select_batch(issues, assignee="krishna", limit=2)
+    assert [i.number for i in chosen] == [3, 5]
+
+
+def test_select_batch_filters_by_assignee_without_mocks() -> None:
+    issues = [_issue(1, ["other"]), _issue(2, ["krishna"]), _issue(4, [])]
+    chosen = select_batch(issues, assignee="krishna", limit=10)
+    assert [i.number for i in chosen] == [2]
+
+
+def test_select_batch_can_include_unassigned() -> None:
+    issues = [_issue(1, []), _issue(2, ["krishna"]), _issue(3, ["other"])]
+    chosen = select_batch(issues, assignee="krishna", include_unassigned=True, limit=10)
+    assert [i.number for i in chosen] == [1, 2]
+
+
+def test_select_batch_returns_all_when_limit_exceeds_eligible() -> None:
+    issues = [_issue(2, ["krishna"]), _issue(7, ["krishna"])]
+    chosen = select_batch(issues, assignee="krishna", limit=99)
+    assert [i.number for i in chosen] == [2, 7]
+
+
+def test_select_batch_is_empty_for_nonpositive_limit() -> None:
+    issues = [_issue(2, ["krishna"])]
+    assert select_batch(issues, assignee="krishna", limit=0) == []
 
 
 def test_github_source_parses_list_output() -> None:

@@ -87,7 +87,7 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     def fake_run_loop(*, runtime: object, **_kwargs: object) -> MagicMock:
         captured["runtime"] = runtime
         outcome = MagicMock()
-        outcome.issue = None
+        outcome.issues = []
         return outcome
 
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
@@ -122,7 +122,7 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     def fake_run_loop(*, runtime: object, **_kwargs: object) -> MagicMock:
         captured["runtime"] = runtime
         outcome = MagicMock()
-        outcome.issue = None
+        outcome.issues = []
         return outcome
 
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)

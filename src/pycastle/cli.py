@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 from collections.abc import Sequence
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
-from .orchestrator import run as run_loop
+from .orchestrator import run_batch as run_loop
 from .preflight import PreflightError, check_required_commands
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 
@@ -117,8 +118,13 @@ def _build_runtime(runtime_name: str, sandbox_kind: str, workspace: Path) -> Run
     return make_runtime(runtime_name)
 
 
+def _make_run_id() -> str:
+    """Return a timestamp-based run id for a fresh run."""
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    """Dispatch ``pycastle run``."""
+    """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     workspace = Path.cwd()
     runtime = _build_runtime(args.runtime, args.sandbox, workspace)
     repo = _resolve_repo()
@@ -133,12 +139,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         repo=repo,
         base_branch=base_branch,
         assignee=assignee,
+        run_id=_make_run_id(),
+        iterations=args.iterations,
         include_unassigned=args.include_unassigned,
     )
-    if outcome.issue is None:
+    if not outcome.issues:
         logger.info("Nothing to do.")
         return 0
-    logger.info("Worked #%s; PR opened: %s", outcome.issue.number, outcome.pr_opened)
+    logger.info(
+        "Run %s worked %d issue(s), merged %s; PR opened: %s",
+        outcome.run_id,
+        len(outcome.issues),
+        outcome.completed,
+        outcome.pr_opened,
+    )
     return 0 if outcome.pr_opened else 1
 
 

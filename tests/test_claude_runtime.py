@@ -438,18 +438,21 @@ def test_run_works_one_issue_end_to_end_via_claude(
     source.list_ready.return_value = [issue]
     runner = MagicMock(side_effect=_ok)
 
-    outcome = orchestrator.run(
+    outcome = orchestrator.run_batch(
         runtime=make_runtime("claude"),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
+        run_id="20260613-090000",
+        iterations=1,
         workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
         runner=runner,
     )
 
-    assert outcome.issue is not None and outcome.issue.number == 7
+    assert outcome.completed == [7]
     assert outcome.pr_opened is True
     # The real adapter ran through the graph: the claude CLI was invoked.
     assert mock_popen.call_args.args[0][0] == "claude"
