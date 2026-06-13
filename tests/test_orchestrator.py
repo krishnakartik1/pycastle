@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pycastle import orchestrator
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
@@ -87,6 +88,11 @@ def test_batch_works_up_to_n_issues_into_one_pr(
     assert source.claim.call_count == 2
     source.claim.assert_any_call(2, assignee="krishna")
     source.claim.assert_any_call(4, assignee="krishna")
+
+    # A clean run never enters the interrupt path: nothing is released back to
+    # ready-for-agent and no issue is handed to a human (cancellation ≠ handoff).
+    source.release.assert_not_called()
+    source.mark_for_human.assert_not_called()
 
 
 def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
@@ -224,6 +230,57 @@ def test_merge_conflict_marks_for_human_and_run_continues(
     assert "- Closes #2" in body
     assert "- Closes #6" in body
     assert "#4" not in body
+
+
+def test_merge_conflict_on_the_first_issue_still_runs_the_rest(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A conflict on the *first* issue must not abort the batch before it starts:
+    # only that issue is handed to a human, and the later issues still merge into
+    # one PR (#9). Pairs with the mid-batch conflict test above.
+    issues = [
+        IssueRef(number=2, title="Conflicts", assignees=["krishna"]),
+        IssueRef(number=4, title="Clean", assignees=["krishna"]),
+        IssueRef(number=6, title="Also clean", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner(merge_fails_for={2})
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # Only the first issue conflicted; the rest merged and the run carried on.
+    assert outcome.completed == [4, 6]
+    merged = {o.issue.number: o.merged for o in outcome.issues}
+    assert merged == {2: False, 4: True, 6: True}
+
+    # The conflicting first issue is the only one handed to a human; cancellation
+    # is not in play, so nothing was released back to ready-for-agent.
+    source.mark_for_human.assert_called_once_with(2)
+    source.release.assert_not_called()
+
+    # The PR closes the clean issues only, never the conflicting first one.
+    pr_calls = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "create"]
+    ]
+    body = pr_calls[0][pr_calls[0].index("--body") + 1]
+    assert "- Closes #4" in body
+    assert "- Closes #6" in body
+    assert "#2" not in body
 
 
 def test_telemetry_and_run_log_are_written_into_the_fixture(
@@ -595,14 +652,15 @@ def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
     source.mark_for_human.assert_not_called()
 
     # No orphaned worktrees: the in-flight issue worktree and the run worktree
-    # are both removed, and the registry is pruned.
+    # are both removed exactly once each — no double-removal from both the
+    # interrupt path and the normal end-of-run teardown.
     removed = [
         call.args[0][3]
         for call in runner.call_args_list
         if call.args[0][:3] == ["git", "worktree", "remove"]
     ]
-    assert str(tmp_path / "wt" / "issue-2") in removed
-    assert str(tmp_path / "wt" / "run-20260613-101500") in removed
+    assert removed.count(str(tmp_path / "wt" / "issue-2")) == 1
+    assert removed.count(str(tmp_path / "wt" / "run-20260613-101500")) == 1
     assert _calls_containing(runner, "git", "worktree", "prune")
 
     # A cancelled run opens no PR.
@@ -642,3 +700,114 @@ def test_interrupt_restores_only_the_in_flight_issue(
     # Only the in-flight issue (#2) was claimed and released; #4 was never reached.
     source.claim.assert_called_once_with(2, assignee="krishna")
     source.release.assert_called_once_with(2)
+
+
+def test_interrupt_cleanup_still_releases_when_worktree_removal_errors(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # Teardown is best-effort: if removing a worktree itself raises, the run must
+    # still release the issue back to ready-for-agent rather than leaving it
+    # stuck claimed. The removal error is swallowed (logged), not propagated.
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        if argv[:3] == ["git", "worktree", "remove"]:
+            raise RuntimeError("worktree busy")
+        return _ok()
+
+    runner = MagicMock(side_effect=side_effect)
+
+    raised = False
+    try:
+        orchestrator.run_batch(
+            runtime=_InterruptingRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+    except KeyboardInterrupt:
+        raised = True
+
+    # The interrupt still propagates even though teardown hit an error.
+    assert raised
+    # A failed worktree removal did not stop the restore: the issue is released.
+    source.release.assert_called_once_with(2)
+
+
+def test_interrupt_after_all_issues_complete_is_a_clean_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # The interrupt seam only fires while an issue is in flight. Once every issue
+    # has merged, ``in_flight`` is cleared, so finishing the batch is a clean run:
+    # nothing is released and the PR is opened normally.
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # Both issues merged into one PR; no cancellation path was taken.
+    assert outcome.completed == [2, 4]
+    assert outcome.pr_opened is True
+    source.release.assert_not_called()
+    source.mark_for_human.assert_not_called()
+
+
+def test_sigint_handler_is_restored_after_the_context_exits() -> None:
+    # Signal-handler hygiene: the previous SIGINT handler is restored on exit, so
+    # the run does not leave its KeyboardInterrupt-raising handler installed.
+    # signal.signal is mocked, so no real handler is ever touched.
+    sentinel = object()
+    with patch("pycastle.orchestrator.signal.signal", return_value=sentinel) as sig:
+        with orchestrator._sigint_as_keyboard_interrupt():
+            pass
+
+    # First call installs the handler and returns the previous one; the last call
+    # restores exactly that previous handler.
+    assert sig.call_args_list[0].args[0] == signal.SIGINT
+    assert sig.call_args_list[-1].args == (signal.SIGINT, sentinel)
+
+
+def test_sigint_handler_off_main_thread_value_error_is_swallowed() -> None:
+    # Off the main thread, signal.signal raises ValueError. The context manager
+    # must swallow it and still yield (so a threaded run is not broken) and must
+    # not attempt to restore a handler it never installed.
+    with patch("pycastle.orchestrator.signal.signal", side_effect=ValueError) as sig:
+        entered = False
+        with orchestrator._sigint_as_keyboard_interrupt():
+            entered = True
+
+    # The body still ran, and only the (failed) install was attempted — no
+    # restore call, since there is no previous handler to put back.
+    assert entered
+    assert sig.call_count == 1
