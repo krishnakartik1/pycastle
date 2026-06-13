@@ -389,6 +389,26 @@ def test_docker_runtime_runs_both_runtime_and_commands_in_container(
     assert argv[0] != "claude"
 
 
+def test_in_docker_resolves_relative_workspace(
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # in_docker forwards its workspace to the sandbox builder, which resolves a
+    # relative path to absolute. A relative workspace must not produce a broken
+    # relative bind-mount source in the launched docker argv.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "repo").mkdir()
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    runtime = ClaudeRuntime.in_docker(workspace=Path("repo"))
+    runtime.run("p", cwd=tmp_path, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    workdir = argv[argv.index("-w") + 1]
+    assert Path(workdir).is_absolute()
+    assert workdir.endswith("/repo")
+    assert f"{workdir}:{workdir}" in argv
+
+
 def test_host_runtime_still_invokes_bare_claude(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:

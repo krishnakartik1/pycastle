@@ -120,6 +120,21 @@ def test_run_docker_requires_docker_in_preflight(
     assert "claude" not in seen["commands"]
 
 
+def test_build_runtime_docker_codex_is_a_later_slice(tmp_path: Path) -> None:
+    # The docker-vs-host choice is orthogonal to the runtime, but the Docker
+    # sandbox for codex is not wired yet: asking for it raises rather than
+    # silently falling back to the host or to claude.
+    with pytest.raises(NotImplementedError):
+        cli._build_runtime("codex", "docker", tmp_path)
+
+
+def test_build_runtime_host_path_is_a_bare_runtime(tmp_path: Path) -> None:
+    # The host path produces a plain runtime with no docker wrapper, so its
+    # argv stays the bare claude command. Docker only enters via --sandbox docker.
+    runtime = cli._build_runtime("claude", "host", tmp_path)
+    assert getattr(runtime, "argv_wrapper", None) is None
+
+
 def test_sandbox_setup_claude_runs_login_then_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

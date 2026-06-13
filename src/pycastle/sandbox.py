@@ -91,8 +91,12 @@ def build_run_command(
     The container runs as non-root ``node``, mounts the per-Runtime auth volume,
     bind-mounts ``workspace`` at the same path so the agent reads and writes the
     real tree, sets the working directory to it, and pins ``CLAUDE_CONFIG_DIR``.
+
+    ``workspace`` is resolved to an absolute path first: Docker rejects a
+    relative bind-mount source, so a relative ``Path`` would otherwise produce a
+    silently broken ``docker run`` argv.
     """
-    workspace_path = str(workspace)
+    workspace_path = str(Path(workspace).resolve())
     return [
         "docker",
         "run",

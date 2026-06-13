@@ -59,6 +59,52 @@ def test_build_run_command_wraps_inner_argv() -> None:
     ]
 
 
+def test_build_run_command_resolves_relative_workspace_to_absolute() -> None:
+    # Docker rejects a relative bind-mount source, so a relative workspace must
+    # be resolved to an absolute path before it reaches the argv. Otherwise the
+    # mount source and -w would be relative and the container would fail to start.
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("work/repo")
+    )
+    workdir = argv[argv.index("-w") + 1]
+    assert Path(workdir).is_absolute()
+    # The bind-mount source and target stay symmetric on the resolved path.
+    assert f"{workdir}:{workdir}" in argv
+    assert workdir.endswith("/work/repo")
+
+
+def test_build_run_command_keeps_absolute_workspace_unchanged() -> None:
+    # An already-absolute workspace is passed through verbatim (resolve is a
+    # no-op for it), so the exact mount path the caller chose is preserved.
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/home/krishna/proj")
+    )
+    assert argv[argv.index("-w") + 1] == "/home/krishna/proj"
+    assert "/home/krishna/proj:/home/krishna/proj" in argv
+
+
+def test_build_run_command_preserves_spaces_as_single_argv_elements() -> None:
+    # A workspace path with spaces stays one argv element on both the mount and
+    # -w (no shell-joining), so the container sees the real directory name.
+    workspace = Path("/home/krishna/my repo")
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=workspace
+    )
+    assert argv[argv.index("-w") + 1] == "/home/krishna/my repo"
+    assert "/home/krishna/my repo:/home/krishna/my repo" in argv
+
+
+def test_build_run_command_passes_inner_argv_as_distinct_elements() -> None:
+    # The inner claude argv is spliced in element-by-element, never shell-joined
+    # into one string, so a prompt with spaces survives as a single argument.
+    inner = ["claude", "-p", "fix the bug now", "--output-format", "stream-json"]
+    argv = sandbox.build_run_command("claude", inner_argv=inner, workspace=Path("/w"))
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert argv[image_idx + 1 :] == inner
+    # The multi-word prompt is one element, not split across the argv.
+    assert "fix the bug now" in argv
+
+
 def test_build_run_command_runs_non_root_node() -> None:
     argv = sandbox.build_run_command(
         "claude", inner_argv=["claude"], workspace=Path("/w")
@@ -175,11 +221,29 @@ def test_build_status_command_checks_from_fresh_container() -> None:
 
 def test_status_command_does_not_print_credentials() -> None:
     # The status check proves auth works by making the agent answer, never by
-    # reading or printing the credential file.
+    # reading or printing the credential file. This test fails the moment anyone
+    # appends a `cat .../.credentials.json` (or any read of the volume) to the
+    # status argv, since those strings would appear in the joined command.
     argv = sandbox.build_status_command("claude")
     joined = " ".join(argv)
-    for forbidden in ("cat", "echo", ".credentials.json"):
+    for forbidden in (
+        "cat",
+        "echo",
+        "cp",
+        ".credentials.json",
+        "/home/node/.claude/",
+    ):
         assert forbidden not in joined
+
+
+def test_status_command_proves_auth_only_by_answering_a_prompt() -> None:
+    # Positive lock on the mechanism: auth is confirmed by running `claude -p`
+    # (the agent answers), bounded to one turn. No file is read; the only thing
+    # after the image is a prompt-answering claude invocation.
+    argv = sandbox.build_status_command("claude")
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert argv[image_idx + 1 : image_idx + 3] == ["claude", "-p"]
+    assert argv[-2:] == ["--max-turns", "1"]
 
 
 def test_login_and_status_share_one_volume_across_projects() -> None:
