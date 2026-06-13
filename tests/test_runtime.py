@@ -9,6 +9,7 @@ import pytest
 from pycastle.runtime import (
     STUB_MARKER,
     ClaudeRuntime,
+    CodexRuntime,
     Runtime,
     StubRuntime,
     make_runtime,
@@ -38,9 +39,8 @@ def test_make_runtime_returns_claude() -> None:
     assert isinstance(make_runtime("claude"), ClaudeRuntime)
 
 
-def test_make_runtime_defers_real_adapters() -> None:
-    with pytest.raises(NotImplementedError):
-        make_runtime("codex")
+def test_make_runtime_returns_codex() -> None:
+    assert isinstance(make_runtime("codex"), CodexRuntime)
 
 
 def test_make_runtime_rejects_unknown() -> None:

@@ -8,10 +8,10 @@ shape of its own workflow, supports both Claude Code and Codex as the runtime,
 and can run the agent inside Docker without forcing API-key billing.
 
 > **Status:** v0.1 in progress. This is the walking skeleton — `pycastle run`
-> works a single ready issue end to end through a stub or the real Claude
-> runtime, on the host or inside the Docker agent sandbox. The Codex adapter,
-> batch runs, retries, and `pycastle init` land in subsequent slices. See the
-> GitHub issues for the roadmap.
+> works a single ready issue end to end through a stub or the real Claude or
+> Codex runtime, on the host or inside the Docker agent sandbox. Batch runs,
+> retries, and `pycastle init` land in subsequent slices. See the GitHub issues
+> for the roadmap.
 
 ## Install (development)
 
@@ -24,10 +24,14 @@ pip install -e ".[dev]"
 - `pycastle run -i N --runtime stub` — work up to N ready issues into one PR.
 - `pycastle run --sandbox docker --runtime claude` — run the loop with the
   Claude runtime *inside* the Docker agent sandbox (see below).
+- `pycastle run --sandbox docker --runtime codex` — same loop with the Codex
+  runtime; switching runtime is just the flag.
 - `pycastle init` — scaffold a `.pycastle/` fixture into a repo *(coming soon)*.
 - `pycastle sandbox setup --runtime claude` — log the Claude runtime into its
-  Docker auth volume, then confirm auth from a fresh container. Codex *(coming
-  soon)*.
+  Docker auth volume (browser login), then confirm auth from a fresh container.
+- `pycastle sandbox setup --runtime codex` — log the Codex runtime into its
+  Docker auth volume via the device-authorization flow (a printed code and URL,
+  no localhost callback or TTY).
 
 ## The Docker agent sandbox
 
@@ -37,11 +41,12 @@ as the non-root user `node` (home `/home/node`), based on a `node:22` image, and
 bind-mounts the project workspace so the agent reads and writes the real tree.
 
 Auth is a subscription login stored in a Docker volume — one volume **per
-runtime**, shared across every project, named like `pycastle-claude-auth` and
-mounted at `/home/node/.claude` with `CLAUDE_CONFIG_DIR` pinned to it. You log
-in once per agent, not once per repo. Credential file contents are never read,
-printed, or copied; `sandbox setup` confirms auth only by having the agent
-answer a one-word prompt from a fresh container.
+runtime**, shared across every project. Claude's volume is `pycastle-claude-auth`,
+mounted at `/home/node/.claude` with `CLAUDE_CONFIG_DIR` pinned to it; Codex's is
+`pycastle-codex-auth`, mounted at `/home/node/.codex` with `CODEX_HOME` pinned to
+it. You log in once per agent, not once per repo. Credential file contents are
+never read, printed, or copied; for Claude, `sandbox setup` confirms auth only by
+having the agent answer a one-word prompt from a fresh container.
 
 Onboard auth with:
 

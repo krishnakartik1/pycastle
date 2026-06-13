@@ -12,7 +12,7 @@ from .commands import run_cmd
 from .issues import GitHubIssueSource
 from .orchestrator import run as run_loop
 from .preflight import PreflightError, check_required_commands
-from .runtime import ClaudeRuntime, Runtime, make_runtime
+from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 
 logger = logging.getLogger("pycastle")
 
@@ -99,17 +99,20 @@ def _resolve_assignee(login: str) -> str:
 def _build_runtime(runtime_name: str, sandbox_kind: str, workspace: Path) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
-    ``--sandbox docker`` with the Claude runtime wraps each phase's ``claude``
-    argv into a ``docker run`` argv, so both the Runtime and the commands it
-    invokes run inside the agent container. Every other combination runs the
-    runtime on the host as before.
+    ``--sandbox docker`` wraps each phase's inner agent argv into a
+    ``docker run`` argv, so both the Runtime and the commands it invokes run
+    inside the agent container. Both Claude and Codex support this; every other
+    combination runs the runtime on the host as before. The docker-vs-host
+    choice is orthogonal to which runtime runs.
     """
     if sandbox_kind == "docker":
         if runtime_name == "claude":
             return ClaudeRuntime.in_docker(workspace=workspace)
+        if runtime_name == "codex":
+            return CodexRuntime.in_docker(workspace=workspace)
         raise NotImplementedError(
-            f"The Docker sandbox for the {runtime_name!r} runtime lands in a "
-            "later slice; run it with --sandbox host for now."
+            f"The Docker sandbox for the {runtime_name!r} runtime is not "
+            "available; run it with --sandbox host for now."
         )
     return make_runtime(runtime_name)
 
@@ -142,20 +145,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle sandbox setup``: onboard a runtime's Docker auth.
 
-    For Claude this runs the interactive login into the per-Runtime auth volume
-    and then confirms auth from a *fresh* container. The login is interactive
-    (it needs a TTY for the browser flow); the headless token fallback is
-    documented in :mod:`pycastle.sandbox`. Credential contents are never read
-    or printed — auth is confirmed only by the agent answering the status
-    prompt. Codex onboarding lands in a later slice.
-    """
-    if args.runtime != "claude":
-        logger.error(
-            "`pycastle sandbox setup --runtime %s` lands in a later slice.",
-            args.runtime,
-        )
-        return 2
+    Both Claude and Codex log into their per-Runtime auth volume. Credential
+    contents are never read or printed.
 
+    Claude runs the interactive browser login and then confirms auth from a
+    *fresh* container by having the agent answer a one-word prompt; the login
+    needs a TTY and the headless token fallback is documented in
+    :mod:`pycastle.sandbox`.
+
+    Codex runs the device-authorization login (``codex login --device-code``),
+    which prints a code and a verification URL and polls in the background — no
+    localhost callback and no TTY. The flow's own zero exit is the success
+    signal, so no fresh-container status check is run.
+    """
+    if args.runtime == "codex":
+        return _setup_codex()
+    if args.runtime == "claude":
+        return _setup_claude()
+    logger.error(
+        "`pycastle sandbox setup --runtime %s` is not supported.", args.runtime
+    )
+    return 2
+
+
+def _setup_claude() -> int:
+    """Run the Claude browser login, then confirm auth from a fresh container."""
     logger.info(
         "Logging the claude runtime into volume %s", sandbox.auth_volume("claude")
     )
@@ -171,6 +185,22 @@ def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
         return 1
 
     logger.info("The claude runtime is authenticated and ready.")
+    return 0
+
+
+def _setup_codex() -> int:
+    """Run the Codex device-authorization login into its auth volume."""
+    logger.info(
+        "Logging the codex runtime into volume %s via the device-authorization "
+        "flow; follow the printed code and URL to finish.",
+        sandbox.auth_volume("codex"),
+    )
+    login = run_cmd(sandbox.build_login_command("codex"))
+    if getattr(login, "returncode", 1) != 0:
+        logger.error("Device-authorization login failed; the volume was not onboarded.")
+        return 1
+
+    logger.info("The codex runtime is authenticated and ready.")
     return 0
 
 

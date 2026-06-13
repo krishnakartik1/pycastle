@@ -2,8 +2,9 @@
 
 v0.1 ships a :class:`StubRuntime` that fakes an agent so the loop's plumbing
 can be proven end to end. The real Claude adapter, :class:`ClaudeRuntime`,
-drives the ``claude`` CLI on the host behind this same interface; the Codex
-adapter lands in a later slice.
+drives the ``claude`` CLI; the Codex adapter, :class:`CodexRuntime`, drives the
+``codex`` CLI. Both run on the host or inside the Docker sandbox behind this
+same interface, so switching runtime is a flag, not a code change.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -268,16 +270,249 @@ def _build_telemetry(
     )
 
 
+#: The flag that lets Codex write inside the Docker sandbox. Codex's own
+#: bubblewrap sandbox cannot nest inside Docker (ADR-0003), so the in-container
+#: run bypasses approvals and Codex's sandbox and relies on Docker for
+#: isolation. It lives on the *runtime's* inner argv, not the docker wrapper, so
+#: the wrapper stays runtime-agnostic.
+CODEX_DOCKER_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
+
+
+class CodexRuntime:
+    """Drive the real ``codex`` CLI behind the Runtime interface.
+
+    It builds the ``codex exec`` command, runs it, and parses the Codex JSONL
+    event stream (``thread.started`` → thread id; ``item.completed`` with an
+    ``agent_message`` → output text; ``turn.completed`` → token usage) into
+    output text plus a telemetry record. A non-zero process exit is raised as
+    :class:`AgentCrashError`.
+
+    Codex reports no cost or duration, so :attr:`Telemetry.duration_ms` stays
+    ``None`` and PyCastle's own measured wall time is recorded as
+    ``elapsed_ms``. The thread id from ``thread.started`` is surfaced as
+    :attr:`Telemetry.thread_id` and is the handle a later handoff resumes via
+    :meth:`run` with ``resume_thread_id``.
+
+    Like :class:`ClaudeRuntime`, an ``argv_wrapper`` (or :meth:`in_docker`)
+    wraps the inner ``codex …`` argv before launch — for the Docker sandbox,
+    into a ``docker run`` argv. When sandboxed in Docker the inner argv carries
+    :data:`CODEX_DOCKER_BYPASS` so Codex can write inside the container.
+    """
+
+    name = "codex"
+
+    def __init__(
+        self,
+        *,
+        command: str = "codex",
+        model: str | None = None,
+        bypass_sandbox: bool = False,
+        argv_wrapper: Callable[[list[str]], list[str]] | None = None,
+    ) -> None:
+        """Configure the CLI invocation shared across phases.
+
+        ``bypass_sandbox`` adds :data:`CODEX_DOCKER_BYPASS` to the inner argv;
+        :meth:`in_docker` sets it so Codex can write inside the container.
+        """
+        self.command = command
+        self.model = model
+        self.bypass_sandbox = bypass_sandbox
+        self.argv_wrapper = argv_wrapper
+
+    @classmethod
+    def in_docker(
+        cls,
+        *,
+        workspace: Path,
+        image: str = sandbox.DEFAULT_IMAGE,
+        model: str | None = None,
+    ) -> CodexRuntime:
+        """Build a Codex runtime that runs each phase inside the Docker sandbox.
+
+        The inner ``codex …`` argv (carrying :data:`CODEX_DOCKER_BYPASS`) is
+        wrapped into a ``docker run`` argv (see
+        :func:`pycastle.sandbox.build_run_command`) so the agent runs as
+        non-root ``node`` against the Codex auth volume with ``CODEX_HOME``
+        pinned, and ``workspace`` bind-mounted so it can read and write the real
+        tree.
+        """
+
+        def wrap(inner_argv: list[str]) -> list[str]:
+            return sandbox.build_run_command(
+                cls.name,
+                inner_argv=inner_argv,
+                workspace=workspace,
+                image=image,
+            )
+
+        return cls(model=model, bypass_sandbox=True, argv_wrapper=wrap)
+
+    def build_command(
+        self, prompt: str, *, cwd: Path, resume_thread_id: str | None = None
+    ) -> list[str]:
+        """Build the ``codex exec`` argv for one non-interactive run.
+
+        Without ``resume_thread_id`` this starts a fresh thread
+        (``codex … exec --json <prompt>``); with one it resumes that thread
+        (``codex … exec resume --json <thread_id> <prompt>``) so a handoff
+        continues the conversation that did the failed attempt.
+        """
+        cmd = [self.command, "-C", str(cwd)]
+        if self.model is not None:
+            cmd += ["--model", self.model]
+        if self.bypass_sandbox:
+            cmd.append(CODEX_DOCKER_BYPASS)
+        cmd.append("exec")
+        if resume_thread_id is not None:
+            cmd.append("resume")
+        cmd.append("--json")
+        if resume_thread_id is not None:
+            cmd.append(resume_thread_id)
+        cmd.append(prompt)
+        return cmd
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        cwd: Path,
+        phase: str,
+        resume_thread_id: str | None = None,
+    ) -> RuntimeResult:
+        """Run the agent for one phase and return its parsed result.
+
+        Pass ``resume_thread_id`` to continue a prior thread (used for
+        handoffs). Raises :class:`AgentCrashError` when the agent exits
+        non-zero.
+        """
+        cmd = self.build_command(prompt, cwd=cwd, resume_thread_id=resume_thread_id)
+        if self.argv_wrapper is not None:
+            cmd = self.argv_wrapper(cmd)
+        started_at = time.perf_counter()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            text=True,
+        )
+
+        output_buf: list[str] = []
+        thread_id: str | None = None
+        usage: dict[str, Any] = {}
+        num_turns = 0
+
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "thread.started":
+                    thread_id = event.get("thread_id")
+                elif event_type == "item.completed":
+                    _collect_codex_item(event.get("item", {}), output_buf)
+                elif event_type == "turn.completed":
+                    num_turns += 1
+                    event_usage = event.get("usage")
+                    if isinstance(event_usage, dict):
+                        usage = event_usage
+        finally:
+            proc.wait()
+
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        stderr_text = proc.stderr.read() if proc.stderr else ""
+
+        if proc.returncode != 0:
+            logger.error(
+                "[%s] codex exited with code %s: %s",
+                phase,
+                proc.returncode,
+                stderr_text[:500],
+            )
+            raise AgentCrashError(
+                f"codex crashed during {phase} (exit code {proc.returncode})",
+                phase=phase,
+                exit_code=proc.returncode,
+            )
+
+        telemetry = _build_codex_telemetry(
+            phase,
+            thread_id=thread_id,
+            usage=usage,
+            num_turns=num_turns,
+            elapsed_ms=elapsed_ms,
+        )
+        return RuntimeResult(output="".join(output_buf), telemetry=telemetry)
+
+
+def _collect_codex_item(item: dict[str, Any], output_buf: list[str]) -> None:
+    """Append the text of an ``agent_message`` Codex item, ignoring the rest.
+
+    Codex narrates tool runs and file changes as their own ``item.completed``
+    events; only ``agent_message`` items are the model's prose output, so the
+    verbose command/file-change items are dropped.
+    """
+    if item.get("type") == "agent_message":
+        text = item.get("text", "")
+        if text:
+            output_buf.append(text)
+
+
+def _build_codex_telemetry(
+    phase: str,
+    *,
+    thread_id: str | None,
+    usage: dict[str, Any],
+    num_turns: int,
+    elapsed_ms: int,
+) -> Telemetry:
+    """Turn parsed Codex stream fields into a :class:`Telemetry` record.
+
+    Codex's usage vocabulary maps onto :class:`TokenUsage` as: ``input_tokens``
+    and ``output_tokens`` pass through; ``cached_input_tokens`` is the cache-read
+    count (Codex has no separate cache-creation count); ``reasoning_output_tokens``
+    records tokens spent on hidden reasoning. Cost and duration are unavailable
+    from Codex, so they stay ``None`` and ``elapsed_ms`` carries the measured
+    wall time.
+    """
+    token_usage = None
+    if usage:
+        token_usage = TokenUsage(
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            cached_input_tokens=usage.get("cached_input_tokens"),
+            reasoning_output_tokens=usage.get("reasoning_output_tokens"),
+        )
+    return Telemetry(
+        runtime=CodexRuntime.name,
+        phase=phase,
+        cost_usd=None,
+        duration_ms=None,
+        elapsed_ms=elapsed_ms,
+        num_turns=num_turns,
+        usage=token_usage,
+        thread_id=thread_id,
+        is_error=False,
+    )
+
+
 def make_runtime(name: str) -> Runtime:
     """Return the Runtime registered under ``name``.
 
-    The stub and the real Claude adapter exist today; the Codex adapter is
-    wired in behind this same factory in a later slice.
+    The stub, the real Claude adapter, and the real Codex adapter all exist
+    today, all behind this same factory.
     """
     if name == "stub":
         return StubRuntime()
     if name == "claude":
         return ClaudeRuntime()
     if name == "codex":
-        raise NotImplementedError(f"The {name!r} runtime lands in a later slice.")
+        return CodexRuntime()
     raise ValueError(f"Unknown runtime: {name!r}")

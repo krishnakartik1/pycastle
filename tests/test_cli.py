@@ -102,6 +102,59 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     assert "pycastle-claude-auth:/home/node/.claude" in wrapped
 
 
+def test_run_docker_builds_a_sandboxed_codex_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run --sandbox docker --runtime codex`` drives Codex inside Docker.
+
+    Switching runtime is just the flag: the same dispatch wraps the codex inner
+    argv into a docker run argv against the codex auth volume. Everything
+    external is mocked.
+    """
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    captured = {}
+
+    def fake_run_loop(*, runtime: object, **_kwargs: object) -> MagicMock:
+        captured["runtime"] = runtime
+        outcome = MagicMock()
+        outcome.issue = None
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "codex"]) == 0
+
+    runtime = captured["runtime"]
+    assert runtime.name == "codex"
+    assert runtime.argv_wrapper is not None
+    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"])
+    assert wrapped[:3] == ["docker", "run", "--rm"]
+    assert "pycastle-codex-auth:/home/node/.codex" in wrapped
+
+
+def test_run_host_codex_requires_codex_in_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, list[str]] = {}
+
+    def record(commands: list[str]) -> None:
+        seen["commands"] = list(commands)
+
+    monkeypatch.setattr(cli, "check_required_commands", record)
+    monkeypatch.setattr(cli, "_cmd_run", lambda _args: 0)
+
+    main(["run", "--sandbox", "host", "--runtime", "codex"])
+
+    # The host codex path needs the codex CLI on PATH, not docker.
+    assert "codex" in seen["commands"]
+    assert "docker" not in seen["commands"]
+
+
 def test_run_docker_requires_docker_in_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -120,12 +173,19 @@ def test_run_docker_requires_docker_in_preflight(
     assert "claude" not in seen["commands"]
 
 
-def test_build_runtime_docker_codex_is_a_later_slice(tmp_path: Path) -> None:
-    # The docker-vs-host choice is orthogonal to the runtime, but the Docker
-    # sandbox for codex is not wired yet: asking for it raises rather than
-    # silently falling back to the host or to claude.
-    with pytest.raises(NotImplementedError):
-        cli._build_runtime("codex", "docker", tmp_path)
+def test_build_runtime_docker_codex_builds_a_sandboxed_runtime(
+    tmp_path: Path,
+) -> None:
+    # The docker-vs-host choice is orthogonal to the runtime: asking for codex
+    # in Docker yields a CodexRuntime whose wrapper produces a docker argv
+    # against the codex auth volume, exactly as claude does.
+    runtime = cli._build_runtime("codex", "docker", tmp_path)
+    assert runtime.name == "codex"
+    assert runtime.argv_wrapper is not None
+    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"])
+    assert wrapped[:3] == ["docker", "run", "--rm"]
+    assert "pycastle-codex-auth:/home/node/.codex" in wrapped
+    assert "CODEX_HOME=/home/node/.codex" in wrapped
 
 
 def test_build_runtime_host_path_is_a_bare_runtime(tmp_path: Path) -> None:
@@ -184,13 +244,49 @@ def test_sandbox_setup_status_failure_returns_nonzero(
     assert main(["sandbox", "setup", "--runtime", "claude"]) == 1
 
 
-def test_sandbox_setup_codex_is_a_later_slice(
+def test_sandbox_setup_codex_uses_device_auth_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sandbox setup --runtime codex`` runs the device-authorization login.
+
+    The login command construction is asserted (no localhost callback, no TTY);
+    Docker is never really invoked. A device-auth login is the whole flow: no
+    fresh-container status check runs, unlike Claude.
+    """
+    from pycastle import sandbox as sandbox_mod
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    calls: list[list[str]] = []
+
+    def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", fake_runner)
+
+    assert main(["sandbox", "setup", "--runtime", "codex"]) == 0
+
+    # Exactly one command: the device-authorization login. No status check.
+    assert calls == [sandbox_mod.build_login_command("codex")]
+    login = calls[0]
+    assert login[-3:] == ["codex", "login", "--device-code"]
+    # The device flow needs no TTY, so -it is never passed.
+    assert "-it" not in login
+
+
+def test_sandbox_setup_codex_login_failure_returns_nonzero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    runner = MagicMock()
-    monkeypatch.setattr(cli, "run_cmd", runner)
 
-    assert main(["sandbox", "setup", "--runtime", "codex"]) == 2
-    # No docker commands run for the deferred runtime.
-    runner.assert_not_called()
+    def fake_runner(_args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", fake_runner)
+
+    assert main(["sandbox", "setup", "--runtime", "codex"]) == 1

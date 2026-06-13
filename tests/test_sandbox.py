@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from pycastle import sandbox
 
 
@@ -254,3 +256,104 @@ def test_login_and_status_share_one_volume_across_projects() -> None:
     vol = "pycastle-claude-auth:/home/node/.claude"
     assert vol in login
     assert vol in status
+
+
+# --- Codex sandbox argv -----------------------------------------------------
+#
+# Codex gets its own config dir (CODEX_HOME), its own env var, its own auth
+# volume, and a device-authorization login. The Claude argv above must stay
+# byte-for-byte unchanged — these tests lock in the parametrization without
+# regressing Claude.
+
+
+def test_build_run_command_codex_pins_codex_home_and_volume() -> None:
+    workspace = Path("/home/krishna/work/repo")
+    inner = [
+        "codex",
+        "-C",
+        "/home/krishna/work/repo",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "exec",
+        "--json",
+        "do the work",
+    ]
+
+    argv = sandbox.build_run_command("codex", inner_argv=inner, workspace=workspace)
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "node",
+        "-w",
+        "/home/krishna/work/repo",
+        "-v",
+        "pycastle-codex-auth:/home/node/.codex",
+        "-v",
+        "/home/krishna/work/repo:/home/krishna/work/repo",
+        "-e",
+        "CODEX_HOME=/home/node/.codex",
+        sandbox.DEFAULT_IMAGE,
+        *inner,
+    ]
+
+
+def test_build_run_command_wrapper_is_runtime_agnostic_for_codex() -> None:
+    # The wrapper adds no codex-specific flags: the bypass flag is owned by the
+    # runtime's inner argv. The wrapper only mounts/pins and splices inner_argv.
+    inner = ["codex", "exec", "--json", "hi"]
+    argv = sandbox.build_run_command("codex", inner_argv=inner, workspace=Path("/w"))
+    # No bypass flag anywhere the wrapper added (the inner argv here has none).
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert argv[image_idx + 1 :] == inner
+
+
+def test_build_login_command_codex_uses_device_code_no_tty() -> None:
+    argv = sandbox.build_login_command("codex")
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "node",
+        "-v",
+        "pycastle-codex-auth:/home/node/.codex",
+        "-e",
+        "CODEX_HOME=/home/node/.codex",
+        sandbox.DEFAULT_IMAGE,
+        "codex",
+        "login",
+        "--device-code",
+    ]
+    # The device-authorization flow needs no TTY: -it is never passed.
+    assert "-it" not in argv
+
+
+def test_build_login_command_claude_still_interactive_with_tty() -> None:
+    # Parametrizing per runtime must not regress Claude: it keeps its TTY and
+    # its /login browser flow.
+    argv = sandbox.build_login_command("claude")
+    assert "-it" in argv
+    assert argv[-2:] == ["claude", "/login"]
+
+
+def test_codex_auth_volume_distinct_from_claude() -> None:
+    assert sandbox.auth_volume("codex") == "pycastle-codex-auth"
+    assert sandbox.auth_volume("codex") != sandbox.auth_volume("claude")
+
+
+def test_codex_run_command_does_not_leak_credentials() -> None:
+    argv = sandbox.build_run_command(
+        "codex", inner_argv=["codex"], workspace=Path("/w")
+    )
+    joined = " ".join(argv)
+    for forbidden in ("cat", "echo", "auth.json", "/home/node/.codex/"):
+        assert forbidden not in joined
+
+
+def test_unknown_runtime_sandbox_config_raises() -> None:
+    with pytest.raises(ValueError):
+        sandbox.build_run_command("nope", inner_argv=["x"], workspace=Path("/w"))
