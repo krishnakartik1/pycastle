@@ -82,11 +82,26 @@ class GraphExecutor:
         self.runtime = runtime
         self.fixture_dir = fixture_dir
 
-    def execute(self, graph: PhaseGraph, *, cwd: Path) -> list[PhaseResult]:
-        """Execute each phase in order and return the per-phase results."""
+    def execute(
+        self,
+        graph: PhaseGraph,
+        *,
+        cwd: Path,
+        phase_context: dict[str, str] | None = None,
+    ) -> list[PhaseResult]:
+        """Execute each phase in order and return the per-phase results.
+
+        ``phase_context`` carries extra text to append to a named phase's
+        prompt for this run — the retry path uses it to thread prior-attempt
+        context into the ``implement`` prompt without rewriting the prompt file.
+        """
+        phase_context = phase_context or {}
         results: list[PhaseResult] = []
         for phase in graph.phases:
             prompt = (self.fixture_dir / "prompts" / phase.prompt).read_text()
+            extra = phase_context.get(phase.name)
+            if extra:
+                prompt = f"{prompt}\n\n{extra}"
             result = self.runtime.run(prompt, cwd=cwd, phase=phase.name)
             results.append(PhaseResult(phase=phase.name, result=result))
         return results

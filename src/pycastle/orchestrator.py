@@ -9,9 +9,17 @@ for the whole run. Per-phase provider telemetry and a run log are written into
 the Project fixture under ``.pycastle/runs/<run_id>/`` (an ignored path, so run
 output is never committed).
 
-Retries and handoff (#7) and the merge-conflict / interrupt restore paths (#8)
-are out of scope here; this slice leaves clear seams for them and otherwise
-records and skips an issue whose merge does not apply cleanly.
+A failed implement attempt (an agent crash, or a clean run whose gates come
+back red) is retried in place on the same worktree (#7): a handoff document is
+written summarising what was tried and what to fix, and the next attempt carries
+that context. For Codex the handoff resumes the thread that did the failed
+attempt; Claude has no thread resume, so its handoff is a fresh call carrying
+the prior-attempt context. An item that exhausts its retries is labelled
+``ready-for-human`` and the run continues to the next item.
+
+The merge-conflict / interrupt restore paths (#8) are out of scope here; this
+slice leaves clear seams for them and otherwise records and skips an issue whose
+merge does not apply cleanly.
 """
 
 from __future__ import annotations
@@ -28,11 +36,34 @@ from .commands import run_cmd
 from .graph import GraphExecutor, PhaseResult, load_graph
 from .issues import IssueSource, select_batch
 from .models import IssueRef
-from .runtime import Runtime
+from .runtime import AgentCrashError, CodexRuntime, Runtime
 
 logger = logging.getLogger(__name__)
 
 Runner = Callable[..., Any]
+
+#: A gate check decides whether an implement attempt's quality gates passed.
+#: It takes the issue worktree and returns ``True`` when the gates are green. It
+#: is injectable so a "gates red" outcome can drive a retry without hardcoding a
+#: specific project gate command here; the default treats every attempt as
+#: passing (the real gate is the project's own and is wired by the caller).
+GateCheck = Callable[[Path], bool]
+
+#: Where a handoff document is written inside the issue worktree (ignored path).
+HANDOFF_DOC = ".pycastle/handoff.md"
+
+#: The phase name used for the handoff invocation's telemetry.
+HANDOFF_PHASE = "handoff"
+
+
+def _gates_always_pass(_worktree: Path) -> bool:
+    """Default gate check: treat every attempt as passing.
+
+    The real gate is the project's own quality-gate command; it is injected by
+    the caller. With no gate wired, a single implement attempt is made and no
+    retry/handoff is triggered.
+    """
+    return True
 
 
 @dataclass
@@ -119,6 +150,189 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
 
 
+_HANDOFF_PROMPT = (
+    "A previous implement attempt left the quality gates red. Write a handoff "
+    f"document at {HANDOFF_DOC} for the next attempt. Summarise, briefly: what "
+    "you attempted, the current state of the code, which files you touched, and "
+    "what to try next to fix the failing gates. Reference the issue and the diff "
+    "by path; do not duplicate their content.\n\n"
+    "## Failing gate output\n\n```\n{gate_output}\n```\n"
+)
+
+
+def generate_handoff(
+    runtime: Runtime,
+    *,
+    worktree: Path,
+    thread_id: str | None,
+    gate_output: str,
+) -> bool:
+    """Have the runtime write a handoff document for the next attempt.
+
+    The handoff captures what the failed attempt tried and what to fix next. For
+    Codex (a runtime whose :meth:`run` accepts ``resume_thread_id``) the handoff
+    resumes the thread that produced the failed attempt, so it keeps the original
+    context; ``thread_id`` is the failed attempt's thread. Claude has no thread
+    resume, so its handoff is a fresh ``run`` carrying the prior-attempt context
+    in the prompt. Returns whether the document was created — a runtime that
+    fails to write it degrades to a fresh retry rather than aborting the issue.
+    """
+    prompt = _HANDOFF_PROMPT.format(gate_output=gate_output)
+    if _runtime_resumes_threads(runtime) and thread_id is not None:
+        # Codex: resume the failed attempt's thread to keep its context.
+        runtime.run(  # type: ignore[call-arg]
+            prompt,
+            cwd=worktree,
+            phase=HANDOFF_PHASE,
+            resume_thread_id=thread_id,
+        )
+    else:
+        # Claude (or any non-resuming runtime): a fresh call with the context.
+        runtime.run(prompt, cwd=worktree, phase=HANDOFF_PHASE)
+    return (worktree / HANDOFF_DOC).is_file()
+
+
+def _runtime_resumes_threads(runtime: Runtime) -> bool:
+    """Whether a runtime can resume the thread that did the failed attempt.
+
+    Thread resume (``run(..., resume_thread_id=...)``) is a Codex capability,
+    not part of the Runtime Protocol, so we narrow on the Codex runtime — by
+    concrete type, or by its ``name`` so a stand-in Codex runtime is recognised
+    too — rather than forcing ``resume_thread_id`` onto every runtime.
+    """
+    return isinstance(runtime, CodexRuntime) or runtime.name == CodexRuntime.name
+
+
+def _retry_context(attempt: int, gate_output: str, *, handoff_made: bool) -> str:
+    """Build the prior-attempt context threaded into the next implement prompt.
+
+    It points the next attempt at the handoff document and the failing gate
+    output rather than duplicating either inline. The handoff path is named even
+    when this attempt did not produce one (a crash skips the handoff) so the
+    next attempt reads it if present.
+    """
+    handoff_note = (
+        "the handoff document from the previous attempt"
+        if handoff_made
+        else "the handoff document, if the previous attempt left one"
+    )
+    lines = [
+        "## Previous Attempt",
+        "",
+        f"Attempt {attempt} was made but a quality gate is still failing.",
+        "",
+        f"- Read {handoff_note}: `{HANDOFF_DOC}`",
+        "- The failing gate output was:",
+        "",
+        "```",
+        gate_output,
+        "```",
+        "",
+        "Fix the failing gates before finishing.",
+    ]
+    return "\n".join(lines)
+
+
+def _run_implement_attempts(
+    issue: IssueRef,
+    *,
+    runtime: Runtime,
+    fixture_dir: Path,
+    run_id: str,
+    issue_worktree: Path,
+    impl_retries: int,
+    gate_check: GateCheck,
+    runner: Runner,
+) -> tuple[bool, list[PhaseResult]]:
+    """Run the graph for one issue, retrying with handoff while gates stay red.
+
+    Up to ``1 + impl_retries`` attempts are made in place on the same worktree.
+    An attempt fails when the agent crashes (:class:`AgentCrashError`) or when
+    the run is clean but :paramref:`gate_check` reports the gates red. On a
+    failed attempt with retries left, a handoff document is generated (resuming
+    the failed Codex thread, or a fresh Claude call) and the next attempt carries
+    that context. Returns ``(passed, phase_results)`` where ``phase_results`` is
+    the last attempt's results (empty if every attempt crashed).
+    """
+    graph = load_graph(fixture_dir)
+    executor = GraphExecutor(runtime, fixture_dir=fixture_dir)
+    phase_results: list[PhaseResult] = []
+    retry_context = ""
+
+    for attempt in range(impl_retries + 1):
+        if attempt > 0:
+            _append_log(
+                fixture_dir,
+                run_id,
+                f"Retry {attempt}/{impl_retries} for #{issue.number}",
+            )
+        try:
+            phase_results = executor.execute(
+                graph,
+                cwd=issue_worktree,
+                phase_context={"implement": retry_context} if retry_context else None,
+            )
+        except AgentCrashError as crash:
+            _append_log(
+                fixture_dir,
+                run_id,
+                f"Attempt {attempt + 1} for #{issue.number} crashed "
+                f"during {crash.phase} (exit {crash.exit_code}).",
+            )
+            if attempt < impl_retries:
+                retry_context = _retry_context(
+                    attempt + 1,
+                    f"agent crashed during {crash.phase} (exit {crash.exit_code})",
+                    handoff_made=False,
+                )
+                continue
+            return False, phase_results
+
+        gate_output = "quality gates reported a failure"
+        if gate_check(issue_worktree):
+            return True, phase_results
+
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"Gates red after attempt {attempt + 1} for #{issue.number}.",
+        )
+        if attempt >= impl_retries:
+            return False, phase_results
+
+        thread_id = _last_thread_id(phase_results)
+        handoff_made = generate_handoff(
+            runtime,
+            worktree=issue_worktree,
+            thread_id=thread_id,
+            gate_output=gate_output,
+        )
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"Handoff {'generated' if handoff_made else 'skipped'} for "
+            f"#{issue.number} (thread {thread_id or 'n/a'}).",
+        )
+        retry_context = _retry_context(
+            attempt + 1, gate_output, handoff_made=handoff_made
+        )
+
+    return False, phase_results
+
+
+def _last_thread_id(phase_results: list[PhaseResult]) -> str | None:
+    """Return the thread id of the last phase that exposed one, if any.
+
+    Codex records its resumable thread on each phase's telemetry; the handoff
+    resumes the implement attempt's thread. Claude records ``None`` here.
+    """
+    for phase_result in reversed(phase_results):
+        thread_id = phase_result.result.telemetry.thread_id
+        if thread_id:
+            return thread_id
+    return None
+
+
 def _work_issue(
     issue: IssueRef,
     *,
@@ -132,15 +346,24 @@ def _work_issue(
     assignee: str,
     workspace: Path,
     runner: Runner,
+    impl_retries: int,
+    gate_check: GateCheck,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
 
-    The issue is claimed, branched off the run branch into its own worktree, run
-    through the graph, and committed. A clean merge of the issue branch into the
-    run worktree folds it into the run; the issue worktree and branch are then
-    removed. On a merge that does not apply cleanly the issue is recorded as not
-    merged and skipped — the conflict -> ready-for-human handling is issue #8, so
-    this is the seam for it (we abort the merge and leave the label untouched).
+    The issue is claimed, branched off the run branch into its own worktree, and
+    run through the graph with a bounded implement retry: a failed attempt (a
+    crash, or clean-but-gates-red) is retried in place with a handoff document
+    and prior-attempt context (see :func:`_run_implement_attempts`). When the
+    gates finally pass the work is committed and a clean merge folds it into the
+    run; the issue worktree and branch are then removed.
+
+    An issue that exhausts its retries is labelled ``ready-for-human`` and
+    skipped (recorded as not merged) so the run continues to the next issue — one
+    stuck item does not sink the batch. On a merge that does not apply cleanly
+    the issue is likewise recorded as not merged and skipped; turning *that* skip
+    into a ready-for-human handoff is issue #8, so this leaves that seam (we abort
+    the merge and leave the label untouched there).
     """
     branch = issue_branch_name(issue)
     issue_source.claim(issue.number, assignee=assignee)
@@ -154,11 +377,31 @@ def _work_issue(
         cwd=workspace,
     )
 
-    graph = load_graph(fixture_dir)
-    phase_results = GraphExecutor(runtime, fixture_dir=fixture_dir).execute(
-        graph, cwd=issue_worktree
+    passed, phase_results = _run_implement_attempts(
+        issue,
+        runtime=runtime,
+        fixture_dir=fixture_dir,
+        run_id=run_id,
+        issue_worktree=issue_worktree,
+        impl_retries=impl_retries,
+        gate_check=gate_check,
+        runner=runner,
     )
-    _write_telemetry(fixture_dir, run_id, issue, phase_results)
+    if phase_results:
+        _write_telemetry(fixture_dir, run_id, issue, phase_results)
+
+    if not passed:
+        # Retries exhausted: hand the issue to a human and move on. Cleaning up
+        # the worktree and branch here keeps the batch tidy for the next issue.
+        issue_source.mark_for_human(issue.number)
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"#{issue.number} exhausted its retries; marked ready-for-human.",
+        )
+        cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
+        runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
+        return IssueOutcome(issue=issue, branch=branch, merged=False)
 
     runner(["git", "add", "-A"], capture=True, cwd=issue_worktree)
     runner(
@@ -227,6 +470,8 @@ def run_batch(
     assignee: str,
     run_id: str,
     iterations: int = 1,
+    impl_retries: int = 2,
+    gate_check: GateCheck | None = None,
     workspace: Path | None = None,
     worktree_root: Path | None = None,
     include_unassigned: bool = False,
@@ -241,7 +486,15 @@ def run_batch(
     run branch. One pull request is opened for the run, closing every issue that
     merged. ``run_id`` is injected (not read from a clock) to keep runs
     deterministic for tests.
+
+    A failed implement attempt is retried up to ``impl_retries`` times
+    (``1 + impl_retries`` attempts total) with a handoff document and
+    prior-attempt context; ``gate_check`` decides whether an attempt's quality
+    gates passed (default: every attempt passes, so no retry fires). An issue
+    that exhausts its retries is labelled ``ready-for-human`` and the run
+    continues to the next issue.
     """
+    gate_check = gate_check or _gates_always_pass
     workspace = workspace or Path.cwd()
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
@@ -287,6 +540,8 @@ def run_batch(
                 assignee=assignee,
                 workspace=workspace,
                 runner=runner,
+                impl_retries=impl_retries,
+                gate_check=gate_check,
             )
         )
 

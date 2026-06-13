@@ -89,6 +89,10 @@ class IssueSource(ABC):
     def claim(self, number: int, *, assignee: str) -> None:
         """Claim an issue so a second run does not collide on it."""
 
+    @abstractmethod
+    def mark_for_human(self, number: int) -> None:
+        """Label an issue for a human after the agent could not finish it."""
+
 
 class GitHubIssueSource(IssueSource):
     """An Issue source backed by GitHub Issues via the ``gh`` CLI."""
@@ -98,10 +102,12 @@ class GitHubIssueSource(IssueSource):
         repo: str,
         *,
         label: str = "ready-for-agent",
+        human_label: str = "ready-for-human",
         runner: Runner = run_cmd,
     ) -> None:
         self.repo = repo
         self.label = label
+        self.human_label = human_label
         self._run = runner
 
     def list_ready(self) -> list[IssueRef]:
@@ -158,6 +164,26 @@ class GitHubIssueSource(IssueSource):
                 assignee,
                 "--remove-label",
                 self.label,
+            ],
+            capture=True,
+        )
+
+    def mark_for_human(self, number: int) -> None:
+        """Add the ready-for-human label so a person picks the issue up.
+
+        Used when an issue exhausts its implement retries: the run leaves the
+        label behind and moves on, so one stuck item does not sink the batch.
+        """
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                self.repo,
+                "--add-label",
+                self.human_label,
             ],
             capture=True,
         )
