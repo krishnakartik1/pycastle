@@ -10,14 +10,14 @@ the Project fixture under ``.pycastle/runs/<run_id>/`` (an ignored path, so run
 output is never committed).
 
 A failed implement attempt (an agent crash, or a clean run whose gates come
-back red) is retried in place on the same worktree (#7): a handoff document is
+back red) is retried in place on the same worktree (#8): a handoff document is
 written summarising what was tried and what to fix, and the next attempt carries
 that context. For Codex the handoff resumes the thread that did the failed
 attempt; Claude has no thread resume, so its handoff is a fresh call carrying
 the prior-attempt context. An item that exhausts its retries is labelled
 ``ready-for-human`` and the run continues to the next item.
 
-The merge-conflict / interrupt restore paths (#8) are out of scope here; this
+The merge-conflict / interrupt restore paths (#9) are out of scope here; this
 slice leaves clear seams for them and otherwise records and skips an issue whose
 merge does not apply cleanly.
 """
@@ -140,7 +140,7 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
 
     Provided so a run leaves no worktrees behind; the interrupt-driven
     cleanup-and-restore path (restoring the ready label, aborting mid-issue) is
-    issue #8 and is not implemented here.
+    issue #9 and is not implemented here.
     """
     runner(
         ["git", "worktree", "remove", str(worktree), "--force"],
@@ -362,7 +362,7 @@ def _work_issue(
     skipped (recorded as not merged) so the run continues to the next issue — one
     stuck item does not sink the batch. On a merge that does not apply cleanly
     the issue is likewise recorded as not merged and skipped; turning *that* skip
-    into a ready-for-human handoff is issue #8, so this leaves that seam (we abort
+    into a ready-for-human handoff is issue #9, so this leaves that seam (we abort
     the merge and leave the label untouched there).
     """
     branch = issue_branch_name(issue)
@@ -437,7 +437,7 @@ def _merge_issue_branch(
 
     A clean merge is enough for this slice. On a merge that does not apply
     cleanly the merge is aborted and ``False`` returned so the caller skips the
-    issue. Turning that skip into a ready-for-human handoff is issue #8; this is
+    issue. Turning that skip into a ready-for-human handoff is issue #9; this is
     the seam — do not add the label here.
     """
     merge = runner(
@@ -449,12 +449,12 @@ def _merge_issue_branch(
         _append_log(fixture_dir, run_id, f"Merged #{issue.number} into {run_id}")
         return True
 
-    # Seam for #8: a conflicting merge is aborted and the issue skipped here;
+    # Seam for #9: a conflicting merge is aborted and the issue skipped here;
     # the ready-for-human label + restore is added in that slice.
     _append_log(
         fixture_dir,
         run_id,
-        f"Merge of #{issue.number} did not apply cleanly; skipping (see #8).",
+        f"Merge of #{issue.number} did not apply cleanly; skipping (see #9).",
     )
     runner(["git", "merge", "--abort"], capture=True, cwd=run_worktree)
     return False
