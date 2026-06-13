@@ -5,6 +5,15 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class TokenUsage(BaseModel):
+    """Per-invocation token counts reported by a Runtime, when available."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+
+
 class Telemetry(BaseModel):
     """A per-phase record of what a Runtime invocation cost and did."""
 
@@ -13,6 +22,7 @@ class Telemetry(BaseModel):
     cost_usd: float | None = None
     duration_ms: int | None = None
     num_turns: int | None = None
+    usage: TokenUsage | None = None
     is_error: bool = False
 
 

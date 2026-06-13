@@ -43,8 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--runtime",
         choices=RUNTIMES,
-        default="stub",
-        help="Runtime to drive the loop (default: stub until real adapters land)",
+        default="claude",
+        help="Runtime to drive the loop (default: claude; stub is selectable)",
     )
     run_parser.add_argument(
         "--assignee",

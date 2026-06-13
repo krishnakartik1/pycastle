@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from pycastle.runtime import STUB_MARKER, Runtime, StubRuntime, make_runtime
+from pycastle.runtime import (
+    STUB_MARKER,
+    ClaudeRuntime,
+    Runtime,
+    StubRuntime,
+    make_runtime,
+)
 
 
 def test_stub_runtime_satisfies_runtime_protocol() -> None:
@@ -28,9 +34,11 @@ def test_make_runtime_returns_stub() -> None:
     assert isinstance(make_runtime("stub"), StubRuntime)
 
 
+def test_make_runtime_returns_claude() -> None:
+    assert isinstance(make_runtime("claude"), ClaudeRuntime)
+
+
 def test_make_runtime_defers_real_adapters() -> None:
-    with pytest.raises(NotImplementedError):
-        make_runtime("claude")
     with pytest.raises(NotImplementedError):
         make_runtime("codex")
 
