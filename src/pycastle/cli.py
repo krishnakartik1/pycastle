@@ -7,11 +7,12 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
+from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
 from .orchestrator import run as run_loop
 from .preflight import PreflightError, check_required_commands
-from .runtime import make_runtime
+from .runtime import ClaudeRuntime, Runtime, make_runtime
 
 logger = logging.getLogger("pycastle")
 
@@ -57,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also work issues that have no assignee",
     )
+    run_parser.add_argument(
+        "--sandbox",
+        choices=("host", "docker"),
+        default="host",
+        help=(
+            "Where the runtime runs: on the host (default) or inside the "
+            "Docker agent sandbox"
+        ),
+    )
     return parser
 
 
@@ -86,9 +96,28 @@ def _resolve_assignee(login: str) -> str:
     return resolved
 
 
+def _build_runtime(runtime_name: str, sandbox_kind: str, workspace: Path) -> Runtime:
+    """Build the Runtime for a run, sandboxed in Docker when asked.
+
+    ``--sandbox docker`` with the Claude runtime wraps each phase's ``claude``
+    argv into a ``docker run`` argv, so both the Runtime and the commands it
+    invokes run inside the agent container. Every other combination runs the
+    runtime on the host as before.
+    """
+    if sandbox_kind == "docker":
+        if runtime_name == "claude":
+            return ClaudeRuntime.in_docker(workspace=workspace)
+        raise NotImplementedError(
+            f"The Docker sandbox for the {runtime_name!r} runtime lands in a "
+            "later slice; run it with --sandbox host for now."
+        )
+    return make_runtime(runtime_name)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``."""
-    runtime = make_runtime(args.runtime)
+    workspace = Path.cwd()
+    runtime = _build_runtime(args.runtime, args.sandbox, workspace)
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
@@ -110,14 +139,56 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome.pr_opened else 1
 
 
+def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
+    """Dispatch ``pycastle sandbox setup``: onboard a runtime's Docker auth.
+
+    For Claude this runs the interactive login into the per-Runtime auth volume
+    and then confirms auth from a *fresh* container. The login is interactive
+    (it needs a TTY for the browser flow); the headless token fallback is
+    documented in :mod:`pycastle.sandbox`. Credential contents are never read
+    or printed — auth is confirmed only by the agent answering the status
+    prompt. Codex onboarding lands in a later slice.
+    """
+    if args.runtime != "claude":
+        logger.error(
+            "`pycastle sandbox setup --runtime %s` lands in a later slice.",
+            args.runtime,
+        )
+        return 2
+
+    logger.info(
+        "Logging the claude runtime into volume %s", sandbox.auth_volume("claude")
+    )
+    login = run_cmd(sandbox.build_login_command("claude"))
+    if getattr(login, "returncode", 1) != 0:
+        logger.error("Login failed; the auth volume was not onboarded.")
+        return 1
+
+    logger.info("Confirming auth from a fresh container...")
+    status = run_cmd(sandbox.build_status_command("claude"))
+    if getattr(status, "returncode", 1) != 0:
+        logger.error("Fresh-container auth check failed; credentials are not usable.")
+        return 1
+
+    logger.info("The claude runtime is authenticated and ready.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, run preflight, and dispatch the chosen command."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
 
     required = ["git", "gh"]
-    if args.command == "run" and args.runtime in {"claude", "codex"}:
-        required.append(args.runtime)
+    if args.command == "run":
+        if args.sandbox == "docker":
+            # Docker is the isolation boundary: the host needs docker, not the
+            # agent CLI (which lives inside the image).
+            required.append("docker")
+        elif args.runtime in {"claude", "codex"}:
+            required.append(args.runtime)
+    if args.command == "sandbox":
+        required.append("docker")
     try:
         check_required_commands(required)
     except PreflightError as exc:
@@ -130,6 +201,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("`pycastle init` lands in a later slice.")
         return 2
     if args.command == "sandbox":
-        logger.error("`pycastle sandbox setup` lands in a later slice.")
-        return 2
+        return _cmd_sandbox_setup(args)
     return 2

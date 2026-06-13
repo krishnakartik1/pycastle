@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +18,17 @@ def test_parses_run_arguments() -> None:
     assert args.iterations == 3
     assert args.runtime == "stub"
     assert args.include_unassigned is False
+    assert args.sandbox == "host"
+
+
+def test_run_sandbox_defaults_to_host() -> None:
+    args = build_parser().parse_args(["run"])
+    assert args.sandbox == "host"
+
+
+def test_parses_run_sandbox_docker() -> None:
+    args = build_parser().parse_args(["run", "--sandbox", "docker"])
+    assert args.sandbox == "docker"
 
 
 def test_parses_sandbox_setup() -> None:
@@ -53,3 +65,117 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_main_reports_unimplemented_init(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     assert main(["init"]) == 2
+
+
+def test_run_docker_builds_a_sandboxed_claude_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run --sandbox docker --runtime claude`` drives Claude inside Docker.
+
+    The runtime handed to the orchestrator wraps its inner argv into a
+    ``docker run`` argv, so both the Runtime and its commands run in the
+    container. Everything external is mocked: no real Docker, gh, or git.
+    """
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    captured = {}
+
+    def fake_run_loop(*, runtime: object, **_kwargs: object) -> MagicMock:
+        captured["runtime"] = runtime
+        outcome = MagicMock()
+        outcome.issue = None
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    # The handed-off runtime carries a wrapper that produces a docker argv.
+    assert runtime.argv_wrapper is not None
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    assert wrapped[:3] == ["docker", "run", "--rm"]
+    assert "pycastle-claude-auth:/home/node/.claude" in wrapped
+
+
+def test_run_docker_requires_docker_in_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, list[str]] = {}
+
+    def record(commands: list[str]) -> None:
+        seen["commands"] = list(commands)
+
+    monkeypatch.setattr(cli, "check_required_commands", record)
+    monkeypatch.setattr(cli, "_cmd_run", lambda _args: 0)
+
+    main(["run", "--sandbox", "docker", "--runtime", "claude"])
+
+    assert "docker" in seen["commands"]
+    # The host claude binary is not required when the agent runs in Docker.
+    assert "claude" not in seen["commands"]
+
+
+def test_sandbox_setup_claude_runs_login_then_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sandbox setup --runtime claude`` runs the login then the status check.
+
+    The interactive login is not unit-tested; the command *construction* and
+    ordering are. Docker is never really invoked: the runner is a mock.
+    """
+    from pycastle import sandbox as sandbox_mod
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    calls: list[list[str]] = []
+
+    def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", fake_runner)
+
+    assert main(["sandbox", "setup", "--runtime", "claude"]) == 0
+
+    assert calls[0] == sandbox_mod.build_login_command("claude")
+    assert calls[1] == sandbox_mod.build_status_command("claude")
+    # Credentials are never read: no cat/echo of the volume anywhere.
+    for argv in calls:
+        joined = " ".join(argv)
+        assert "cat" not in joined
+        assert ".credentials.json" not in joined
+
+
+def test_sandbox_setup_status_failure_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        # Login succeeds, the fresh-container status check fails.
+        proc.returncode = 0 if "/login" in args else 1
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", fake_runner)
+
+    assert main(["sandbox", "setup", "--runtime", "claude"]) == 1
+
+
+def test_sandbox_setup_codex_is_a_later_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    runner = MagicMock()
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", "codex"]) == 2
+    # No docker commands run for the deferred runtime.
+    runner.assert_not_called()

@@ -346,6 +346,60 @@ def test_result_event_with_non_dict_usage_does_not_throw(
     assert result.telemetry.num_turns == 1
 
 
+def test_docker_runtime_wraps_inner_argv_into_docker_run(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    """A docker-sandboxed Claude run invokes ``docker run``, not bare claude.
+
+    The inner ``claude …`` argv is unchanged; the sandbox wraps it. The same
+    stream-json parsing applies to the container's stdout.
+    """
+    from pycastle import sandbox
+
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    result = runtime.run("a prompt", cwd=tmp_path, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    # The whole command is a docker invocation wrapping the claude argv.
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert sandbox.DEFAULT_IMAGE in argv
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert argv[image_idx + 1 : image_idx + 4] == ["claude", "-p", "a prompt"]
+    assert "pycastle-claude-auth:/home/node/.claude" in argv
+    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" in argv
+    # Same stream-json parsing as the host path.
+    assert result.output == "Implemented the feature."
+    assert result.telemetry.num_turns == 3
+
+
+def test_docker_runtime_runs_both_runtime_and_commands_in_container(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Every phase the Runtime drives is wrapped: there is no host-side claude.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime.run("p", cwd=tmp_path, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    assert argv[0] == "docker"
+    # The non-docker host claude binary never appears as the process argv[0].
+    assert argv[0] != "claude"
+
+
+def test_host_runtime_still_invokes_bare_claude(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Without a sandbox wrapper the runtime runs claude directly on the host.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert mock_popen.call_args.args[0][0] == "claude"
+
+
 def test_run_works_one_issue_end_to_end_via_claude(
     mock_popen: MagicMock, fixture_dir: Path, tmp_path: Path
 ) -> None:

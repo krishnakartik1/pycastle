@@ -8,9 +8,10 @@ shape of its own workflow, supports both Claude Code and Codex as the runtime,
 and can run the agent inside Docker without forcing API-key billing.
 
 > **Status:** v0.1 in progress. This is the walking skeleton — `pycastle run`
-> works a single ready issue end to end through a stub runtime. Real Claude and
-> Codex adapters, the Docker sandbox, batch runs, retries, and `pycastle init`
-> land in subsequent slices. See the GitHub issues for the roadmap.
+> works a single ready issue end to end through a stub or the real Claude
+> runtime, on the host or inside the Docker agent sandbox. The Codex adapter,
+> batch runs, retries, and `pycastle init` land in subsequent slices. See the
+> GitHub issues for the roadmap.
 
 ## Install (development)
 
@@ -21,9 +22,40 @@ pip install -e ".[dev]"
 ## Commands
 
 - `pycastle run -i N --runtime stub` — work up to N ready issues into one PR.
+- `pycastle run --sandbox docker --runtime claude` — run the loop with the
+  Claude runtime *inside* the Docker agent sandbox (see below).
 - `pycastle init` — scaffold a `.pycastle/` fixture into a repo *(coming soon)*.
-- `pycastle sandbox setup --runtime claude|codex` — log a runtime into its
-  Docker auth volume *(coming soon)*.
+- `pycastle sandbox setup --runtime claude` — log the Claude runtime into its
+  Docker auth volume, then confirm auth from a fresh container. Codex *(coming
+  soon)*.
+
+## The Docker agent sandbox
+
+`--sandbox docker` runs the agent inside a container instead of on the host, so
+both the runtime and every command it invokes are isolated. The container runs
+as the non-root user `node` (home `/home/node`), based on a `node:22` image, and
+bind-mounts the project workspace so the agent reads and writes the real tree.
+
+Auth is a subscription login stored in a Docker volume — one volume **per
+runtime**, shared across every project, named like `pycastle-claude-auth` and
+mounted at `/home/node/.claude` with `CLAUDE_CONFIG_DIR` pinned to it. You log
+in once per agent, not once per repo. Credential file contents are never read,
+printed, or copied; `sandbox setup` confirms auth only by having the agent
+answer a one-word prompt from a fresh container.
+
+Onboard auth with:
+
+```bash
+pycastle sandbox setup --runtime claude
+```
+
+**Headless token fallback.** `sandbox setup` runs the interactive browser login,
+which needs a TTY. On a headless host (CI, a server with no browser), either run
+the login on a machine that has a browser and move the resulting credentials
+into the same named volume, or skip the volume and pass a long-lived token into
+the container via the `CLAUDE_CODE_OAUTH_TOKEN` environment variable. The token
+is read from the host environment at run time and never written to the command
+line.
 
 ## How it fits together
 

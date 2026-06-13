@@ -1,0 +1,192 @@
+"""Pure Docker argv builders for the agent sandbox.
+
+Every test here asserts the exact ``docker`` argv a builder produces. No real
+Docker runs: the builders are pure functions of their inputs, so the tests are
+plain equality checks. These lock in the encoded decisions from ADR-0002
+(subscription-backed auth volume) and ADR-0003 (Docker is the isolation
+boundary): non-root ``node``, a ``node:22``-based image, one auth volume per
+Runtime, and ``CLAUDE_CONFIG_DIR`` pinning runtime state.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pycastle import sandbox
+
+
+def test_default_image_is_node_22_based() -> None:
+    # The agent image is based on node:22 so the bundled claude CLI runs. The
+    # tag names that base ("node22") so the lineage is legible from the argv.
+    assert "node22" in sandbox.DEFAULT_IMAGE
+    assert sandbox.DEFAULT_IMAGE == "pycastle/agent:node22"
+
+
+def test_auth_volume_is_stable_per_runtime() -> None:
+    # One volume per runtime, shared across projects: the name depends only on
+    # the runtime, never on a repo or workspace path.
+    assert sandbox.auth_volume("claude") == "pycastle-claude-auth"
+    assert sandbox.auth_volume("codex") == "pycastle-codex-auth"
+    assert sandbox.auth_volume("claude") == sandbox.auth_volume("claude")
+
+
+def test_build_run_command_wraps_inner_argv() -> None:
+    workspace = Path("/home/krishna/work/repo")
+    inner = ["claude", "-p", "do the work", "--output-format", "stream-json"]
+
+    argv = sandbox.build_run_command("claude", inner_argv=inner, workspace=workspace)
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "node",
+        "-w",
+        "/home/krishna/work/repo",
+        "-v",
+        "pycastle-claude-auth:/home/node/.claude",
+        "-v",
+        "/home/krishna/work/repo:/home/krishna/work/repo",
+        "-e",
+        "CLAUDE_CONFIG_DIR=/home/node/.claude",
+        sandbox.DEFAULT_IMAGE,
+        "claude",
+        "-p",
+        "do the work",
+        "--output-format",
+        "stream-json",
+    ]
+
+
+def test_build_run_command_runs_non_root_node() -> None:
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    assert "-u" in argv
+    assert argv[argv.index("-u") + 1] == "node"
+
+
+def test_build_run_command_pins_config_dir_under_node_home() -> None:
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    assert "-e" in argv
+    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" in argv
+
+
+def test_build_run_command_mounts_auth_volume_at_node_home() -> None:
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    # The per-runtime auth volume is mounted under node's home, where the claude
+    # CLI looks for its credentials.
+    assert "pycastle-claude-auth:/home/node/.claude" in argv
+
+
+def test_build_run_command_bind_mounts_workspace_for_readwrite() -> None:
+    workspace = Path("/home/krishna/proj")
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=workspace
+    )
+    # The workspace is bind-mounted at the same path so the agent reads and
+    # writes the real tree, and the working dir is set to it.
+    assert f"{workspace}:{workspace}" in argv
+    assert argv[argv.index("-w") + 1] == str(workspace)
+
+
+def test_build_run_command_uses_rm() -> None:
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    assert argv[:3] == ["docker", "run", "--rm"]
+
+
+def test_build_run_command_accepts_custom_image() -> None:
+    argv = sandbox.build_run_command(
+        "claude",
+        inner_argv=["claude"],
+        workspace=Path("/w"),
+        image="my/agent:dev",
+    )
+    # The image sits just before the inner argv.
+    assert argv[argv.index("my/agent:dev") + 1] == "claude"
+
+
+def test_build_run_command_does_not_leak_credentials() -> None:
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    joined = " ".join(argv)
+    # Never cat/echo or otherwise read credential file contents.
+    for forbidden in ("cat", "echo", ".credentials.json", "/home/node/.claude/"):
+        assert forbidden not in joined
+
+
+def test_build_login_command_is_interactive_into_volume() -> None:
+    argv = sandbox.build_login_command("claude")
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-it",
+        "-u",
+        "node",
+        "-v",
+        "pycastle-claude-auth:/home/node/.claude",
+        "-e",
+        "CLAUDE_CONFIG_DIR=/home/node/.claude",
+        sandbox.DEFAULT_IMAGE,
+        "claude",
+        "/login",
+    ]
+
+
+def test_build_login_command_accepts_custom_image() -> None:
+    argv = sandbox.build_login_command("claude", image="my/agent:dev")
+    assert argv[argv.index("my/agent:dev") + 1 : argv.index("my/agent:dev") + 3] == [
+        "claude",
+        "/login",
+    ]
+
+
+def test_build_status_command_checks_from_fresh_container() -> None:
+    argv = sandbox.build_status_command("claude")
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "node",
+        "-v",
+        "pycastle-claude-auth:/home/node/.claude",
+        "-e",
+        "CLAUDE_CONFIG_DIR=/home/node/.claude",
+        sandbox.DEFAULT_IMAGE,
+        "claude",
+        "-p",
+        "respond with the single word: ok",
+        "--max-turns",
+        "1",
+    ]
+
+
+def test_status_command_does_not_print_credentials() -> None:
+    # The status check proves auth works by making the agent answer, never by
+    # reading or printing the credential file.
+    argv = sandbox.build_status_command("claude")
+    joined = " ".join(argv)
+    for forbidden in ("cat", "echo", ".credentials.json"):
+        assert forbidden not in joined
+
+
+def test_login_and_status_share_one_volume_across_projects() -> None:
+    # Login and status both target the same per-runtime volume; nothing here is
+    # keyed on a project path, so a single login serves every repo.
+    login = sandbox.build_login_command("claude")
+    status = sandbox.build_status_command("claude")
+    vol = "pycastle-claude-auth:/home/node/.claude"
+    assert vol in login
+    assert vol in status

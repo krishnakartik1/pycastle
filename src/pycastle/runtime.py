@@ -11,9 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from . import sandbox
 from .models import RuntimeResult, Telemetry, TokenUsage
 
 logger = logging.getLogger(__name__)
@@ -71,12 +73,19 @@ class StubRuntime:
 
 
 class ClaudeRuntime:
-    """Drive the real ``claude`` CLI on the host behind the Runtime interface.
+    """Drive the real ``claude`` CLI behind the Runtime interface.
 
     It builds the ``claude`` command, runs it, and parses the ``stream-json``
     JSONL stream into output text plus a telemetry record. A non-zero agent
     exit (surfaced by the CLI's final ``result`` event or the process exit
     code) is raised as :class:`AgentCrashError`.
+
+    By default the ``claude`` CLI runs on the host. Pass ``argv_wrapper`` (or
+    construct via :meth:`in_docker`) to wrap the inner ``claude …`` argv before
+    it is launched — for example, into a ``docker run`` argv so both the
+    Runtime and the commands it invokes run inside the agent sandbox. The
+    wrapper changes only how the process is launched; the same stream-json
+    parsing applies to its stdout either way.
     """
 
     name = "claude"
@@ -88,12 +97,47 @@ class ClaudeRuntime:
         model: str | None = None,
         max_turns: int | None = None,
         dangerously_skip_permissions: bool = False,
+        argv_wrapper: Callable[[list[str]], list[str]] | None = None,
     ) -> None:
         """Configure the CLI invocation shared across phases."""
         self.command = command
         self.model = model
         self.max_turns = max_turns
         self.dangerously_skip_permissions = dangerously_skip_permissions
+        self.argv_wrapper = argv_wrapper
+
+    @classmethod
+    def in_docker(
+        cls,
+        *,
+        workspace: Path,
+        image: str = sandbox.DEFAULT_IMAGE,
+        model: str | None = None,
+        max_turns: int | None = None,
+        dangerously_skip_permissions: bool = False,
+    ) -> ClaudeRuntime:
+        """Build a Claude runtime that runs each phase inside the Docker sandbox.
+
+        The inner ``claude …`` argv is wrapped into a ``docker run`` argv (see
+        :func:`pycastle.sandbox.build_run_command`) so the agent runs as
+        non-root ``node`` against the per-Runtime auth volume, with
+        ``workspace`` bind-mounted so it can read and write the real tree.
+        """
+
+        def wrap(inner_argv: list[str]) -> list[str]:
+            return sandbox.build_run_command(
+                cls.name,
+                inner_argv=inner_argv,
+                workspace=workspace,
+                image=image,
+            )
+
+        return cls(
+            model=model,
+            max_turns=max_turns,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+            argv_wrapper=wrap,
+        )
 
     def build_command(self, prompt: str) -> list[str]:
         """Build the ``claude`` argv for a single non-interactive run."""
@@ -119,6 +163,8 @@ class ClaudeRuntime:
         Raises :class:`AgentCrashError` when the agent exits non-zero.
         """
         cmd = self.build_command(prompt)
+        if self.argv_wrapper is not None:
+            cmd = self.argv_wrapper(cmd)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
