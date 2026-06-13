@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from pycastle import orchestrator
-from pycastle.models import IssueRef
+from pycastle.models import IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import STUB_MARKER, StubRuntime
 
 
@@ -359,3 +359,126 @@ def test_worktrees_are_cleaned_up_even_when_an_issue_is_skipped(
     assert _calls_containing(
         runner, "git", "branch", "-D", "pycastle/issue-4-conflicts"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Default plan -> implement -> review graph, end to end (#7).                  #
+# --------------------------------------------------------------------------- #
+
+
+class _TimelineRuntime:
+    """A fake Runtime that appends each phase it runs to a shared timeline.
+
+    Sharing one ``timeline`` list with the timeline-aware runner lets a test
+    assert the interleaved order of agent phases and git operations — e.g. that
+    the ``review`` phase ran before the commit and merge.
+    """
+
+    name = "stub"
+
+    def __init__(self, timeline: list[str]) -> None:
+        self._timeline = timeline
+
+    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+        self._timeline.append(f"phase:{phase}")
+        (cwd / STUB_MARKER).write_text(f"phase {phase}\n")
+        return RuntimeResult(
+            output=f"ran {phase}",
+            telemetry=Telemetry(runtime=self.name, phase=phase, num_turns=1),
+        )
+
+
+def _timeline_runner(timeline: list[str]) -> MagicMock:
+    """A git-aware runner that records ``commit`` and ``merge`` on a timeline.
+
+    Like :func:`_git_aware_runner` it creates worktree directories so the stub
+    has a real ``cwd``; in addition it appends a marker to the shared timeline
+    when an issue branch is committed or merged, so a test can pin their order
+    relative to the agent phases. No real git or gh is ever invoked.
+    """
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+        elif argv[:2] == ["git", "commit"]:
+            timeline.append("git:commit")
+        elif argv[:2] == ["git", "merge"] and "--abort" not in argv:
+            timeline.append("git:merge")
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def test_default_run_completes_plan_implement_review_in_order(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A run drives the full plan → implement → review cycle on an issue, in order."""
+    issue = IssueRef(number=2, title="Full cycle", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    timeline: list[str] = []
+    runner = _timeline_runner(timeline)
+
+    outcome = orchestrator.run_batch(
+        runtime=_TimelineRuntime(timeline),
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    phases = [
+        event[len("phase:") :] for event in timeline if event.startswith("phase:")
+    ]
+    assert phases == ["plan", "implement", "review"]
+    assert outcome.completed == [2]
+
+
+def test_review_changes_are_committed_before_the_merge(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """The review phase runs and its changes are committed before ``git merge``.
+
+    Acceptance criterion: review tests edge cases and commits improvements
+    before merge. The single commit after the graph captures plan + implement +
+    review changes; this pins that the review phase ran, then the issue branch
+    was committed, then merged — review's work lands on the branch before it is
+    folded into the run branch.
+    """
+    issue = IssueRef(number=2, title="Review before merge", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    timeline: list[str] = []
+    runner = _timeline_runner(timeline)
+
+    orchestrator.run_batch(
+        runtime=_TimelineRuntime(timeline),
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # The review phase ran, then the branch was committed, then merged — in that
+    # order, so review's improvements are on the branch before the merge.
+    assert "phase:review" in timeline
+    assert "git:commit" in timeline
+    assert "git:merge" in timeline
+    review_at = timeline.index("phase:review")
+    commit_at = timeline.index("git:commit")
+    merge_at = timeline.index("git:merge")
+    assert review_at < commit_at < merge_at

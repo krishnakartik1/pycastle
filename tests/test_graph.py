@@ -28,3 +28,29 @@ def test_executor_runs_each_phase_through_the_runtime(fixture_dir: Path) -> None
 
     assert [r.phase for r in results] == ["implement"]
     assert (fixture_dir / "PYCASTLE_STUB.md").is_file()
+
+
+def test_default_graph_loads_plan_implement_review_in_order(
+    three_phase_fixture_dir: Path,
+) -> None:
+    """The default workflow graph is plan → implement → review, in that order."""
+    loaded = load_graph(three_phase_fixture_dir)
+
+    assert [p.name for p in loaded.phases] == ["plan", "implement", "review"]
+    assert [p.prompt for p in loaded.phases] == [
+        "plan.md",
+        "implement.md",
+        "review.md",
+    ]
+
+
+def test_executor_runs_the_three_phases_in_order(
+    three_phase_fixture_dir: Path,
+) -> None:
+    """Executing the default graph runs the three phases in plan→implement→review."""
+    loaded = load_graph(three_phase_fixture_dir)
+    executor = GraphExecutor(StubRuntime(), fixture_dir=three_phase_fixture_dir)
+
+    results = executor.execute(loaded, cwd=three_phase_fixture_dir)
+
+    assert [r.phase for r in results] == ["plan", "implement", "review"]
