@@ -335,6 +335,105 @@ def test_multiple_agent_messages_concatenate_in_order(
     assert result.output == "first second"
 
 
+def test_stream_without_turn_completed_degrades_no_crash(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # A stream that ends before any turn.completed (e.g. the agent answered but
+    # the process was cut short) still yields the captured output and thread id;
+    # telemetry just degrades — no usage, num_turns stays 0, and no crash.
+    events = [
+        {"type": "thread.started", "thread_id": "thread-789"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "partial answer"},
+        },
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "partial answer"
+    assert result.telemetry.thread_id == "thread-789"
+    assert result.telemetry.num_turns == 0
+    assert result.telemetry.usage is None
+    assert result.telemetry.is_error is False
+
+
+def test_multiple_turns_count_each_and_keep_last_usage(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # num_turns counts every turn.completed, and the usage record is the last
+    # turn's (it overwrites earlier turns), so a multi-turn run reports the final
+    # cumulative counts Codex emits rather than the first turn's.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        },
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 12,
+                "cached_input_tokens": 4,
+                "output_tokens": 9,
+                "reasoning_output_tokens": 6,
+            },
+        },
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.telemetry.num_turns == 2
+    assert result.telemetry.usage is not None
+    assert result.telemetry.usage.input_tokens == 12
+    assert result.telemetry.usage.cached_input_tokens == 4
+    assert result.telemetry.usage.output_tokens == 9
+    assert result.telemetry.usage.reasoning_output_tokens == 6
+
+
+def test_codex_telemetry_leaves_claude_cache_fields_none(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Codex maps onto cached_input_tokens / reasoning_output_tokens; the
+    # Claude-only cache fields must stay None so the two vocabularies never
+    # collide in one TokenUsage record.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    usage = result.telemetry.usage
+    assert usage is not None
+    assert usage.cached_input_tokens == 7
+    assert usage.reasoning_output_tokens == 3
+    # Claude's vocabulary is absent for a Codex run.
+    assert usage.cache_creation_input_tokens is None
+    assert usage.cache_read_input_tokens is None
+    # Codex reports no cost or runtime-side duration.
+    assert result.telemetry.cost_usd is None
+    assert result.telemetry.duration_ms is None
+
+
+def test_empty_agent_message_text_contributes_nothing(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # An agent_message item carrying no text (empty or missing) adds nothing to
+    # the output, so empty narration never injects blank strings into the result.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": ""}},
+        {"type": "item.completed", "item": {"type": "agent_message"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "real"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "real"
+
+
 def test_docker_runtime_wraps_inner_argv_into_docker_run(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:
