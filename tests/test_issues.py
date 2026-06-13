@@ -172,3 +172,24 @@ def test_github_source_mark_for_human_adds_the_label() -> None:
         ],
         capture=True,
     )
+
+
+def test_github_source_release_restores_the_ready_label() -> None:
+    runner = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    source.release(42)
+
+    runner.assert_called_once_with(
+        [
+            "gh",
+            "issue",
+            "edit",
+            "42",
+            "-R",
+            "owner/repo",
+            "--add-label",
+            "ready-for-agent",
+        ],
+        capture=True,
+    )

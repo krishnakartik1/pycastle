@@ -17,9 +17,12 @@ attempt; Claude has no thread resume, so its handoff is a fresh call carrying
 the prior-attempt context. An item that exhausts its retries is labelled
 ``ready-for-human`` and the run continues to the next item.
 
-The merge-conflict / interrupt restore paths (#9) are out of scope here; this
-slice leaves clear seams for them and otherwise records and skips an issue whose
-merge does not apply cleanly.
+A merge that does not apply cleanly does not fail the run (#9): the conflicting
+issue is labelled ``ready-for-human`` and the run continues with the remaining
+items. An interrupt (SIGINT) while an issue is in flight unwinds through a
+cleanup-and-restore path that removes the run's worktrees and releases the
+claimed issue back to ``ready-for-agent``, so a cancelled run leaves no orphaned
+worktrees and no issue stuck in a claimed state.
 """
 
 from __future__ import annotations
@@ -27,7 +30,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable
+import signal
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -138,9 +143,9 @@ def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
 def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
     """Remove a worktree and prune the registry.
 
-    Provided so a run leaves no worktrees behind; the interrupt-driven
-    cleanup-and-restore path (restoring the ready label, aborting mid-issue) is
-    issue #9 and is not implemented here.
+    Used both at the end of normal per-issue work and on the interrupt path
+    (:func:`_cleanup_interrupted`), so a cancelled run leaves no worktrees
+    behind.
     """
     runner(
         ["git", "worktree", "remove", str(worktree), "--force"],
@@ -148,6 +153,70 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
         cwd=cwd,
     )
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
+
+
+@contextmanager
+def _sigint_as_keyboard_interrupt() -> Iterator[None]:
+    """Make SIGINT raise ``KeyboardInterrupt`` for the duration of the run.
+
+    Ported in shape from Ralph's ``sigint_handler``: a SIGINT arriving mid-run is
+    turned into a :class:`KeyboardInterrupt` so the per-issue work unwinds
+    through the run's cleanup-and-restore path rather than killing the process
+    outright. The previous handler is restored on exit, and installing a handler
+    is skipped when not on the main thread (where ``signal.signal`` would raise).
+    """
+
+    def _raise(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGINT, _raise)
+    except ValueError:
+        # Not on the main thread: no handler to install; the default applies.
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _cleanup_interrupted(
+    *,
+    issue: IssueRef,
+    issue_source: IssueSource,
+    worktree_root: Path,
+    run_worktree: Path,
+    workspace: Path,
+    fixture_dir: Path,
+    run_id: str,
+    runner: Runner,
+) -> None:
+    """Tear down an interrupted run: remove worktrees, restore the ready state.
+
+    Called when an interrupt (SIGINT/``KeyboardInterrupt``) or any exception
+    escapes while ``issue`` is in flight. It removes that issue's worktree and
+    the run worktree so no orphaned worktrees are left, then releases the issue
+    back to ``ready-for-agent`` so it is not stuck claimed. Cleanup is
+    best-effort: a failure removing one worktree must not stop the release, so
+    each step is guarded and logged rather than allowed to mask the interrupt.
+    """
+    issue_worktree = worktree_root / f"issue-{issue.number}"
+    for worktree in (issue_worktree, run_worktree):
+        try:
+            cleanup_worktree(worktree, runner=runner, cwd=workspace)
+        except Exception:  # noqa: BLE001 - best-effort teardown, never re-raise here
+            logger.exception("Failed to remove worktree %s during interrupt", worktree)
+    try:
+        issue_source.release(issue.number)
+    except Exception:  # noqa: BLE001 - best-effort restore, never mask the interrupt
+        logger.exception("Failed to restore ready state on #%s", issue.number)
+    _append_log(
+        fixture_dir,
+        run_id,
+        f"Run interrupted while working #{issue.number}; "
+        "worktrees removed and issue released to ready-for-agent.",
+    )
 
 
 _HANDOFF_PROMPT = (
@@ -360,10 +429,10 @@ def _work_issue(
 
     An issue that exhausts its retries is labelled ``ready-for-human`` and
     skipped (recorded as not merged) so the run continues to the next issue — one
-    stuck item does not sink the batch. On a merge that does not apply cleanly
-    the issue is likewise recorded as not merged and skipped; turning *that* skip
-    into a ready-for-human handoff is issue #9, so this leaves that seam (we abort
-    the merge and leave the label untouched there).
+    stuck item does not sink the batch. A merge that does not apply cleanly is
+    likewise recorded as not merged and skipped, and the issue is labelled
+    ``ready-for-human`` (#9) so a person resolves the conflict while the run
+    carries on with the remaining items.
     """
     branch = issue_branch_name(issue)
     issue_source.claim(issue.number, assignee=assignee)
@@ -418,6 +487,15 @@ def _work_issue(
         run_worktree=run_worktree,
         runner=runner,
     )
+    if not merged:
+        # The merge conflicted and was aborted (#9): hand the issue to a human so
+        # the loop keeps going with the remaining items instead of failing the run.
+        issue_source.mark_for_human(issue.number)
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"#{issue.number} did not merge cleanly; marked ready-for-human.",
+        )
 
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
@@ -435,10 +513,10 @@ def _merge_issue_branch(
 ) -> bool:
     """Merge an issue branch into the run worktree; return True on a clean merge.
 
-    A clean merge is enough for this slice. On a merge that does not apply
-    cleanly the merge is aborted and ``False`` returned so the caller skips the
-    issue. Turning that skip into a ready-for-human handoff is issue #9; this is
-    the seam — do not add the label here.
+    On a merge that does not apply cleanly the merge is aborted and ``False``
+    returned so the caller skips the issue. The caller (:func:`_work_issue`)
+    labels a skipped issue ``ready-for-human`` (#9); this stays git-only and does
+    not touch the Issue source.
     """
     merge = runner(
         ["git", "merge", branch, "--no-edit"],
@@ -449,12 +527,12 @@ def _merge_issue_branch(
         _append_log(fixture_dir, run_id, f"Merged #{issue.number} into {run_id}")
         return True
 
-    # Seam for #9: a conflicting merge is aborted and the issue skipped here;
-    # the ready-for-human label + restore is added in that slice.
+    # A conflicting merge is aborted and the issue skipped; the caller marks it
+    # ready-for-human so a person resolves the conflict (#9).
     _append_log(
         fixture_dir,
         run_id,
-        f"Merge of #{issue.number} did not apply cleanly; skipping (see #9).",
+        f"Merge of #{issue.number} did not apply cleanly; skipping for a human.",
     )
     runner(["git", "merge", "--abort"], capture=True, cwd=run_worktree)
     return False
@@ -526,24 +604,48 @@ def run_batch(
         f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
     )
 
-    for issue in selected:
-        outcome.issues.append(
-            _work_issue(
-                issue,
-                runtime=runtime,
-                issue_source=issue_source,
-                fixture_dir=fixture_dir,
-                run_id=run_id,
-                run_branch=run_branch,
-                run_worktree=run_worktree,
-                worktree_root=worktree_root,
-                assignee=assignee,
-                workspace=workspace,
-                runner=runner,
-                impl_retries=impl_retries,
-                gate_check=gate_check,
-            )
-        )
+    # Track the issue currently in flight so an interrupt (SIGINT) or any
+    # exception mid-issue can clean up that issue's worktree and restore its
+    # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
+    in_flight: IssueRef | None = None
+    with _sigint_as_keyboard_interrupt():
+        try:
+            for issue in selected:
+                in_flight = issue
+                outcome.issues.append(
+                    _work_issue(
+                        issue,
+                        runtime=runtime,
+                        issue_source=issue_source,
+                        fixture_dir=fixture_dir,
+                        run_id=run_id,
+                        run_branch=run_branch,
+                        run_worktree=run_worktree,
+                        worktree_root=worktree_root,
+                        assignee=assignee,
+                        workspace=workspace,
+                        runner=runner,
+                        impl_retries=impl_retries,
+                        gate_check=gate_check,
+                    )
+                )
+                in_flight = None
+        except BaseException:
+            # An interrupt or unexpected error mid-issue: leave no orphaned
+            # worktrees and no stuck-claimed issue, then re-raise so the caller
+            # sees the cancellation.
+            if in_flight is not None:
+                _cleanup_interrupted(
+                    issue=in_flight,
+                    issue_source=issue_source,
+                    worktree_root=worktree_root,
+                    run_worktree=run_worktree,
+                    workspace=workspace,
+                    fixture_dir=fixture_dir,
+                    run_id=run_id,
+                    runner=runner,
+                )
+            raise
 
     completed = outcome.completed
     if completed:

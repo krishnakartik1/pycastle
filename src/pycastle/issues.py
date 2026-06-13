@@ -93,6 +93,10 @@ class IssueSource(ABC):
     def mark_for_human(self, number: int) -> None:
         """Label an issue for a human after the agent could not finish it."""
 
+    @abstractmethod
+    def release(self, number: int) -> None:
+        """Return a claimed issue to the ready pool after an interrupted run."""
+
 
 class GitHubIssueSource(IssueSource):
     """An Issue source backed by GitHub Issues via the ``gh`` CLI."""
@@ -184,6 +188,28 @@ class GitHubIssueSource(IssueSource):
                 self.repo,
                 "--add-label",
                 self.human_label,
+            ],
+            capture=True,
+        )
+
+    def release(self, number: int) -> None:
+        """Re-add the ready label so a claimed issue returns to the agent pool.
+
+        The mirror of :meth:`claim`'s label drop: when a run is interrupted
+        (SIGINT) with an issue in flight, the run restores ``ready-for-agent``
+        so the issue is not left stuck in a claimed state and the next run can
+        pick it up again.
+        """
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                self.repo,
+                "--add-label",
+                self.label,
             ],
             capture=True,
         )

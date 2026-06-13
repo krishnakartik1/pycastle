@@ -175,12 +175,16 @@ def test_successful_branches_merge_and_one_pr_is_opened(
     assert outcome.pr_opened is True
 
 
-def test_failed_merge_is_skipped_and_left_for_issue_8(
+def test_merge_conflict_marks_for_human_and_run_continues(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
+    # A merge conflict on one issue must not sink the batch: the conflicting
+    # issue is handed to a human (ready-for-human) and the run keeps going with
+    # the remaining items (#9).
     issues = [
         IssueRef(number=2, title="Clean", assignees=["krishna"]),
         IssueRef(number=4, title="Conflicts", assignees=["krishna"]),
+        IssueRef(number=6, title="Also clean", assignees=["krishna"]),
     ]
     source = MagicMock()
     source.list_ready.return_value = issues
@@ -201,12 +205,16 @@ def test_failed_merge_is_skipped_and_left_for_issue_8(
         runner=runner,
     )
 
-    # The clean issue merged; the conflicting one was aborted and recorded.
-    assert outcome.completed == [2]
+    # The clean issues merged; the conflicting one was aborted and recorded.
+    assert outcome.completed == [2, 6]
     merged = {o.issue.number: o.merged for o in outcome.issues}
-    assert merged == {2: True, 4: False}
+    assert merged == {2: True, 4: False, 6: True}
     assert _calls_containing(runner, "git", "merge", "--abort")
-    # The PR closes only the merged issue.
+
+    # The conflicting issue is marked for human handling; the clean ones are not.
+    source.mark_for_human.assert_called_once_with(4)
+
+    # The PR closes only the merged issues, never the conflicting one.
     pr_calls = [
         call.args[0]
         for call in runner.call_args_list
@@ -214,6 +222,7 @@ def test_failed_merge_is_skipped_and_left_for_issue_8(
     ]
     body = pr_calls[0][pr_calls[0].index("--body") + 1]
     assert "- Closes #2" in body
+    assert "- Closes #6" in body
     assert "#4" not in body
 
 
@@ -525,3 +534,111 @@ def test_full_run_interleaves_phases_then_commit_then_merge(
         "git:merge",
     ]
     assert outcome.completed == [2]
+
+
+# --------------------------------------------------------------------------- #
+# Interrupt (SIGINT) cleanup and ready-state restore (#9).                     #
+# --------------------------------------------------------------------------- #
+
+
+class _InterruptingRuntime:
+    """A fake Runtime that raises ``KeyboardInterrupt`` while working an issue.
+
+    Stands in for a SIGINT arriving mid-issue: the graph calls ``run`` and the
+    interrupt propagates out of the per-issue work so the run's cleanup/restore
+    path is exercised without sending a real signal.
+    """
+
+    name = "stub"
+
+    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+        raise KeyboardInterrupt
+
+
+def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A SIGINT (KeyboardInterrupt) while an issue is in flight must leave no mess:
+    # the in-flight worktree and the run worktree are removed, and the claimed
+    # issue is released back to ready-for-agent so it is not stuck claimed (#9).
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    raised = False
+    try:
+        orchestrator.run_batch(
+            runtime=_InterruptingRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+    except KeyboardInterrupt:
+        raised = True
+
+    # The interrupt propagates so the caller learns the run was cancelled.
+    assert raised
+
+    # The in-flight issue was claimed, then released back to ready-for-agent.
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
+    # The interrupt never reaches a human handoff: that is for conflicts, not
+    # cancellation. The issue simply returns to the ready pool.
+    source.mark_for_human.assert_not_called()
+
+    # No orphaned worktrees: the in-flight issue worktree and the run worktree
+    # are both removed, and the registry is pruned.
+    removed = [
+        call.args[0][3]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "worktree", "remove"]
+    ]
+    assert str(tmp_path / "wt" / "issue-2") in removed
+    assert str(tmp_path / "wt" / "run-20260613-101500") in removed
+    assert _calls_containing(runner, "git", "worktree", "prune")
+
+    # A cancelled run opens no PR.
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_interrupt_restores_only_the_in_flight_issue(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # With several ready issues, an interrupt on the first one must release only
+    # that claimed issue; later issues were never claimed, so nothing to restore.
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    try:
+        orchestrator.run_batch(
+            runtime=_InterruptingRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=5,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+    except KeyboardInterrupt:
+        pass
+
+    # Only the in-flight issue (#2) was claimed and released; #4 was never reached.
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
