@@ -269,10 +269,12 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
         path.write_text(content)
         written.append(path)
 
-    # The gate is an executable script `pycastle run` invokes directly, so make
-    # it executable for the owner/group/other-readable+executable bits.
+    # The gate is an executable script `pycastle run` invokes directly, so give
+    # it mode 0755. Set the mode outright rather than OR-ing onto the
+    # write-time mode so the result does not depend on the caller's umask
+    # (an OR could leave it group/other-writable under a permissive umask).
     gate = fixture_dir / "gate"
-    gate.chmod(gate.stat().st_mode | 0o755)
+    gate.chmod(0o755)
 
     logger.info(
         "Scaffolded the PyCastle fixture into %s (%d files, sandbox=%s).",

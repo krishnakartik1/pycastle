@@ -9,6 +9,10 @@ difference) is.
 
 from __future__ import annotations
 
+import os
+import shutil
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -240,6 +244,63 @@ def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None
     assert gate.stat().st_mode & 0o111
 
 
+def test_scaffolded_gate_mode_is_exactly_0755(tmp_path: Path) -> None:
+    """The gate is mode 0755 regardless of the caller's umask.
+
+    The scaffolder sets the mode outright (not OR-ed onto the write-time mode),
+    so a permissive umask cannot leave the gate group/other-writable. We force a
+    permissive umask for this test to prove the mode does not depend on it.
+    """
+    old_umask = os.umask(0o000)
+    try:
+        scaffold_fixture(tmp_path, sandbox="host")
+    finally:
+        os.umask(old_umask)
+    gate = tmp_path / ".pycastle" / "gate"
+    assert stat.S_IMODE(gate.stat().st_mode) == 0o755
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not on PATH")
+def test_scaffolded_gate_passes_in_a_fresh_repo_with_no_tooling(tmp_path: Path) -> None:
+    """The default gate exits 0 in a brand-new repo before any tools are added.
+
+    Each step is guarded by ``command -v``, so a missing ruff/black/pytest is
+    skipped rather than failing. This keeps the #14 retry-with-handoff path
+    reachable (the gate is real and runnable) without an empty project's first
+    run spuriously failing its own gate. We run it with a minimal PATH that has
+    bash and coreutils but none of the Python tools.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    gate = tmp_path / ".pycastle" / "gate"
+
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"  # bash + coreutils, but no ruff/black/pytest
+    proc = subprocess.run(
+        [str(gate)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # The absent tools are skipped, not run, so the empty repo passes its gate.
+    assert "skipping gate step" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# Every scaffolded file is non-empty                                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_every_scaffolded_file_is_non_empty(tmp_path: Path, choice: str) -> None:
+    """No scaffolded file is empty: each carries real, usable content."""
+    written = scaffold_fixture(tmp_path, sandbox=choice)
+    for path in written:
+        assert path.read_text().strip(), f"{path} is empty"
+
+
 # --------------------------------------------------------------------------- #
 # Clobber protection                                                           #
 # --------------------------------------------------------------------------- #
@@ -265,3 +326,70 @@ def test_clobber_refusal_leaves_the_existing_fixture_untouched(
 
     # The on-disk marker still reads the original host choice, not docker.
     assert marker.read_text() == original
+
+
+def test_refused_init_writes_nothing_new(tmp_path: Path) -> None:
+    """A refused second init leaves the fixture byte-for-byte as it was.
+
+    Clobber protection must be an all-or-nothing refusal: the second init must
+    not add, replace, or partially write any file before raising. We snapshot
+    the whole fixture, attempt a clobbering init, and assert the tree is
+    unchanged down to file contents.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture_dir = tmp_path / ".pycastle"
+
+    def snapshot() -> dict[str, str]:
+        return {
+            p.relative_to(fixture_dir).as_posix(): p.read_text()
+            for p in fixture_dir.rglob("*")
+            if p.is_file()
+        }
+
+    before = snapshot()
+    with pytest.raises(FixtureExistsError):
+        scaffold_fixture(tmp_path, sandbox="docker")
+
+    # Same set of files, each with identical content -- nothing new was written.
+    assert snapshot() == before
+
+
+# --------------------------------------------------------------------------- #
+# Scaffolding leaves the rest of the target dir untouched                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_scaffold_does_not_disturb_existing_files_in_the_target_dir(
+    tmp_path: Path,
+) -> None:
+    """Scaffolding into a non-empty repo touches only ``.pycastle/``.
+
+    A real repo already has its own files when ``pycastle init`` runs. The
+    scaffolder must add ``.pycastle/`` without reading, moving, or overwriting
+    anything already in the target directory.
+    """
+    # Pre-existing project files alongside (and below) where .pycastle/ lands.
+    (tmp_path / "README.md").write_text("# My project\n")
+    (tmp_path / "main.py").write_text("print('mine')\n")  # same basename, root level
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.py").write_text("x = 1\n")
+
+    existing_before = {
+        p.relative_to(tmp_path).as_posix(): p.read_text()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+
+    scaffold_fixture(tmp_path, sandbox="host")
+
+    # Every pre-existing file is still present and byte-identical.
+    for rel, content in existing_before.items():
+        assert (tmp_path / rel).read_text() == content
+
+    # The scaffold added only files under .pycastle/.
+    new_files = {
+        p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()
+    } - set(existing_before)
+    assert new_files
+    assert all(rel.startswith(".pycastle/") for rel in new_files)
