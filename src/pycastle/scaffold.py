@@ -194,13 +194,13 @@ run_if_available pytest -q
 """
 
 # The agent image the project extends with its own language dependencies (#4).
-# Based on node:22 so the bundled Claude/Codex CLIs are present; the project
+# Based on node:22-slim so the bundled Claude/Codex CLIs are present; the project
 # adds its toolchains at the marked extension point.
 _DOCKERFILE = """\
 # PyCastle agent image.
 #
 # This builds the `pycastle/agent:node22` image the Docker sandbox runs the
-# agent inside. It is based on `node:22` so the bundled Claude/Codex CLIs are
+# agent inside. It is based on `node:22-slim` so the bundled Claude/Codex CLIs
 # available, and it runs as the non-root `node` user the sandbox expects.
 #
 # Extend it with YOUR project's language dependencies at the marked point below,
@@ -208,10 +208,10 @@ _DOCKERFILE = """\
 #
 #     docker build -t pycastle/agent:node22 .pycastle
 #
-FROM node:22
+FROM node:22-slim
 
 # Install the agent CLIs your runtime needs. Pin versions to taste.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 
 # --- PROJECT EXTENSION POINT ------------------------------------------------
 # Add your project's own language toolchains and system packages here, e.g.:

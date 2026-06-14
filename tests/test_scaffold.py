@@ -224,8 +224,8 @@ def test_scaffolded_dockerfile_extends_the_node22_agent_image(
     scaffold_fixture(tmp_path, sandbox=choice)
     dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
 
-    # Built on node:22 so the bundled Claude/Codex CLIs are available (#4).
-    assert "FROM node:22" in dockerfile
+    # Built on node:22-slim so the bundled Claude/Codex CLIs are available (#4).
+    assert "FROM node:22-slim" in dockerfile
     # The image runs as the non-root `node` user the sandbox expects.
     assert "node" in dockerfile
     # There is an obvious, documented place to add the project's own language
