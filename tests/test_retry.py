@@ -894,3 +894,158 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     assert main(["run", "--runtime", "stub"]) == 0
     # The fixture-sourced gate (not the always-pass default) reached run_batch.
     assert captured["gate_check"] is sentinel
+
+
+def test_fixture_gate_exhaustion_marks_for_human_through_run_batch(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A fixture gate that never passes hands the issue to a human (exhaustion).
+
+    The gate command comes from ``make_fixture_gate_check(fixture_dir)`` as the
+    CLI wires it, and exits non-zero on every attempt. With ``impl_retries=2``
+    that is three failing attempts (1 + 2), so the issue exhausts its retries and
+    is marked ``ready-for-human`` — proving the exhaustion path (not just the
+    failure-then-pass path) is reachable through the fixture-sourced gate (#14).
+    """
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=3, title="Always red gate", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    # 1 + 2 retries = 3 attempts, all failing the gate.
+    runner = _gating_runner(fixture_dir, 1, 1, 1)
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    impl_calls = [c for c in runtime.calls if c["phase"] == "implement"]
+    assert len(impl_calls) == 3
+    source.mark_for_human.assert_called_once_with(3)
+    assert outcome.completed == []
+
+
+# --------------------------------------------------------------------------- #
+# Exec safety: a gate that exists but cannot be launched fails sanely (#14).    #
+# --------------------------------------------------------------------------- #
+
+
+def test_gate_that_cannot_be_executed_is_a_failure_not_a_crash(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A gate that raises ``OSError`` when launched counts as a gate failure.
+
+    A ``.pycastle/gate`` can exist yet be unlaunchable — it lost its executable
+    bit on checkout (``PermissionError``) or has a bad interpreter line. The
+    check must treat that as a *failing* gate (``False``), not let the OSError
+    escape and abort the run.
+    """
+    _write_gate(fixture_dir)
+
+    def exploding_runner(argv: list[str], **_kwargs: object) -> object:
+        raise PermissionError(13, "Permission denied")
+
+    gate_check = orchestrator.make_fixture_gate_check(
+        fixture_dir, runner=exploding_runner
+    )
+
+    # No exception escapes; the unlaunchable gate is reported as failing.
+    assert gate_check(tmp_path) is False
+
+
+def test_unexecutable_fixture_gate_marks_for_human_not_crash_the_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """An unlaunchable fixture gate sends the issue to a human, not down the run.
+
+    Driven through ``run_batch`` with the gate subprocess raising ``OSError`` on
+    every attempt (as a real non-executable gate would). The run must survive:
+    the issue exhausts its retries and is marked ``ready-for-human``, and the run
+    completes normally rather than re-raising the OSError through the interrupt
+    cleanup path.
+    """
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=5, title="Bad gate mode", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+
+    def runner_side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv == [gate_path]:
+            # The gate exists but cannot be launched (e.g. lost its +x bit).
+            raise PermissionError(13, "Permission denied")
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        return _ok()
+
+    runner = MagicMock(side_effect=runner_side_effect)
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # The run did not crash: every attempt's gate failed, the issue was handed to
+    # a human, and the batch finished cleanly.
+    source.mark_for_human.assert_called_once_with(5)
+    assert outcome.completed == []
+
+
+def test_fixture_gate_path_is_resolved_absolute_regardless_of_cwd(
+    fixture_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is invoked by an absolute path, even from a relative fixture_dir.
+
+    The gate runs with the issue worktree as cwd, so a relative fixture path
+    would not resolve against the worktree. Building the check from a *relative*
+    fixture_dir and changing cwd, the command passed to the runner must still be
+    the gate's absolute, resolved path.
+    """
+    _write_gate(fixture_dir)
+    abs_gate = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+
+    captured: dict[str, object] = {}
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+
+    # A relative fixture_dir, evaluated from a different cwd than the worktree.
+    monkeypatch.chdir(fixture_dir.parent)
+    rel_fixture = Path(fixture_dir.name)
+    gate_check = orchestrator.make_fixture_gate_check(rel_fixture, runner=runner)
+
+    worktree = tmp_path / "elsewhere"
+    worktree.mkdir()
+    assert gate_check(worktree) is True
+    # The runner saw the absolute gate path, not a path relative to the worktree.
+    assert captured["argv"] == [abs_gate]

@@ -97,13 +97,27 @@ def make_fixture_gate_check(
     grows or drops its gate between runs is honoured. ``runner`` is injectable so
     the subprocess can be mocked in tests; production passes the real
     :func:`~pycastle.commands.run_cmd`.
+
+    A gate that exists but cannot be launched — it lost its executable bit on
+    checkout (``PermissionError``), or has a bad interpreter line
+    (``FileNotFoundError``/``ENOEXEC``) — is treated as a *failing* gate, not a
+    crash: the :class:`OSError` is logged and the check returns ``False`` so the
+    attempt is retried and the issue ultimately handed to a human, rather than
+    one bad file mode sinking the whole run.
     """
     gate_path = fixture_dir / FIXTURE_GATE
 
     def _check(worktree: Path) -> bool:
         if not gate_path.is_file():
             return True
-        result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
+        try:
+            result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
+        except OSError:
+            # The gate file is there but cannot be executed (lost +x on checkout,
+            # bad shebang, ...). Count it as a gate failure so the run retries and
+            # hands the issue to a human instead of aborting the whole batch.
+            logger.exception("Could not run quality gate %s", gate_path)
+            return False
         return getattr(result, "returncode", 1) == 0
 
     return _check
