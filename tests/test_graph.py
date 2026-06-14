@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from pycastle.graph import (
+    DEFAULT_VISIT_CAP,
     DONE,
     HUMAN,
     GraphExecutor,
@@ -230,6 +231,107 @@ def test_executor_routes_a_runaway_cycle_to_human() -> None:
     walk = executor.execute(graph, cwd=Path("/unused"), phase_runner=always_fail)
 
     assert walk.terminal is HUMAN
+
+
+def test_visit_cap_counts_a_phase_in_exactly_its_cap_times_before_routing() -> None:
+    """The cap is the number of *entries* of one phase, applied before its run.
+
+    With ``visit_cap=3`` the looping ``implement`` node is run on visits 1, 2 and
+    3; the 4th entry trips the cap and routes to HUMAN without running it again.
+    Pinning the exact run count guards the off-by-one and proves the cap gates on
+    entry, not after the run.
+    """
+    graph = build(
+        start="implement",
+        phases=[
+            phase("implement", "implement.md", on_success=DONE, on_failure="handoff"),
+            phase("handoff", "handoff.md", on_success="implement", on_failure=HUMAN),
+        ],
+    )
+    runtime = _ScriptedRuntime()
+    executor = GraphExecutor(runtime, fixture_dir=Path("/unused"), visit_cap=3)
+
+    def always_fail(p: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        runtime.run("", cwd=Path("/unused"), phase=p.name)
+        return (p.name != "implement"), []
+
+    walk = executor.execute(graph, cwd=Path("/unused"), phase_runner=always_fail)
+
+    assert walk.terminal is HUMAN
+    # implement entered (and run) on visits 1, 2, 3; the 4th entry trips the cap
+    # and routes to HUMAN without running it. handoff ran after each implement
+    # fail, so 3 times; its loop-back to implement is what triggers the 4th entry.
+    assert runtime.ran == [
+        "implement",
+        "handoff",
+        "implement",
+        "handoff",
+        "implement",
+        "handoff",
+    ]
+    assert runtime.ran.count("implement") == 3
+
+
+def test_default_visit_cap_is_ten_in_production() -> None:
+    """An executor built without an explicit cap uses ``DEFAULT_VISIT_CAP`` (10).
+
+    Production never passes ``visit_cap``; only tests do. This pins the shipped
+    default so a change to it is a deliberate, reviewed edit, not a silent drift.
+    """
+    executor = GraphExecutor(_ScriptedRuntime(), fixture_dir=Path("/unused"))
+    assert executor.visit_cap == DEFAULT_VISIT_CAP == 10
+
+
+def test_a_long_acyclic_chain_is_not_capped() -> None:
+    """The cap is per-phase-visit, not a global step budget.
+
+    A straight chain of more phases than the cap runs end to end: each phase is
+    entered once, so no per-phase count ever exceeds the cap. This proves the cap
+    bounds *re*-entry of a single phase (a cycle), not the total number of phases
+    a healthy linear flow may have.
+    """
+    n = 5
+    cap = 2  # smaller than the chain length: a global budget would trip here.
+    phases = [
+        phase(f"p{i}", f"p{i}.md", on_success=(f"p{i + 1}" if i < n - 1 else DONE))
+        for i in range(n)
+    ]
+    graph = build(start="p0", phases=phases)
+    runtime = _ScriptedRuntime()
+    executor = GraphExecutor(runtime, fixture_dir=Path("/unused"), visit_cap=cap)
+
+    def run_each(p: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        runtime.run("", cwd=Path("/unused"), phase=p.name)
+        return True, []
+
+    walk = executor.execute(graph, cwd=Path("/unused"), phase_runner=run_each)
+
+    assert walk.terminal is DONE
+    assert runtime.ran == [f"p{i}" for i in range(n)]
+
+
+def test_implement_only_graph_routes_default_edges_to_done_and_human() -> None:
+    """An implement-only graph (default edges) ends at DONE on pass, HUMAN on fail.
+
+    ADR-0004's terse non-default flow — ``build(start='implement',
+    phases=[phase('implement', ...)])`` — leans entirely on the default edges
+    (``on_success=DONE``, ``on_failure=HUMAN``). This pins both: a passing run
+    reaches DONE and a failing run reaches HUMAN, with no edges spelled out.
+    """
+    graph = build(start="implement", phases=[phase("implement", "implement.md")])
+    executor = GraphExecutor(_ScriptedRuntime(), fixture_dir=Path("/unused"))
+
+    def passing(_p: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        return True, []
+
+    def failing(_p: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        return False, []
+
+    done = executor.execute(graph, cwd=Path("/unused"), phase_runner=passing)
+    human = executor.execute(graph, cwd=Path("/unused"), phase_runner=failing)
+
+    assert done.terminal is DONE
+    assert human.terminal is HUMAN
 
 
 # --------------------------------------------------------------------------- #

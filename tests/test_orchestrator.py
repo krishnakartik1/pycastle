@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from pycastle import orchestrator
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
-from pycastle.runtime import STUB_MARKER, StubRuntime
+from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
 
 
 def _ok(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -591,6 +591,93 @@ def test_full_run_interleaves_phases_then_commit_then_merge(
         "git:merge",
     ]
     assert outcome.completed == [2]
+
+
+# --------------------------------------------------------------------------- #
+# A non-implement phase crash takes its failure edge to HUMAN, end to end (#10).#
+# --------------------------------------------------------------------------- #
+
+
+class _PhaseCrashingRuntime:
+    """A fake Runtime that crashes on a given phase for one issue's worktree.
+
+    Stands in for an agent that dies mid-phase on a single issue: when the
+    ``crash_phase`` runs inside a worktree path containing ``crash_in`` it raises
+    :class:`AgentCrashError` (so the walker takes that phase's ``on_failure``
+    edge); every other call runs clean and records its phase. This keeps the
+    crash scoped to one issue while a sibling issue runs to completion on the
+    same shared runtime. No real subprocess runs.
+    """
+
+    name = "stub"
+
+    def __init__(self, *, crash_phase: str, crash_in: str) -> None:
+        self.crash_phase = crash_phase
+        self.crash_in = crash_in
+        self.calls: list[str] = []
+
+    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+        self.calls.append(phase)
+        if phase == self.crash_phase and self.crash_in in str(cwd):
+            raise AgentCrashError("boom", phase=phase, exit_code=1)
+        (cwd / STUB_MARKER).write_text(f"phase {phase}\n")
+        return RuntimeResult(
+            output=f"ran {phase}",
+            telemetry=Telemetry(runtime=self.name, phase=phase, num_turns=1),
+        )
+
+
+def test_plan_crash_routes_to_human_and_run_continues(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A crash on a non-retried phase takes its failure edge to HUMAN (#10).
+
+    On the default plan → implement → review graph every failure edge is HUMAN.
+    A crash in ``plan`` (which runs once, not under #8's retry) must take that
+    failure edge straight to the HUMAN terminal: the issue is marked
+    ready-for-human, never reaches implement or review, is not committed or
+    merged, and the run carries on to the next issue. This pins the failure-edge
+    application through the orchestrator, not just the bare walker.
+    """
+    issues = [
+        IssueRef(number=2, title="Plan crashes", assignees=["krishna"]),
+        IssueRef(number=4, title="Clean one", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    # #2's plan crashes; #4 is fully clean. The crash is scoped to issue-2's
+    # worktree, so the shared runtime crashes only #2's plan and #4 runs clean.
+    runtime = _PhaseCrashingRuntime(crash_phase="plan", crash_in="issue-2")
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # #2's plan crashed -> HUMAN terminal -> marked ready-for-human, not merged.
+    source.mark_for_human.assert_called_once_with(2)
+    merged = {o.issue.number: o.merged for o in outcome.issues}
+    assert merged == {2: False, 4: True}
+    assert outcome.completed == [4]
+    # The crashed walk never advanced past plan: implement and review never ran
+    # for #2, and that issue branch was not committed or merged.
+    assert runtime.calls[0] == "plan"
+    assert not _calls_containing(
+        runner, "git", "merge", "pycastle/issue-2-plan-crashes"
+    )
+    # The whole #4 cycle still ran after #2 was handed off — one stuck phase does
+    # not sink the batch.
+    assert runtime.calls[-3:] == ["plan", "implement", "review"]
 
 
 # --------------------------------------------------------------------------- #
