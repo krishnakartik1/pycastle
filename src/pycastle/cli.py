@@ -11,6 +11,7 @@ from pathlib import Path
 from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
+from .orchestrator import make_fixture_gate_check
 from .orchestrator import run_batch as run_loop
 from .preflight import PreflightError, check_required_commands
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
@@ -132,6 +133,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     assignee = _resolve_assignee(args.assignee)
     issue_source = GitHubIssueSource(repo)
 
+    # The quality gate is the project's own: it comes from the fixture's `gate`
+    # file (run in each issue worktree after implement), not hardcoded here. With
+    # no gate file the check falls back to always-pass, so a project without a
+    # gate keeps the single-attempt behaviour. Wiring it here is what makes the
+    # retry-with-handoff path reachable through the real `pycastle run` (#14).
+    gate_check = make_fixture_gate_check(FIXTURE_DIR)
+
     outcome = run_loop(
         runtime=runtime,
         issue_source=issue_source,
@@ -142,6 +150,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=_make_run_id(),
         iterations=args.iterations,
         include_unassigned=args.include_unassigned,
+        gate_check=gate_check,
     )
     if not outcome.issues:
         logger.info("Nothing to do.")

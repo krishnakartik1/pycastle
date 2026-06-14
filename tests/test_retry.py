@@ -15,7 +15,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from pycastle import orchestrator
+import pytest
+
+from pycastle import cli, orchestrator
+from pycastle.cli import main
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import AgentCrashError
 
@@ -680,3 +683,214 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     assert "Previous Attempt" not in impl_calls[0]["prompt"]
     assert "Previous Attempt" in impl_calls[1]["prompt"]
     assert outcome.completed == [2]
+
+
+# --------------------------------------------------------------------------- #
+# The gate is sourced from the Project fixture, not injected as a kwarg (#14).  #
+# --------------------------------------------------------------------------- #
+
+
+def _write_gate(fixture_dir: Path) -> Path:
+    """Drop a (no-op) gate file into the fixture and return its path.
+
+    The contents never run — the gate subprocess is always mocked — but the file
+    must exist so :func:`make_fixture_gate_check` decides the project opts into
+    gating. Production runs this as an executable in the issue worktree.
+    """
+    gate = fixture_dir / orchestrator.FIXTURE_GATE
+    gate.write_text("#!/usr/bin/env bash\nexit 0\n")
+    gate.chmod(0o755)
+    return gate
+
+
+def _gating_runner(fixture_dir: Path, *gate_results: int) -> MagicMock:
+    """A git-aware runner whose gate-command exit codes are scripted.
+
+    Like :func:`_git_aware_runner`, but it also recognises the fixture's gate
+    command (``[<fixture>/gate]``) and returns ``gate_results`` in order (then 0
+    forever) as the gate's exit code. No real gate, git, or gh ever runs — the
+    gate failing/passing is the scripted exit code, proving the gate is sourced
+    from the fixture rather than injected as a ``gate_check=`` kwarg.
+    """
+    gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+    codes = list(gate_results)
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv == [gate_path]:
+            code = codes.pop(0) if codes else 0
+            return subprocess.CompletedProcess(args=argv, returncode=code, stdout="")
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def test_fixture_gate_failure_drives_the_retry_path_through_run_batch(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A failing fixture gate (not an injected kwarg) reaches the retry path.
+
+    The gate command comes from ``make_fixture_gate_check(fixture_dir)``, exactly
+    as the CLI wires it. The mocked gate exits non-zero on the first attempt and
+    zero on the retry, so the run must make two implement attempts, write a
+    handoff, and merge the issue — proving the fixture-sourced gate (#14), not a
+    directly-injected ``gate_check=``, drives retry/handoff.
+    """
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=2, title="Fixture gate", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    # Gate fails on attempt 1, passes on the retry.
+    runner = _gating_runner(fixture_dir, 1, 0)
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    impl_calls = [c for c in runtime.calls if c["phase"] == "implement"]
+    handoff_calls = [c for c in runtime.calls if c["phase"] == "handoff"]
+    # The failing fixture gate forced a second implement attempt with a handoff.
+    assert len(impl_calls) == 2
+    assert len(handoff_calls) == 1
+    assert "Previous Attempt" in impl_calls[1]["prompt"]
+    assert outcome.completed == [2]
+    source.mark_for_human.assert_not_called()
+
+
+def test_fixture_gate_runs_in_the_issue_worktree(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """The fixture gate is run with the issue worktree as its cwd.
+
+    The gate must see the attempt's code, not the fixture, so it is invoked with
+    ``cwd`` set to the issue worktree. This pins that the wiring runs the gate in
+    the right place.
+    """
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=7, title="Worktree cwd", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    runner = _gating_runner(fixture_dir, 0)
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+    gate_calls = [call for call in runner.call_args_list if call.args[0] == [gate_path]]
+    assert len(gate_calls) == 1
+    # The gate ran in the issue worktree (issue-7), capturing its exit code.
+    assert gate_calls[0].kwargs["cwd"] == tmp_path / "wt" / "issue-7"
+    assert gate_calls[0].kwargs["capture"] is True
+
+
+def test_no_fixture_gate_makes_one_attempt_and_passes(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A fixture with no gate file falls back to always-pass (back-compat).
+
+    ``make_fixture_gate_check`` on a fixture without a ``gate`` file behaves like
+    the default ``_gates_always_pass``: exactly one implement attempt, no
+    handoff, no retry — identical to the pre-#14 behaviour.
+    """
+    # No _write_gate(...) here: the fixture defines no gate.
+    issue = IssueRef(number=2, title="No fixture gate", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    runner = _git_aware_runner()
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    outcome = orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    impl_calls = [c for c in runtime.calls if c["phase"] == "implement"]
+    assert len(impl_calls) == 1
+    assert not any(c["phase"] == "handoff" for c in runtime.calls)
+    assert outcome.completed == [2]
+    source.mark_for_human.assert_not_called()
+
+
+def test_cli_run_wires_the_fixture_gate_into_run_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pycastle run`` builds the gate from the fixture and passes it down.
+
+    Driven through ``main(["run", ...])`` with every external mocked: the gate
+    check handed to ``run_batch`` must be the one built from ``FIXTURE_DIR`` by
+    ``make_fixture_gate_check`` — proving the CLI sources the gate from the
+    project fixture rather than leaving the always-pass default in place (#14).
+    """
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    sentinel = object()
+
+    def fake_factory(fixture_dir: Path) -> object:
+        # The CLI builds the gate from its fixture dir, not a hardcoded command.
+        assert fixture_dir == cli.FIXTURE_DIR
+        return sentinel
+
+    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_loop(*, gate_check: object, **_kwargs: object) -> MagicMock:
+        captured["gate_check"] = gate_check
+        outcome = MagicMock()
+        outcome.issues = []
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--runtime", "stub"]) == 0
+    # The fixture-sourced gate (not the always-pass default) reached run_batch.
+    assert captured["gate_check"] is sentinel

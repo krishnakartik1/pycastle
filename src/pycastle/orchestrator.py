@@ -71,6 +71,44 @@ def _gates_always_pass(_worktree: Path) -> bool:
     return True
 
 
+#: The optional project-owned quality gate, relative to the Project fixture.
+#: If this file exists it is run (as an executable) inside the issue worktree
+#: after the implement phase; exit 0 means the gates passed, any non-zero exit
+#: means they failed and the attempt is retried with a handoff. The file is
+#: project-owned (it lives in and travels with ``.pycastle/``), so each project
+#: decides its own gate without the runner hardcoding a command. ``pycastle
+#: init`` (#11) will scaffold a default ``gate`` file matching this convention.
+FIXTURE_GATE = "gate"
+
+
+def make_fixture_gate_check(
+    fixture_dir: Path, *, runner: Runner = run_cmd
+) -> GateCheck:
+    """Build a :data:`GateCheck` from the Project fixture's gate file.
+
+    The gate definition is project-owned: if ``<fixture_dir>/gate`` exists it is
+    run as an executable inside the issue worktree (so it sees the attempt's
+    code, not the fixture), and the returned check passes only when that command
+    exits 0. With no gate file the fixture opts out of gating and the check
+    falls back to :func:`_gates_always_pass`, so a project without a gate keeps
+    the single-attempt, no-retry behaviour (back-compat).
+
+    The gate is resolved once here, but read freshly per call so a fixture that
+    grows or drops its gate between runs is honoured. ``runner`` is injectable so
+    the subprocess can be mocked in tests; production passes the real
+    :func:`~pycastle.commands.run_cmd`.
+    """
+    gate_path = fixture_dir / FIXTURE_GATE
+
+    def _check(worktree: Path) -> bool:
+        if not gate_path.is_file():
+            return True
+        result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
+        return getattr(result, "returncode", 1) == 0
+
+    return _check
+
+
 @dataclass
 class IssueOutcome:
     """What working a single issue inside a batch produced."""
