@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment
+.env
+
+# PyCastle run output (transient)
+.pycastle/logs/
+.pycastle/runs/
+.pycastle/worktrees/
