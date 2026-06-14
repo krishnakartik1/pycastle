@@ -98,9 +98,73 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
     dispatched.assert_called_once()
 
 
-def test_main_reports_unimplemented_init(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_scaffolds_the_chosen_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``pycastle init`` prompts host/docker and scaffolds the matching fixture.
+
+    The interactive prompt is stubbed (it is not unit-tested); we assert the
+    answer is threaded into the scaffolder and a fixture is written into cwd.
+    """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    assert main(["init"]) == 2
+    monkeypatch.chdir(tmp_path)
+    # The user picks Docker-first at the prompt.
+    monkeypatch.setattr(cli, "_prompt_sandbox", lambda: "docker")
+
+    assert main(["init"]) == 0
+
+    fixture = tmp_path / ".pycastle"
+    assert (fixture / "main.py").is_file()
+    assert (fixture / "Dockerfile").is_file()
+    assert (fixture / ".gitignore").is_file()
+    # The Docker-first choice is recorded in the scaffolded fixture.
+    assert (fixture / "sandbox").read_text().strip() == "docker"
+
+
+def test_init_defaults_the_prompt_to_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty answer at the init prompt defaults to host-first."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    # Simulate the user pressing Enter (empty input) by stubbing input().
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+
+    assert main(["init"]) == 0
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
+
+
+def test_init_refuses_to_clobber_an_existing_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Running init where ``.pycastle/`` already exists exits non-zero, no clobber."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_prompt_sandbox", lambda: "host")
+
+    assert main(["init"]) == 0
+    # Second run is refused; the fixture is left as-is.
+    assert main(["init"]) == 1
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
+
+
+def test_init_does_not_require_docker_or_runtime_in_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """init only needs git/gh — never docker or an agent CLI on PATH."""
+    seen: dict[str, list[str]] = {}
+
+    def record(commands: list[str]) -> None:
+        seen["commands"] = list(commands)
+
+    monkeypatch.setattr(cli, "check_required_commands", record)
+    monkeypatch.setattr(cli, "_cmd_init", lambda _args: 0)
+
+    main(["init"])
+
+    assert "docker" not in seen["commands"]
+    assert "claude" not in seen["commands"]
+    assert "codex" not in seen["commands"]
 
 
 def test_run_docker_builds_a_sandboxed_claude_runtime(
