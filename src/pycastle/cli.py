@@ -15,6 +15,7 @@ from .orchestrator import make_fixture_gate_check
 from .orchestrator import run_batch as run_loop
 from .preflight import PreflightError, check_required_commands
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
+from .scaffold import FixtureExistsError, scaffold_fixture
 
 logger = logging.getLogger("pycastle")
 
@@ -30,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="Scaffold a .pycastle/ project fixture (coming soon)")
+    sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
     sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
@@ -227,6 +228,45 @@ def _setup_codex() -> int:
     return 0
 
 
+def _prompt_sandbox() -> str:
+    """Ask whether execution is host-first or Docker-first; default to host.
+
+    The default is host-first because it needs no Docker image build to run the
+    scaffolded fixture. An empty answer (Enter) takes the default; ``docker``
+    (or ``d``) picks Docker-first. This interactive prompt is not unit-tested;
+    the scaffolding it drives is.
+    """
+    answer = input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
+    return "docker" if answer in {"docker", "d"} else "host"
+
+
+def _cmd_init(_args: argparse.Namespace) -> int:
+    """Dispatch ``pycastle init``: scaffold the Project fixture into the cwd.
+
+    Prompts for host-first vs Docker-first, then writes the fixture to match.
+    Refuses to clobber an existing ``.pycastle/`` so a project's prompts, gate,
+    and graph shape are never silently replaced.
+    """
+    choice = _prompt_sandbox()
+    try:
+        written = scaffold_fixture(Path.cwd(), sandbox=choice)  # type: ignore[arg-type]
+    except FixtureExistsError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    logger.info(
+        "Scaffolded the PyCastle Project fixture (%s-first) into .pycastle/:",
+        choice,
+    )
+    for path in written:
+        logger.info("  %s", path.relative_to(Path.cwd()))
+    logger.info(
+        "Edit .pycastle/prompts/, .pycastle/gate, and .pycastle/main.py to "
+        "customize the loop, then run `pycastle run`."
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, run preflight, and dispatch the chosen command."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -251,8 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "init":
-        logger.error("`pycastle init` lands in a later slice.")
-        return 2
+        return _cmd_init(args)
     if args.command == "sandbox":
         return _cmd_sandbox_setup(args)
     return 2
