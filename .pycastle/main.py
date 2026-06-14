@@ -1,20 +1,27 @@
 """PyCastle workflow for this repository.
 
 Hand-written for the conservative default flow: ``plan`` → ``implement`` →
-``review``. The plan phase works out an approach, implement does the work
-test-first, and review tests edge cases and commits any improvements before the
-issue branch is merged. Each phase is driven by its prompt file under
-``prompts/``. Edit this file with normal Python to change the workflow — add
-phases, reorder them, or (in a later slice) wire up success and failure
-transitions.
+``review`` → done. The plan phase works out an approach, implement does the work
+test-first (retrying with a handoff while the quality gates stay red), and
+review tests edge cases and commits any improvements before the issue branch is
+merged. Each phase names its own success and failure destinations as explicit
+rows; the executor walks those transitions rather than running a fixed list (see
+ADR-0004).
+
+The failure edges all route to ``HUMAN``: implement's bounded retry is kept
+internal to the implement phase, so a phase that genuinely cannot pass hands the
+issue to a person rather than looping. Edit this file with normal Python to
+change the workflow — add phases, repoint edges, or model handoff as its own
+node.
 """
 
-from pycastle import graph as g
+from pycastle.graph import DONE, HUMAN, build, phase
 
-graph = (
-    g.build()
-    .phase("plan", prompt="plan.md")
-    .phase("implement", prompt="implement.md")
-    .phase("review", prompt="review.md")
-    .build()
+graph = build(
+    start="plan",
+    phases=[
+        phase("plan", "plan.md", on_success="implement", on_failure=HUMAN),
+        phase("implement", "implement.md", on_success="review", on_failure=HUMAN),
+        phase("review", "review.md", on_success=DONE, on_failure=HUMAN),
+    ],
 )

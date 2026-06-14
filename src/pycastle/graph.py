@@ -1,56 +1,135 @@
-"""The Phase graph and its Builder-style API.
+"""The Phase graph and its declarative Builder API.
 
-A project describes its workflow in ``.pycastle/main.py`` by building a
-:class:`PhaseGraph` with chained calls and assigning it to a module-level
-``graph``. v0.1 runs a linear sequence of phases; per-phase success and
-failure transitions arrive in a later slice, so the Builder API here is kept
-deliberately small.
+A project describes its workflow in ``.pycastle/main.py`` by assembling a
+:class:`PhaseGraph` from a list of :func:`phase` rows and assigning it to a
+module-level ``graph``. Each phase names its own success and failure
+destinations, so the workflow can branch — implement → review on success,
+implement → handoff (or a human) on failure — rather than running a fixed
+linear list. The executor is a transition *walker*: from ``start`` it runs each
+phase, maps the phase's outcome onto its ``on_success`` / ``on_failure`` edge,
+and follows that edge until it reaches a terminal (:data:`DONE` or
+:data:`HUMAN`). See ADR-0004 for why the API reads as declarative rows.
 """
 
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import RuntimeResult
-from .runtime import Runtime
+from .runtime import AgentCrashError, Runtime
+
+
+class Terminal:
+    """A sentinel marking where a walk stops rather than another phase.
+
+    Two terminals exist: :data:`DONE` (the workflow finished cleanly) and
+    :data:`HUMAN` (the workflow needs a person). A phase edge points either at
+    another phase by name or at one of these.
+    """
+
+    def __init__(self, name: str) -> None:
+        """Name the terminal so it reads clearly in logs and errors."""
+        self.name = name
+
+    def __repr__(self) -> str:
+        """Render as the bare terminal name (``DONE`` / ``HUMAN``)."""
+        return self.name
+
+
+#: The walk finished cleanly; the orchestrator proceeds to commit and merge.
+DONE = Terminal("DONE")
+#: The walk needs a person; the orchestrator hands the issue to a human.
+HUMAN = Terminal("HUMAN")
+
+#: How many times a single phase may be (re)entered before the walk gives up.
+#: Guards against runaway cycles such as ``handoff`` ↔ ``implement``; when the
+#: cap is hit the walk takes the phase's failure edge (routing toward
+#: :data:`HUMAN`) rather than looping forever.
+DEFAULT_VISIT_CAP = 10
 
 
 @dataclass(frozen=True)
 class Phase:
-    """One step in the workflow, driven by a named prompt file."""
+    """One step in the workflow, with its prompt and its two transitions.
+
+    ``on_success`` / ``on_failure`` are each another phase's name or a terminal
+    sentinel (:data:`DONE` / :data:`HUMAN`). They default to the terminals, so a
+    phase with no explicit edges simply finishes (success) or escalates to a
+    human (failure).
+    """
 
     name: str
     prompt: str
+    on_success: str | Terminal = DONE
+    on_failure: str | Terminal = HUMAN
 
 
 @dataclass
 class PhaseGraph:
-    """An ordered sequence of phases."""
+    """A set of phases plus the name of the one the walk starts at.
 
-    phases: list[Phase] = field(default_factory=list)
+    ``phases`` is keyed by phase name; declaration order is preserved (Python
+    dicts are ordered) but does not affect the walk, which follows edges from
+    ``start``.
+    """
 
-
-class PhaseGraphBuilder:
-    """Builds a :class:`PhaseGraph` through chained ``.phase(...)`` calls."""
-
-    def __init__(self) -> None:
-        self._phases: list[Phase] = []
-
-    def phase(self, name: str, *, prompt: str) -> PhaseGraphBuilder:
-        """Append a phase and return ``self`` for chaining."""
-        self._phases.append(Phase(name=name, prompt=prompt))
-        return self
-
-    def build(self) -> PhaseGraph:
-        """Return the assembled :class:`PhaseGraph`."""
-        return PhaseGraph(phases=list(self._phases))
+    start: str
+    phases: dict[str, Phase] = field(default_factory=dict)
 
 
-def build() -> PhaseGraphBuilder:
-    """Start a graph; the entry point a fixture's ``main.py`` calls."""
-    return PhaseGraphBuilder()
+def phase(
+    name: str,
+    prompt: str,
+    *,
+    on_success: str | Terminal = DONE,
+    on_failure: str | Terminal = HUMAN,
+) -> Phase:
+    """Declare one phase row for :func:`build`.
+
+    ``name`` identifies the phase and ``prompt`` is its prompt file under
+    ``prompts/``. ``on_success`` and ``on_failure`` name where the walk goes
+    next — another phase's name or a terminal (:data:`DONE` / :data:`HUMAN`);
+    they default to the terminals so a simple flow stays terse.
+    """
+    return Phase(name=name, prompt=prompt, on_success=on_success, on_failure=on_failure)
+
+
+def build(*, start: str, phases: list[Phase]) -> PhaseGraph:
+    """Assemble and validate a :class:`PhaseGraph` from declared phase rows.
+
+    Row order is irrelevant — ``start`` names the entry explicitly. Every edge
+    target must be a declared phase name or a terminal, and ``start`` must name a
+    declared phase; a violation raises :class:`ValueError` with a clear message
+    so a bad ``.pycastle/main.py`` fails fast rather than walking off the graph.
+    """
+    by_name: dict[str, Phase] = {}
+    for p in phases:
+        if p.name in by_name:
+            raise ValueError(f"Duplicate phase name: {p.name!r}")
+        by_name[p.name] = p
+
+    if start not in by_name:
+        raise ValueError(
+            f"start={start!r} is not a declared phase (declared: {sorted(by_name)})"
+        )
+
+    for p in by_name.values():
+        for kind, target in (
+            ("on_success", p.on_success),
+            ("on_failure", p.on_failure),
+        ):
+            if isinstance(target, Terminal):
+                continue
+            if target not in by_name:
+                raise ValueError(
+                    f"Phase {p.name!r} {kind}={target!r} is neither a declared "
+                    f"phase nor a terminal (declared: {sorted(by_name)})"
+                )
+
+    return PhaseGraph(start=start, phases=by_name)
 
 
 def load_graph(fixture_dir: Path) -> PhaseGraph:
@@ -75,12 +154,66 @@ class PhaseResult:
     result: RuntimeResult
 
 
-class GraphExecutor:
-    """Runs a :class:`PhaseGraph`'s phases in order through a Runtime."""
+#: A function the walker calls to run one phase. It returns ``(passed, results)``
+#: where ``passed`` decides which edge the walk follows (``True`` → ``on_success``,
+#: ``False`` → ``on_failure``) and ``results`` are the :class:`PhaseResult`\ s that
+#: run produced (it may be more than one for a phase that retries internally).
+#: ``phase_context`` is extra text to append to this phase's prompt for this run.
+PhaseRunner = Callable[[Phase, str | None], "tuple[bool, list[PhaseResult]]"]
 
-    def __init__(self, runtime: Runtime, *, fixture_dir: Path) -> None:
+
+@dataclass
+class WalkResult:
+    """What walking a :class:`PhaseGraph` produced.
+
+    ``results`` is the per-phase-visit results in walk order; ``terminal`` is the
+    terminal the walk stopped at (:data:`DONE` or :data:`HUMAN`). The orchestrator
+    reads ``terminal`` to decide between the commit/merge path and the
+    hand-to-a-human path.
+    """
+
+    results: list[PhaseResult]
+    terminal: Terminal
+
+
+class GraphExecutor:
+    """Walks a :class:`PhaseGraph`'s transitions through a Runtime.
+
+    From the graph's ``start`` it runs each phase, maps the phase outcome onto
+    its ``on_success`` / ``on_failure`` edge, and follows that edge until a
+    terminal. A phase "fails" when its runtime call raises
+    :class:`~pycastle.runtime.AgentCrashError`; the orchestrator can override
+    that per-phase by supplying its own ``phase_runner`` (the ``implement`` node
+    runs through #8's retry-with-handoff budget that way).
+    """
+
+    def __init__(
+        self, runtime: Runtime, *, fixture_dir: Path, visit_cap: int = DEFAULT_VISIT_CAP
+    ) -> None:
+        """Bind the runtime and fixture dir, and set the per-phase visit cap."""
         self.runtime = runtime
         self.fixture_dir = fixture_dir
+        self.visit_cap = visit_cap
+
+    def render_prompt(self, phase: Phase, extra: str | None = None) -> str:
+        """Read a phase's prompt file, appending ``extra`` context if given."""
+        prompt = (self.fixture_dir / "prompts" / phase.prompt).read_text()
+        if extra:
+            prompt = f"{prompt}\n\n{extra}"
+        return prompt
+
+    def _default_runner(self, cwd: Path) -> PhaseRunner:
+        """A phase runner that runs each phase once; a crash is a failure."""
+
+        def run_once(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
+            prompt = self.render_prompt(phase, extra)
+            try:
+                result = self.runtime.run(prompt, cwd=cwd, phase=phase.name)
+            except AgentCrashError:
+                return False, []
+            return True, [PhaseResult(phase=phase.name, result=result)]
+
+        return run_once
 
     def execute(
         self,
@@ -88,20 +221,39 @@ class GraphExecutor:
         *,
         cwd: Path,
         phase_context: dict[str, str] | None = None,
-    ) -> list[PhaseResult]:
-        """Execute each phase in order and return the per-phase results.
+        phase_runner: PhaseRunner | None = None,
+    ) -> WalkResult:
+        """Walk ``graph`` from its ``start`` and return the results + terminal.
 
-        ``phase_context`` carries extra text to append to a named phase's
-        prompt for this run — the retry path uses it to thread prior-attempt
-        context into the ``implement`` prompt without rewriting the prompt file.
+        Each phase is run via ``phase_runner`` (default: once through the
+        runtime, a crash counting as failure). The phase's pass/fail outcome
+        selects its ``on_success`` / ``on_failure`` edge; the walk follows edges
+        until it reaches a terminal. ``phase_context`` carries extra text to
+        append to a named phase's prompt — the retry path threads prior-attempt
+        context into ``implement`` that way. A phase entered more than
+        :attr:`visit_cap` times takes its failure edge, so a cyclic graph
+        (e.g. ``handoff`` ↔ ``implement``) cannot loop forever.
         """
         phase_context = phase_context or {}
+        run_phase = phase_runner or self._default_runner(cwd)
+
         results: list[PhaseResult] = []
-        for phase in graph.phases:
-            prompt = (self.fixture_dir / "prompts" / phase.prompt).read_text()
-            extra = phase_context.get(phase.name)
-            if extra:
-                prompt = f"{prompt}\n\n{extra}"
-            result = self.runtime.run(prompt, cwd=cwd, phase=phase.name)
-            results.append(PhaseResult(phase=phase.name, result=result))
-        return results
+        visits: dict[str, int] = {}
+        node: str | Terminal = graph.start
+
+        while not isinstance(node, Terminal):
+            current = graph.phases[node]
+            visits[node] = visits.get(node, 0) + 1
+            if visits[node] > self.visit_cap:
+                # Runaway cycle (e.g. handoff ↔ implement): stop entering this
+                # phase and route to HUMAN so the walk always terminates rather
+                # than chasing failure edges around the cycle forever.
+                node = HUMAN
+                continue
+
+            extra = phase_context.get(current.name) or None
+            passed, phase_results = run_phase(current, extra)
+            results.extend(phase_results)
+            node = current.on_success if passed else current.on_failure
+
+        return WalkResult(results=results, terminal=node)

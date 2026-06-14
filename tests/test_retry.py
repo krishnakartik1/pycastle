@@ -635,12 +635,12 @@ def test_prior_attempt_block_carries_the_failing_gate_info(
 def test_retry_context_never_reaches_plan_or_review_phases(
     three_phase_fixture_dir: Path, tmp_path: Path
 ) -> None:
-    """On the default graph the retry block lands in implement alone (#7, #8).
+    """On the default graph the retry block lands in implement alone (#7, #8, #10).
 
-    The retry wrapper re-runs the whole plan → implement → review graph per
-    attempt and keys the prior-attempt context to ``implement``. This drives a
-    real gate-fail retry through that wrapper and proves the isolation end to
-    end: every plan and review prompt across both attempts is free of the
+    With the branching walker (#10), the implement retry is internal to the
+    implement node: plan and review each run *once* on the walk, while implement
+    retries in place. This drives a real gate-fail retry through the walk and
+    proves the isolation end to end: every plan and review prompt is free of the
     "Previous Attempt" block, while only the retried implement prompt carries it.
     """
     issue = IssueRef(number=2, title="Three phase retry", assignees=["krishna"])
@@ -648,8 +648,8 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     source.list_ready.return_value = [issue]
     runtime = _RecordingRuntime()
     runner = _git_aware_runner()
-    # First implement attempt's gates fail; the retry passes — so the whole graph
-    # runs twice and the retry context is threaded into the second implement.
+    # First implement attempt's gates fail; the retry passes — implement runs
+    # twice (retry is internal to the node), plan and review run once each.
     gate = _gate(False, True)
 
     outcome = orchestrator.run_batch(
@@ -671,12 +671,12 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     plan_calls = [c for c in runtime.calls if c["phase"] == "plan"]
     review_calls = [c for c in runtime.calls if c["phase"] == "review"]
     impl_calls = [c for c in runtime.calls if c["phase"] == "implement"]
-    # The whole graph ran twice (failed attempt + retry): plan and review each
-    # ran on both attempts, implement on both.
-    assert len(plan_calls) == 2
-    assert len(review_calls) == 2
+    # The walk runs each non-implement phase once; implement retries in place, so
+    # it ran twice (failed attempt + retry).
+    assert len(plan_calls) == 1
+    assert len(review_calls) == 1
     assert len(impl_calls) == 2
-    # No plan or review prompt — on either attempt — carried implement's context.
+    # No plan or review prompt carried implement's retry context.
     assert not any("Previous Attempt" in c["prompt"] for c in plan_calls)
     assert not any("Previous Attempt" in c["prompt"] for c in review_calls)
     # The retried implement prompt is the only one that carried it.
