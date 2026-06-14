@@ -187,15 +187,19 @@ def test_build_login_command_is_interactive_into_volume() -> None:
         "CLAUDE_CONFIG_DIR=/home/node/.claude",
         sandbox.DEFAULT_IMAGE,
         "claude",
-        "/login",
+        "auth",
+        "login",
+        "--claudeai",
     ]
 
 
 def test_build_login_command_accepts_custom_image() -> None:
     argv = sandbox.build_login_command("claude", image="my/agent:dev")
-    assert argv[argv.index("my/agent:dev") + 1 : argv.index("my/agent:dev") + 3] == [
+    assert argv[argv.index("my/agent:dev") + 1 :] == [
         "claude",
-        "/login",
+        "auth",
+        "login",
+        "--claudeai",
     ]
 
 
@@ -214,10 +218,8 @@ def test_build_status_command_checks_from_fresh_container() -> None:
         "CLAUDE_CONFIG_DIR=/home/node/.claude",
         sandbox.DEFAULT_IMAGE,
         "claude",
-        "-p",
-        "respond with the single word: ok",
-        "--max-turns",
-        "1",
+        "auth",
+        "status",
     ]
 
 
@@ -238,14 +240,13 @@ def test_status_command_does_not_print_credentials() -> None:
         assert forbidden not in joined
 
 
-def test_status_command_proves_auth_only_by_answering_a_prompt() -> None:
-    # Positive lock on the mechanism: auth is confirmed by running `claude -p`
-    # (the agent answers), bounded to one turn. No file is read; the only thing
-    # after the image is a prompt-answering claude invocation.
+def test_status_command_proves_auth_with_the_real_status_subcommand() -> None:
+    # Positive lock on the mechanism: auth is confirmed by the runtime's own
+    # `auth status` subcommand, which the real claude CLI provides. No file is
+    # read; the only thing after the image is the claude status invocation.
     argv = sandbox.build_status_command("claude")
     image_idx = argv.index(sandbox.DEFAULT_IMAGE)
-    assert argv[image_idx + 1 : image_idx + 3] == ["claude", "-p"]
-    assert argv[-2:] == ["--max-turns", "1"]
+    assert argv[image_idx + 1 :] == ["claude", "auth", "status"]
 
 
 def test_login_and_status_share_one_volume_across_projects() -> None:
@@ -310,7 +311,7 @@ def test_build_run_command_wrapper_is_runtime_agnostic_for_codex() -> None:
     assert argv[image_idx + 1 :] == inner
 
 
-def test_build_login_command_codex_uses_device_code_no_tty() -> None:
+def test_build_login_command_codex_uses_device_auth_no_tty() -> None:
     argv = sandbox.build_login_command("codex")
 
     assert argv == [
@@ -326,7 +327,7 @@ def test_build_login_command_codex_uses_device_code_no_tty() -> None:
         sandbox.DEFAULT_IMAGE,
         "codex",
         "login",
-        "--device-code",
+        "--device-auth",
     ]
     # The device-authorization flow needs no TTY: -it is never passed.
     assert "-it" not in argv
@@ -334,10 +335,10 @@ def test_build_login_command_codex_uses_device_code_no_tty() -> None:
 
 def test_build_login_command_claude_still_interactive_with_tty() -> None:
     # Parametrizing per runtime must not regress Claude: it keeps its TTY and
-    # its /login browser flow.
+    # its browser-based auth login flow.
     argv = sandbox.build_login_command("claude")
     assert "-it" in argv
-    assert argv[-2:] == ["claude", "/login"]
+    assert argv[-4:] == ["claude", "auth", "login", "--claudeai"]
 
 
 def test_codex_auth_volume_distinct_from_claude() -> None:

@@ -25,7 +25,7 @@ Encoded decisions, shared by every builder:
   ``CODEX_HOME=/home/node/.codex`` (see :data:`RUNTIME_CONFIG`).
 
 Credential file contents are never read, printed, or copied by any builder.
-Auth is proved only by having the agent answer a prompt (see
+Auth is proved only by the runtime's own ``status`` subcommand (see
 :func:`build_status_command`), never by ``cat``-ing the volume.
 
 Headless token fallback
@@ -71,34 +71,40 @@ class RuntimeSandboxConfig:
 
     Each runtime mounts its per-Runtime auth volume at ``config_dir`` and pins
     that path through the environment variable named ``config_env``, so the CLI
-    reads and writes credentials there. ``cli`` is the in-container binary and
-    ``login_args`` is the argv that performs a headless, no-TTY onboarding login
-    into the mounted volume.
+    reads and writes credentials there. ``cli`` is the in-container binary,
+    ``login_args`` is the argv that onboards a login into the mounted volume, and
+    ``status_args`` is the argv that asks the runtime's own CLI whether the
+    volume holds working credentials. Both run the runtime's own binary, so a
+    Codex status check never shells out to ``claude`` (and vice versa).
     """
 
     cli: str
     config_dir: str
     config_env: str
     login_args: tuple[str, ...]
+    status_args: tuple[str, ...]
 
 
 #: Per-runtime sandbox configuration. Claude pins ``CLAUDE_CONFIG_DIR`` and logs
-#: in via the interactive ``claude /login`` browser flow; Codex pins
-#: ``CODEX_HOME`` and logs in via the device-authorization flow
-#: (``codex login --device-code``), which prints a code and a URL instead of
-#: opening a localhost callback or needing a TTY.
+#: in via the interactive ``claude auth login --claudeai`` browser flow; Codex
+#: pins ``CODEX_HOME`` and logs in via the device-authorization flow
+#: (``codex login --device-auth``), which prints a code and a URL instead of
+#: opening a localhost callback or needing a TTY. These subcommands match the
+#: installed CLIs (Claude Code 2.1.177, Codex 0.139.0).
 RUNTIME_CONFIG: dict[str, RuntimeSandboxConfig] = {
     "claude": RuntimeSandboxConfig(
         cli="claude",
         config_dir=CLAUDE_CONFIG_DIR,
         config_env="CLAUDE_CONFIG_DIR",
-        login_args=("claude", "/login"),
+        login_args=("claude", "auth", "login", "--claudeai"),
+        status_args=("claude", "auth", "status"),
     ),
     "codex": RuntimeSandboxConfig(
         cli="codex",
         config_dir=CODEX_HOME,
         config_env="CODEX_HOME",
-        login_args=("codex", "login", "--device-code"),
+        login_args=("codex", "login", "--device-auth"),
+        status_args=("codex", "login", "status"),
     ),
 }
 
@@ -181,9 +187,9 @@ def build_login_command(
 ) -> list[str]:
     """Build the login argv that writes auth into the per-Runtime volume.
 
-    For Claude this runs ``claude /login`` with a TTY (``-it``) so the
-    browser-based login can complete. For Codex it runs
-    ``codex login --device-code``: the device-authorization flow prints a code
+    For Claude this runs ``claude auth login --claudeai`` with a TTY (``-it``)
+    so the browser-based login can complete. For Codex it runs
+    ``codex login --device-auth``: the device-authorization flow prints a code
     and a verification URL to stdout and polls in the background, so it needs no
     localhost callback and no TTY — the ``-it`` flag is omitted. Either way the
     credentials land in the runtime's auth volume. No workspace is mounted:
@@ -212,11 +218,14 @@ def build_status_command(
 ) -> list[str]:
     """Build a fresh-container auth status-check argv.
 
-    Spins up a clean container against the same auth volume and asks the agent
-    to answer a one-word prompt. A zero exit proves the volume holds working
-    credentials. Auth is never confirmed by reading or printing the credential
-    file — only by the agent responding.
+    Spins up a clean container against the same auth volume and runs the
+    runtime's own status subcommand (``claude auth status`` for Claude,
+    ``codex login status`` for Codex), never a hardcoded ``claude``. A zero exit
+    proves the volume holds working credentials. The subcommand reports auth
+    state without reading or printing the credential file, so auth is never
+    confirmed by ``cat``-ing the volume.
     """
+    config = _config_for(runtime_name)
     return [
         "docker",
         "run",
@@ -226,9 +235,5 @@ def build_status_command(
         *_auth_mount_args(runtime_name),
         *_config_env_args(runtime_name),
         image,
-        "claude",
-        "-p",
-        "respond with the single word: ok",
-        "--max-turns",
-        "1",
+        *config.status_args,
     ]

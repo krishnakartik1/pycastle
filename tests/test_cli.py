@@ -271,8 +271,9 @@ def test_sandbox_setup_status_failure_returns_nonzero(
 
     def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
         proc = MagicMock()
-        # Login succeeds, the fresh-container status check fails.
-        proc.returncode = 0 if "/login" in args else 1
+        # Login succeeds, the fresh-container status check fails. The login
+        # argv carries `login`; the status argv carries `status`.
+        proc.returncode = 0 if "login" in args else 1
         return proc
 
     monkeypatch.setattr(cli, "run_cmd", fake_runner)
@@ -308,7 +309,7 @@ def test_sandbox_setup_codex_uses_device_auth_flow(
     # Exactly one command: the device-authorization login. No status check.
     assert calls == [sandbox_mod.build_login_command("codex")]
     login = calls[0]
-    assert login[-3:] == ["codex", "login", "--device-code"]
+    assert login[-3:] == ["codex", "login", "--device-auth"]
     # The device flow needs no TTY, so -it is never passed.
     assert "-it" not in login
 

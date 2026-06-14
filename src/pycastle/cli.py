@@ -167,7 +167,7 @@ def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
     needs a TTY and the headless token fallback is documented in
     :mod:`pycastle.sandbox`.
 
-    Codex runs the device-authorization login (``codex login --device-code``),
+    Codex runs the device-authorization login (``codex login --device-auth``),
     which prints a code and a verification URL and polls in the background — no
     localhost callback and no TTY. The flow's own zero exit is the success
     signal, so no fresh-container status check is run.
