@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from .commands import run_cmd
-from .graph import GraphExecutor, PhaseResult, load_graph
+from .graph import HUMAN, GraphExecutor, Phase, PhaseResult, WalkResult, load_graph
 from .issues import IssueSource, select_batch
 from .models import IssueRef
 from .runtime import AgentCrashError, CodexRuntime, Runtime
@@ -354,31 +354,35 @@ def _retry_context(attempt: int, gate_output: str, *, handoff_made: bool) -> str
     return "\n".join(lines)
 
 
-def _run_implement_attempts(
+def _run_implement_phase(
     issue: IssueRef,
+    implement: Phase,
+    extra: str | None,
     *,
+    executor: GraphExecutor,
     runtime: Runtime,
     fixture_dir: Path,
     run_id: str,
     issue_worktree: Path,
     impl_retries: int,
     gate_check: GateCheck,
-    runner: Runner,
 ) -> tuple[bool, list[PhaseResult]]:
-    """Run the graph for one issue, retrying with handoff while gates stay red.
+    """Run the ``implement`` phase under #8's retry-with-handoff budget.
 
-    Up to ``1 + impl_retries`` attempts are made in place on the same worktree.
-    An attempt fails when the agent crashes (:class:`AgentCrashError`) or when
-    the run is clean but :paramref:`gate_check` reports the gates red. On a
-    failed attempt with retries left, a handoff document is generated (resuming
-    the failed Codex thread, or a fresh Claude call) and the next attempt carries
-    that context. Returns ``(passed, phase_results)`` where ``phase_results`` is
-    the last attempt's results (empty if every attempt crashed).
+    This is the per-phase runner the walker calls for the ``implement`` node, so
+    the branching graph drives the flow while the implement step keeps its
+    bounded retry. Up to ``1 + impl_retries`` attempts are made in place on the
+    same worktree. An attempt fails when the agent crashes
+    (:class:`AgentCrashError`) or when the run is clean but :paramref:`gate_check`
+    reports the gates red. On a failed attempt with retries left, a handoff
+    document is generated (resuming the failed Codex thread, or a fresh Claude
+    call) and the next attempt carries that context. ``extra`` is any
+    prior-context the walker threaded into the implement prompt for the first
+    attempt (none, today). Returns ``(passed, phase_results)`` — the walker maps
+    ``passed`` onto the implement node's ``on_success`` / ``on_failure`` edge.
     """
-    graph = load_graph(fixture_dir)
-    executor = GraphExecutor(runtime, fixture_dir=fixture_dir)
     phase_results: list[PhaseResult] = []
-    retry_context = ""
+    retry_context = extra or ""
 
     for attempt in range(impl_retries + 1):
         if attempt > 0:
@@ -387,13 +391,11 @@ def _run_implement_attempts(
                 run_id,
                 f"Retry {attempt}/{impl_retries} for #{issue.number}",
             )
+        prompt = executor.render_prompt(implement, retry_context or None)
         try:
-            phase_results = executor.execute(
-                graph,
-                cwd=issue_worktree,
-                phase_context={"implement": retry_context} if retry_context else None,
-            )
+            result = runtime.run(prompt, cwd=issue_worktree, phase=implement.name)
         except AgentCrashError as crash:
+            phase_results = []
             _append_log(
                 fixture_dir,
                 run_id,
@@ -409,6 +411,7 @@ def _run_implement_attempts(
                 continue
             return False, phase_results
 
+        phase_results = [PhaseResult(phase=implement.name, result=result)]
         gate_output = "quality gates reported a failure"
         if gate_check(issue_worktree):
             return True, phase_results
@@ -439,6 +442,55 @@ def _run_implement_attempts(
         )
 
     return False, phase_results
+
+
+#: The phase name that runs through #8's retry-with-handoff budget. Every other
+#: phase runs once; a crash takes that phase's failure edge.
+IMPLEMENT_PHASE = "implement"
+
+
+def _walk_issue(
+    issue: IssueRef,
+    *,
+    runtime: Runtime,
+    fixture_dir: Path,
+    run_id: str,
+    issue_worktree: Path,
+    impl_retries: int,
+    gate_check: GateCheck,
+) -> WalkResult:
+    """Walk the issue's phase graph, with the implement node under #8's retry.
+
+    The graph is loaded from the Project fixture and walked from its ``start``
+    (see :class:`~pycastle.graph.GraphExecutor`). The ``implement`` node is run
+    through :func:`_run_implement_phase` (the retry-with-handoff budget plus the
+    project gate), so "succeeded within budget" follows its ``on_success`` edge
+    and "exhausted/failed" follows its ``on_failure`` edge. Every other phase
+    runs once; an agent crash takes that phase's failure edge. The walk stops at
+    a terminal — :data:`~pycastle.graph.DONE` (proceed to commit + merge) or
+    :data:`~pycastle.graph.HUMAN` (hand the issue to a person).
+    """
+    graph = load_graph(fixture_dir)
+    executor = GraphExecutor(runtime, fixture_dir=fixture_dir)
+    default_runner = executor._default_runner(issue_worktree)
+
+    def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        if phase.name == IMPLEMENT_PHASE:
+            return _run_implement_phase(
+                issue,
+                phase,
+                extra,
+                executor=executor,
+                runtime=runtime,
+                fixture_dir=fixture_dir,
+                run_id=run_id,
+                issue_worktree=issue_worktree,
+                impl_retries=impl_retries,
+                gate_check=gate_check,
+            )
+        return default_runner(phase, extra)
+
+    return executor.execute(graph, cwd=issue_worktree, phase_runner=run_phase)
 
 
 def _last_thread_id(phase_results: list[PhaseResult]) -> str | None:
@@ -473,16 +525,21 @@ def _work_issue(
     """Work one issue in its own worktree and merge it into the run branch.
 
     The issue is claimed, branched off the run branch into its own worktree, and
-    run through the graph with a bounded implement retry: a failed attempt (a
-    crash, or clean-but-gates-red) is retried in place with a handoff document
-    and prior-attempt context (see :func:`_run_implement_attempts`). When the
-    gates finally pass the work is committed and a clean merge folds it into the
-    run; the issue worktree and branch are then removed.
+    driven by *walking* its phase graph (#10): from ``start`` each phase runs and
+    its success/failure outcome follows the phase's ``on_success`` /
+    ``on_failure`` edge until a terminal (see :func:`_walk_issue`). The
+    ``implement`` node keeps its bounded retry — a failed attempt (a crash, or
+    clean-but-gates-red) is retried in place with a handoff document and
+    prior-attempt context (see :func:`_run_implement_phase`). A walk that reaches
+    :data:`~pycastle.graph.DONE` is committed and, on a clean merge, folded into
+    the run; the issue worktree and branch are then removed.
 
-    An issue that exhausts its retries is labelled ``ready-for-human`` and
-    skipped (recorded as not merged) so the run continues to the next issue — one
-    stuck item does not sink the batch. A merge that does not apply cleanly is
-    likewise recorded as not merged and skipped, and the issue is labelled
+    A walk that reaches :data:`~pycastle.graph.HUMAN` (an implement node that
+    exhausted its retries, a crash on a non-retried phase, or a runaway cycle
+    hitting the visit cap) labels the issue ``ready-for-human`` and skips it
+    (recorded as not merged) so the run continues to the next issue — one stuck
+    item does not sink the batch. A merge that does not apply cleanly is likewise
+    recorded as not merged and skipped, and the issue is labelled
     ``ready-for-human`` (#9) so a person resolves the conflict while the run
     carries on with the remaining items.
     """
@@ -498,7 +555,7 @@ def _work_issue(
         cwd=workspace,
     )
 
-    passed, phase_results = _run_implement_attempts(
+    walk: WalkResult = _walk_issue(
         issue,
         runtime=runtime,
         fixture_dir=fixture_dir,
@@ -506,19 +563,19 @@ def _work_issue(
         issue_worktree=issue_worktree,
         impl_retries=impl_retries,
         gate_check=gate_check,
-        runner=runner,
     )
-    if phase_results:
-        _write_telemetry(fixture_dir, run_id, issue, phase_results)
+    if walk.results:
+        _write_telemetry(fixture_dir, run_id, issue, walk.results)
 
-    if not passed:
-        # Retries exhausted: hand the issue to a human and move on. Cleaning up
-        # the worktree and branch here keeps the batch tidy for the next issue.
+    if walk.terminal is HUMAN:
+        # The walk routed to a human (retries exhausted, a non-retried phase
+        # crashed, or a runaway cycle hit the visit cap): hand the issue over and
+        # move on. Cleaning up the worktree and branch keeps the batch tidy.
         issue_source.mark_for_human(issue.number)
         _append_log(
             fixture_dir,
             run_id,
-            f"#{issue.number} exhausted its retries; marked ready-for-human.",
+            f"#{issue.number} reached the HUMAN terminal; marked ready-for-human.",
         )
         cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
