@@ -31,8 +31,30 @@ logger = logging.getLogger("pycastle")
 #: The directory name the fixture is written into, relative to the target repo.
 FIXTURE_DIRNAME = ".pycastle"
 
+#: The fixture file recording the host-first/Docker-first choice, relative to
+#: the fixture dir. ``pycastle init`` writes it; ``pycastle run`` reads it.
+SANDBOX_MARKER = "sandbox"
+
 #: The two execution choices ``pycastle init`` offers.
 SandboxChoice = Literal["host", "docker"]
+
+
+def read_sandbox(fixture_dir: Path) -> str | None:
+    """Return the sandbox choice recorded in ``fixture_dir``'s marker, or ``None``.
+
+    Reads the ``sandbox`` marker ``pycastle init`` writes (see
+    :data:`SANDBOX_MARKER`) and returns its stripped, lower-cased contents.
+    Returns ``None`` when the marker is absent, empty, or unreadable, so a caller
+    can fall back to a default without crashing on a missing or garbled file. The
+    value is returned verbatim (after stripping) and is *not* validated against
+    ``host``/``docker`` here -- the caller decides how to treat an unknown value.
+    """
+    marker = fixture_dir / SANDBOX_MARKER
+    try:
+        recorded = marker.read_text().strip().lower()
+    except OSError:
+        return None
+    return recorded or None
 
 
 class FixtureExistsError(Exception):
@@ -227,7 +249,7 @@ def _fixture_files(sandbox: SandboxChoice) -> dict[str, str]:
     return {
         "main.py": _MAIN_PY,
         "gate": _GATE,
-        "sandbox": f"{sandbox}\n",
+        SANDBOX_MARKER: f"{sandbox}\n",
         "Dockerfile": _DOCKERFILE,
         ".gitignore": _GITIGNORE,
         "prompts/plan.md": _PLAN_MD,

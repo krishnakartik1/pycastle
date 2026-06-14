@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from pycastle.graph import DONE, PhaseGraph, load_graph
-from pycastle.scaffold import FixtureExistsError, scaffold_fixture
+from pycastle.scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
 
 # The files every scaffolded fixture carries, relative to the fixture dir.
 EXPECTED_TREE = {
@@ -324,8 +324,52 @@ def test_clobber_refusal_leaves_the_existing_fixture_untouched(
     with pytest.raises(FixtureExistsError):
         scaffold_fixture(tmp_path, sandbox="docker")
 
-    # The on-disk marker still reads the original host choice, not docker.
     assert marker.read_text() == original
+
+
+# --------------------------------------------------------------------------- #
+# read_sandbox: the marker reader pycastle run uses for its default            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_read_sandbox_round_trips_the_written_marker(
+    tmp_path: Path, choice: str
+) -> None:
+    """``read_sandbox`` reads back exactly the choice the scaffolder recorded."""
+    scaffold_fixture(tmp_path, sandbox=choice)
+    assert read_sandbox(tmp_path / ".pycastle") == choice
+
+
+def test_read_sandbox_returns_none_when_marker_is_absent(tmp_path: Path) -> None:
+    """A fixture dir with no ``sandbox`` marker reads as ``None`` (not a crash)."""
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    assert read_sandbox(fixture) is None
+
+
+def test_read_sandbox_returns_none_when_fixture_dir_is_missing(
+    tmp_path: Path,
+) -> None:
+    """A missing fixture dir reads as ``None`` rather than raising."""
+    assert read_sandbox(tmp_path / "nope") is None
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n", "  \n\t "])
+def test_read_sandbox_treats_empty_marker_as_none(tmp_path: Path, blank: str) -> None:
+    """An empty or whitespace-only marker reads as ``None``."""
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    (fixture / "sandbox").write_text(blank)
+    assert read_sandbox(fixture) is None
+
+
+def test_read_sandbox_strips_and_lowercases(tmp_path: Path) -> None:
+    """The marker value is stripped and lower-cased for a forgiving read."""
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    (fixture / "sandbox").write_text("  DOCKER \n")
+    assert read_sandbox(fixture) == "docker"
 
 
 def test_refused_init_writes_nothing_new(tmp_path: Path) -> None:
