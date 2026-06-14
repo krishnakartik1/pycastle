@@ -18,12 +18,15 @@ def test_parses_run_arguments() -> None:
     assert args.iterations == 3
     assert args.runtime == "stub"
     assert args.include_unassigned is False
-    assert args.sandbox == "host"
+    # The flag now parses to None when omitted so the marker can be consulted;
+    # the effective host/docker choice is resolved later (see _resolve_sandbox).
+    assert args.sandbox is None
 
 
-def test_run_sandbox_defaults_to_host() -> None:
+def test_run_sandbox_flag_defaults_to_none_for_marker_resolution() -> None:
+    # No --sandbox flag parses to None, which signals "consult the marker".
     args = build_parser().parse_args(["run"])
-    assert args.sandbox == "host"
+    assert args.sandbox is None
 
 
 def test_make_run_id_is_a_timestamp_shape() -> None:
@@ -235,6 +238,176 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"])
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-codex-auth:/home/node/.codex" in wrapped
+
+
+def _write_marker(tmp_path: Path, value: str) -> None:
+    """Write ``value`` into a ``.pycastle/sandbox`` marker under ``tmp_path``."""
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "sandbox").write_text(value)
+
+
+def _mock_run_externals(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub everything ``pycastle run`` touches and capture the run-loop kwargs.
+
+    Mocks preflight, repo/branch/assignee resolution, the issue source, and the
+    orchestrator's ``run_loop`` so no real gh/git/docker/network runs. Returns
+    the dict the fake run loop records its kwargs into.
+    """
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    captured: dict[str, object] = {}
+
+    def fake_run_loop(*, runtime: object, **_kwargs: object) -> MagicMock:
+        captured["runtime"] = runtime
+        outcome = MagicMock()
+        outcome.issues = []
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+    return captured
+
+
+def test_run_defaults_sandbox_from_docker_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No flag + marker=docker drives the run inside the Docker sandbox.
+
+    The recorded init-time choice is honoured: the runtime handed to the
+    orchestrator carries a docker-wrapping argv even though no ``--sandbox`` was
+    passed.
+    """
+    _write_marker(tmp_path, "docker\n")
+    monkeypatch.chdir(tmp_path)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert runtime.argv_wrapper is not None
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    assert wrapped[:3] == ["docker", "run", "--rm"]
+
+
+def test_run_defaults_sandbox_from_host_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No flag + marker=host drives the run on the host (no docker wrapper)."""
+    _write_marker(tmp_path, "host\n")
+    monkeypatch.chdir(tmp_path)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert getattr(runtime, "argv_wrapper", None) is None
+
+
+def test_run_flag_overrides_docker_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit ``--sandbox host`` overrides a marker that says docker."""
+    _write_marker(tmp_path, "docker\n")
+    monkeypatch.chdir(tmp_path)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert getattr(runtime, "argv_wrapper", None) is None
+
+
+def test_run_flag_overrides_host_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit ``--sandbox docker`` overrides a marker that says host."""
+    _write_marker(tmp_path, "host\n")
+    monkeypatch.chdir(tmp_path)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert runtime.argv_wrapper is not None
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    assert wrapped[:3] == ["docker", "run", "--rm"]
+
+
+def test_run_falls_back_to_host_when_marker_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No flag and no marker at all falls back to a host run."""
+    monkeypatch.chdir(tmp_path)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert getattr(runtime, "argv_wrapper", None) is None
+
+
+def test_run_falls_back_to_host_for_empty_or_garbage_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty or unrecognised marker value falls back to host, never crashes."""
+    monkeypatch.chdir(tmp_path)
+
+    for value in ("", "   \n", "weird-value\n"):
+        _write_marker(tmp_path, value)
+        captured = _mock_run_externals(monkeypatch)
+        assert main(["run", "--runtime", "claude"]) == 0
+        runtime = captured["runtime"]
+        assert getattr(runtime, "argv_wrapper", None) is None
+
+
+def test_run_marker_docker_requires_docker_in_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A docker marker (no flag) makes preflight require docker, not the agent CLI.
+
+    Resolution happens before preflight, so the required-command set matches
+    where the run will actually execute.
+    """
+    _write_marker(tmp_path, "docker\n")
+    monkeypatch.chdir(tmp_path)
+
+    seen: dict[str, list[str]] = {}
+
+    def record(commands: list[str]) -> None:
+        seen["commands"] = list(commands)
+
+    monkeypatch.setattr(cli, "check_required_commands", record)
+    monkeypatch.setattr(cli, "_cmd_run", lambda _args: 0)
+
+    main(["run", "--runtime", "claude"])
+
+    assert "docker" in seen["commands"]
+    assert "claude" not in seen["commands"]
+
+
+def test_resolve_sandbox_prefers_explicit_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_resolve_sandbox`` returns the flag verbatim without reading the marker."""
+    _write_marker(tmp_path, "docker\n")
+    monkeypatch.chdir(tmp_path)
+    assert cli._resolve_sandbox("host") == "host"
+    assert cli._resolve_sandbox("docker") == "docker"
+
+
+def test_resolve_sandbox_reads_marker_when_flag_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no flag, ``_resolve_sandbox`` reads the marker; missing -> host."""
+    monkeypatch.chdir(tmp_path)
+    assert cli._resolve_sandbox(None) == "host"  # no marker
+
+    _write_marker(tmp_path, "docker\n")
+    assert cli._resolve_sandbox(None) == "docker"
 
 
 def test_run_host_codex_requires_codex_in_preflight(

@@ -15,7 +15,7 @@ from .orchestrator import make_fixture_gate_check
 from .orchestrator import run_batch as run_loop
 from .preflight import PreflightError, check_required_commands
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
-from .scaffold import FixtureExistsError, scaffold_fixture
+from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
 
 logger = logging.getLogger("pycastle")
 
@@ -64,10 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--sandbox",
         choices=("host", "docker"),
-        default="host",
+        default=None,
         help=(
-            "Where the runtime runs: on the host (default) or inside the "
-            "Docker agent sandbox"
+            "Where the runtime runs: on the host or inside the Docker agent "
+            "sandbox. Defaults to the choice recorded in .pycastle/sandbox at "
+            "init time, or host when that marker is absent."
         ),
     )
     return parser
@@ -97,6 +98,22 @@ def _resolve_assignee(login: str) -> str:
     if not resolved:
         raise PreflightError("Could not resolve the current GitHub login.")
     return resolved
+
+
+def _resolve_sandbox(flag: str | None) -> str:
+    """Resolve the effective sandbox for a run: flag, then marker, then host.
+
+    An explicit ``--sandbox`` flag wins. With no flag, the choice
+    ``pycastle init`` recorded in ``.pycastle/sandbox`` is used. A missing,
+    empty, or unrecognised marker falls back to ``host`` so a run never crashes
+    on a garbled marker -- only ``host`` and ``docker`` are honoured.
+    """
+    if flag is not None:
+        return flag
+    recorded = read_sandbox(FIXTURE_DIR)
+    if recorded in ("host", "docker"):
+        return recorded
+    return "host"
 
 
 def _build_runtime(runtime_name: str, sandbox_kind: str, workspace: Path) -> Runtime:
@@ -274,6 +291,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     required = ["git", "gh"]
     if args.command == "run":
+        # Resolve the effective sandbox (flag -> .pycastle/sandbox marker ->
+        # host) before preflight so the required-command set matches where the
+        # run will actually execute. The resolved value is written back onto
+        # args so _cmd_run reads the same decision.
+        args.sandbox = _resolve_sandbox(args.sandbox)
         if args.sandbox == "docker":
             # Docker is the isolation boundary: the host needs docker, not the
             # agent CLI (which lives inside the image).
