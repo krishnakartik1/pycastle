@@ -333,6 +333,32 @@ def test_build_login_command_codex_uses_device_auth_no_tty() -> None:
     assert "-it" not in argv
 
 
+def test_build_status_command_codex_uses_login_status_subcommand() -> None:
+    # Codex has no `auth` subcommand: its status check is `codex login status`
+    # (verified against Codex 0.139.0), run against the Codex auth volume and
+    # CODEX_HOME — never a hardcoded `claude` and never a bare `codex status`,
+    # which is not a subcommand and would launch the interactive TUI instead.
+    argv = sandbox.build_status_command("codex")
+
+    assert argv == [
+        "docker",
+        "run",
+        "--rm",
+        "-u",
+        "node",
+        "-v",
+        "pycastle-codex-auth:/home/node/.codex",
+        "-e",
+        "CODEX_HOME=/home/node/.codex",
+        sandbox.DEFAULT_IMAGE,
+        "codex",
+        "login",
+        "status",
+    ]
+    # No cross-runtime leak: the Codex status check never shells out to claude.
+    assert "claude" not in argv
+
+
 def test_build_login_command_claude_still_interactive_with_tty() -> None:
     # Parametrizing per runtime must not regress Claude: it keeps its TTY and
     # its browser-based auth login flow.
