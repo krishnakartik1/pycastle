@@ -1,7 +1,7 @@
 """PyCastle workflow for this repository.
 
-Hand-written for the conservative default flow: ``plan`` → ``implement`` →
-``review`` → done. The plan phase works out an approach, implement does the work
+Hand-written for the conservative default flow: ``plan`` -> ``implement`` ->
+``review`` -> done. The plan phase works out an approach, implement does the work
 test-first (retrying with a handoff while the quality gates stay red), and
 review tests edge cases and commits any improvements before the issue branch is
 merged. Each phase names its own success and failure destinations as explicit
@@ -11,7 +11,7 @@ ADR-0004).
 The failure edges all route to ``HUMAN``: implement's bounded retry is kept
 internal to the implement phase, so a phase that genuinely cannot pass hands the
 issue to a person rather than looping. Edit this file with normal Python to
-change the workflow — add phases, repoint edges, or model handoff as its own
+change the workflow -- add phases, repoint edges, or model handoff as its own
 node.
 """
 

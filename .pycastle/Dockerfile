@@ -1,0 +1,30 @@
+# PyCastle agent image.
+#
+# This builds the `pycastle/agent:node22` image the Docker sandbox runs the
+# agent inside. It is based on `node:22-slim` so the bundled Claude/Codex CLIs
+# available, and it runs as the non-root `node` user the sandbox expects.
+#
+# Extend it with YOUR project's language dependencies at the marked point below,
+# then build it once:
+#
+#     docker build -t pycastle/agent:node22 .pycastle
+#
+FROM node:22-slim
+
+# Install the agent CLIs your runtime needs. Pin versions to taste.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
+
+# --- PROJECT EXTENSION POINT ------------------------------------------------
+# Add your project's own language toolchains and system packages here, e.g.:
+#
+#   RUN apt-get update && apt-get install -y --no-install-recommends \
+#         python3 python3-pip \
+#     && rm -rf /var/lib/apt/lists/*
+#
+# Leave this block empty if a plain Node toolchain is all your repo needs.
+# ---------------------------------------------------------------------------
+
+# The agent runs as the non-root `node` user (the Claude CLI refuses root, and
+# files it writes stay owned by a real user rather than root).
+USER node
+WORKDIR /home/node
