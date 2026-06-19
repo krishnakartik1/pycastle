@@ -452,13 +452,16 @@ class CodexRuntime:
         return RuntimeResult(output="".join(output_buf), telemetry=telemetry)
 
 
-def _collect_codex_item(item: dict[str, Any], output_buf: list[str]) -> None:
+def _collect_codex_item(item: object, output_buf: list[str]) -> None:
     """Append the text of an ``agent_message`` Codex item, ignoring the rest.
 
     Codex narrates tool runs and file changes as their own ``item.completed``
     events; only ``agent_message`` items are the model's prose output, so the
-    verbose command/file-change items are dropped.
+    verbose command/file-change items are dropped. A malformed event whose
+    ``item`` is not a mapping contributes nothing rather than crashing the parse.
     """
+    if not isinstance(item, dict):
+        return
     if item.get("type") == "agent_message":
         text = item.get("text", "")
         if text:
