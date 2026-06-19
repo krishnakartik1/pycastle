@@ -41,6 +41,7 @@ written to the argv these builders return.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,28 @@ from pathlib import Path
 #: ``claude`` CLI is available. The project Dockerfile that publishes this image
 #: under this tag is scaffolded by a later slice.
 DEFAULT_IMAGE = "pycastle/agent:node22"
+
+#: The Docker repo every content-addressed agent image is tagged under (see
+#: :func:`image_tag_for_dockerfile`). The default image lives here too.
+AGENT_IMAGE_REPO = "pycastle/agent"
+
+
+def image_tag_for_dockerfile(dockerfile_text: str) -> str:
+    """Return the content-addressed agent-image tag for a Dockerfile's text.
+
+    The tag is ``pycastle/agent:<sha256(text)[:12]>`` (ADR-0005): a 12-char
+    lowercase-hex slice of the recipe's SHA-256. Identical text always yields
+    the same tag, so an unchanged Dockerfile skips the build, and any edit
+    changes the tag and triggers exactly one rebuild.
+
+    The hash covers the *recipe text*, not the upstream base it pulls. A moving
+    base tag such as ``FROM node:22-slim`` is deliberately not tracked: identical
+    text means the same tag and no rebuild even if the base has changed upstream
+    (catching base drift is a separate, deliberate ``--pull`` — out of scope).
+    """
+    digest = hashlib.sha256(dockerfile_text.encode("utf-8")).hexdigest()[:12]
+    return f"{AGENT_IMAGE_REPO}:{digest}"
+
 
 #: The non-root user the agent runs as inside the container.
 SANDBOX_USER = "node"

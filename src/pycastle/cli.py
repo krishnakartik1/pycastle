@@ -20,6 +20,7 @@ from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
 logger = logging.getLogger("pycastle")
 
 FIXTURE_DIR = Path(".pycastle")
+DOCKERFILE_NAME = "Dockerfile"
 RUNTIMES = ("stub", "claude", "codex")
 
 
@@ -39,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         "setup", help="Log a runtime into its Docker auth volume (coming soon)"
     )
     setup.add_argument("--runtime", choices=RUNTIMES, default="claude")
+    sandbox_sub.add_parser(
+        "build",
+        help="Build .pycastle/Dockerfile into its content-addressed agent image",
+    )
 
     run_parser = sub.add_parser("run", help="Run the autonomous loop")
     run_parser.add_argument(
@@ -69,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Where the runtime runs: on the host or inside the Docker agent "
             "sandbox. Defaults to the choice recorded in .pycastle/sandbox at "
             "init time, or host when that marker is absent."
+        ),
+    )
+    run_parser.add_argument(
+        "--image",
+        default=None,
+        help=(
+            "Agent image to run in the Docker sandbox (bring-your-own-image). "
+            "When omitted, .pycastle/Dockerfile is built on demand into a "
+            "content-addressed tag, else the default tag is used."
         ),
     )
     return parser
@@ -116,20 +130,69 @@ def _resolve_sandbox(flag: str | None) -> str:
     return "host"
 
 
-def _build_runtime(runtime_name: str, sandbox_kind: str, workspace: Path) -> Runtime:
+def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
+    """Build ``fixture_dir``'s Dockerfile into its content-addressed tag if absent.
+
+    Derives the tag from the recipe text (ADR-0005), then builds only when the
+    tag is not already present. A successful ``docker image inspect <tag>``
+    (exit 0) means the cached image exists and the build is skipped; any
+    non-zero exit is treated as "absent → build", and that one ``docker build``
+    is the only build invoked. Returns the resolved tag.
+    """
+    tag = sandbox.image_tag_for_dockerfile(dockerfile_text)
+    inspect = run_cmd(["docker", "image", "inspect", tag], capture=True)
+    if getattr(inspect, "returncode", 1) == 0:
+        logger.info("Agent image %s is already built; skipping build.", tag)
+        return tag
+    logger.info("Building the agent image %s from %s ...", tag, fixture_dir)
+    run_cmd(["docker", "build", "-t", tag, str(fixture_dir)])
+    return tag
+
+
+def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
+    """Resolve the agent image for a Docker run by ADR-0005's precedence.
+
+    1. ``image_flag`` given → return it verbatim. The Dockerfile is never read
+       and ``docker`` is never invoked (pure bring-your-own-image).
+    2. No flag, ``fixture_dir/Dockerfile`` exists → build it on demand into its
+       content-addressed tag (skipping the build when the tag already exists)
+       and return that tag.
+    3. No flag, no Dockerfile → fall back to :data:`sandbox.DEFAULT_IMAGE`.
+
+    Only ever called for a Docker run; a host run never resolves an image.
+    """
+    if image_flag is not None:
+        return image_flag
+    dockerfile = fixture_dir / DOCKERFILE_NAME
+    if dockerfile.is_file():
+        # A present-but-unreadable Dockerfile surfaces here rather than being
+        # treated as absent: the read raises, it is not swallowed.
+        return _build_image_for_dockerfile(dockerfile.read_text(), fixture_dir)
+    return sandbox.DEFAULT_IMAGE
+
+
+def _build_runtime(
+    runtime_name: str,
+    sandbox_kind: str,
+    workspace: Path,
+    *,
+    image: str = sandbox.DEFAULT_IMAGE,
+) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
     ``--sandbox docker`` wraps each phase's inner agent argv into a
     ``docker run`` argv, so both the Runtime and the commands it invokes run
-    inside the agent container. Both Claude and Codex support this; every other
-    combination runs the runtime on the host as before. The docker-vs-host
-    choice is orthogonal to which runtime runs.
+    inside the agent container. ``image`` is the already-resolved agent image
+    (see :func:`_resolve_agent_image`) and is threaded into the docker wrapper.
+    Both Claude and Codex support this; every other combination runs the runtime
+    on the host as before. The docker-vs-host choice is orthogonal to which
+    runtime runs.
     """
     if sandbox_kind == "docker":
         if runtime_name == "claude":
-            return ClaudeRuntime.in_docker(workspace=workspace)
+            return ClaudeRuntime.in_docker(workspace=workspace, image=image)
         if runtime_name == "codex":
-            return CodexRuntime.in_docker(workspace=workspace)
+            return CodexRuntime.in_docker(workspace=workspace, image=image)
         raise NotImplementedError(
             f"The Docker sandbox for the {runtime_name!r} runtime is not "
             "available; run it with --sandbox host for now."
@@ -145,7 +208,13 @@ def _make_run_id() -> str:
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     workspace = Path.cwd()
-    runtime = _build_runtime(args.runtime, args.sandbox, workspace)
+    # Resolve the agent image once, before the run loop, so a missing image is
+    # built exactly once rather than per iteration. Resolution is docker-only.
+    if args.sandbox == "docker":
+        image = _resolve_agent_image(args.image, FIXTURE_DIR)
+        runtime = _build_runtime(args.runtime, args.sandbox, workspace, image=image)
+    else:
+        runtime = _build_runtime(args.runtime, args.sandbox, workspace)
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
@@ -207,6 +276,28 @@ def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
         "`pycastle sandbox setup --runtime %s` is not supported.", args.runtime
     )
     return 2
+
+
+def _cmd_sandbox_build(_args: argparse.Namespace) -> int:
+    """Dispatch ``pycastle sandbox build``: build the Dockerfile's agent image.
+
+    Builds ``.pycastle/Dockerfile`` into its content-addressed tag via the same
+    build path a Docker run takes implicitly (see
+    :func:`_build_image_for_dockerfile`), so there is one build path, not two.
+    Errors with guidance and a non-zero exit when no Dockerfile is present,
+    rather than silently falling back to the default image.
+    """
+    dockerfile = FIXTURE_DIR / DOCKERFILE_NAME
+    if not dockerfile.is_file():
+        logger.error(
+            "No %s found; run `pycastle init` to scaffold a Project fixture "
+            "with an agent Dockerfile first.",
+            dockerfile,
+        )
+        return 1
+    tag = _build_image_for_dockerfile(dockerfile.read_text(), FIXTURE_DIR)
+    logger.info("The agent image %s is built and ready.", tag)
+    return 0
 
 
 def _setup_claude() -> int:
@@ -315,5 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "init":
         return _cmd_init(args)
     if args.command == "sandbox":
+        if args.sandbox_command == "build":
+            return _cmd_sandbox_build(args)
         return _cmd_sandbox_setup(args)
     return 2

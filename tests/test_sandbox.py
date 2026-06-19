@@ -384,3 +384,47 @@ def test_codex_run_command_does_not_leak_credentials() -> None:
 def test_unknown_runtime_sandbox_config_raises() -> None:
     with pytest.raises(ValueError):
         sandbox.build_run_command("nope", inner_argv=["x"], workspace=Path("/w"))
+
+
+# --- Content-addressed agent-image tag (ADR-0005) ---------------------------
+#
+# The agent image is built on demand from the project's Dockerfile and cached by
+# a content hash of the recipe text. These tests lock the tag shape and the
+# hash's determinism without ever invoking docker (the helper is pure).
+
+
+def test_image_tag_for_dockerfile_is_pycastle_agent_with_12_hex() -> None:
+    # The tag is `pycastle/agent:<sha256(text)[:12]>`: the pycastle/agent repo
+    # plus a 12-char lowercase-hex slice of the recipe's sha256.
+    tag = sandbox.image_tag_for_dockerfile("FROM node:22-slim\n")
+    repo, _, digest = tag.partition(":")
+    assert repo == "pycastle/agent"
+    assert len(digest) == 12
+    assert all(c in "0123456789abcdef" for c in digest)
+
+
+def test_image_tag_for_dockerfile_matches_known_sha256() -> None:
+    # The hash is over the exact recipe bytes (utf-8 sha256), not a file's mtime
+    # or size, so it is deterministic across runs and platforms.
+    import hashlib
+
+    text = "FROM node:22-slim\nUSER node\n"
+    expected = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    assert sandbox.image_tag_for_dockerfile(text) == f"pycastle/agent:{expected}"
+
+
+def test_image_tag_for_dockerfile_is_stable_for_identical_text() -> None:
+    # Identical recipe text -> identical tag, which is what lets an unchanged
+    # Dockerfile skip the build entirely.
+    text = "FROM node:22-slim\nRUN npm i -g x\n"
+    assert sandbox.image_tag_for_dockerfile(text) == sandbox.image_tag_for_dockerfile(
+        text
+    )
+
+
+def test_image_tag_for_dockerfile_changes_on_one_byte_edit() -> None:
+    # A one-byte edit changes the hash, so an edited Dockerfile resolves to a new
+    # tag and triggers exactly one rebuild.
+    a = sandbox.image_tag_for_dockerfile("FROM node:22-slim\n")
+    b = sandbox.image_tag_for_dockerfile("FROM node:22-slim \n")
+    assert a != b
