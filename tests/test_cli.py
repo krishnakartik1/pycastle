@@ -642,6 +642,41 @@ def test_resolve_agent_image_flag_wins_never_builds(
     assert calls == []
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_resolve_agent_image_rejects_blank_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blank: str
+) -> None:
+    # An empty or whitespace-only --image must fail fast: returned verbatim it
+    # would slot into the docker run argv as the image name, shifting the real
+    # inner argv and failing opaquely deep in docker run. Nothing is built.
+    fixture = _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    calls, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    with pytest.raises(PreflightError):
+        cli._resolve_agent_image(blank, fixture)
+
+    assert calls == []
+
+
+def test_run_docker_exits_nonzero_on_blank_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: a blank --image aborts the run with a clean non-zero exit (not
+    # a traceback) before any runtime is resolved or docker is touched.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        raise AssertionError(f"docker should never run for a blank image: {args}")
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert (
+        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""]) == 1
+    )
+
+
 def test_resolve_agent_image_builds_when_tag_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

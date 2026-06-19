@@ -161,7 +161,10 @@ def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
     """Resolve the agent image for a Docker run by ADR-0005's precedence.
 
     1. ``image_flag`` given → return it verbatim. The Dockerfile is never read
-       and ``docker`` is never invoked (pure bring-your-own-image).
+       and ``docker`` is never invoked (pure bring-your-own-image). An empty or
+       whitespace-only flag raises :class:`PreflightError`: it would otherwise
+       slot into the ``docker run`` argv as the image name, shifting the real
+       inner argv and failing opaquely deep in ``docker run``.
     2. No flag, ``fixture_dir/Dockerfile`` exists → build it on demand into its
        content-addressed tag (skipping the build when the tag already exists)
        and return that tag.
@@ -170,6 +173,11 @@ def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
     Only ever called for a Docker run; a host run never resolves an image.
     """
     if image_flag is not None:
+        if not image_flag.strip():
+            raise PreflightError(
+                "The --image value is empty; pass a real agent image tag, or "
+                "omit --image to build .pycastle/Dockerfile or use the default."
+            )
         return image_flag
     dockerfile = fixture_dir / DOCKERFILE_NAME
     if dockerfile.is_file():
