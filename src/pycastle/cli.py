@@ -145,7 +145,15 @@ def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
         logger.info("Agent image %s is already built; skipping build.", tag)
         return tag
     logger.info("Building the agent image %s from %s ...", tag, fixture_dir)
-    run_cmd(["docker", "build", "-t", tag, str(fixture_dir)])
+    build = run_cmd(["docker", "build", "-t", tag, str(fixture_dir)])
+    if getattr(build, "returncode", 1) != 0:
+        # A failed build must not be swallowed: returning the tag here would let
+        # the run proceed against an image that was never built (or a stale tag
+        # from an earlier build), failing opaquely deeper in `docker run`.
+        raise PreflightError(
+            f"Failed to build the agent image {tag} from {fixture_dir}; "
+            "fix the Dockerfile and retry."
+        )
     return tag
 
 
@@ -397,16 +405,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         required.append("docker")
     try:
         check_required_commands(required)
+        if args.command == "run":
+            return _cmd_run(args)
+        if args.command == "init":
+            return _cmd_init(args)
+        if args.command == "sandbox":
+            if args.sandbox_command == "build":
+                return _cmd_sandbox_build(args)
+            return _cmd_sandbox_setup(args)
     except PreflightError as exc:
+        # Covers both preflight (missing commands) and a failed on-demand image
+        # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)
         return 1
-
-    if args.command == "run":
-        return _cmd_run(args)
-    if args.command == "init":
-        return _cmd_init(args)
-    if args.command == "sandbox":
-        if args.sandbox_command == "build":
-            return _cmd_sandbox_build(args)
-        return _cmd_sandbox_setup(args)
     return 2

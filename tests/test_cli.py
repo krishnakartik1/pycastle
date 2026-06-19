@@ -665,6 +665,70 @@ def test_resolve_agent_image_builds_when_tag_absent(
     assert builds[0] == ["docker", "build", "-t", tag, str(fixture)]
 
 
+def test_resolve_agent_image_raises_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A failed `docker build` must surface, not be swallowed: returning the tag
+    # would let the run proceed against an image that was never built. The
+    # resolver raises PreflightError so the run never reaches `docker run`.
+    text = "FROM node:22-slim\nRUN false\n"
+    fixture = _write_dockerfile(tmp_path, text)
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        # The image is absent (inspect non-zero) and the build itself fails.
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    with pytest.raises(PreflightError):
+        cli._resolve_agent_image(None, fixture)
+
+    # The one build was attempted; the failure is what raised.
+    assert [c for c in calls if c[:2] == ["docker", "build"]]
+
+
+def test_run_docker_exits_nonzero_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: a failed build aborts the run with a clean non-zero exit (not a
+    # traceback) and never resolves a runtime or opens a PR.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 1  # inspect: absent; build: fails
+        return proc
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
+
+
+def test_sandbox_build_exits_nonzero_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `sandbox build` surfaces a build failure as a non-zero exit rather than
+    # claiming the image is ready.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "build"]) == 1
+
+
 def test_resolve_agent_image_skips_build_when_tag_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
