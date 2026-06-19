@@ -319,6 +319,26 @@ def test_non_dict_usage_does_not_throw(mock_popen: MagicMock, tmp_path: Path) ->
     assert result.telemetry.num_turns == 1
 
 
+def test_non_dict_item_does_not_throw(mock_popen: MagicMock, tmp_path: Path) -> None:
+    # A malformed item.completed whose item is not a mapping (null, a string)
+    # must be skipped rather than crashing the parse loop. A well-formed
+    # agent_message after it is still captured, so one junk event does not
+    # swallow the rest of the stream.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": None},
+        {"type": "item.completed", "item": "not-a-dict"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "kept"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "kept"
+    assert result.telemetry.thread_id == "t"
+
+
 def test_multiple_agent_messages_concatenate_in_order(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:

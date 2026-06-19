@@ -1,0 +1,4 @@
+# PyCastle run output (transient): run logs and generated run artifacts.
+logs/
+runs/
+worktrees/

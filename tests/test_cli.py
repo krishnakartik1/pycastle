@@ -29,6 +29,24 @@ def test_run_sandbox_flag_defaults_to_none_for_marker_resolution() -> None:
     assert args.sandbox is None
 
 
+def test_run_image_flag_parses() -> None:
+    # `--image X` is bring-your-own-image: it is parsed verbatim onto args.
+    args = build_parser().parse_args(["run", "--image", "my/agent:dev"])
+    assert args.image == "my/agent:dev"
+
+
+def test_run_image_flag_defaults_to_none() -> None:
+    # No --image means "resolve from the Dockerfile, else the default tag".
+    args = build_parser().parse_args(["run"])
+    assert args.image is None
+
+
+def test_parses_sandbox_build() -> None:
+    args = build_parser().parse_args(["sandbox", "build"])
+    assert args.command == "sandbox"
+    assert args.sandbox_command == "build"
+
+
 def test_make_run_id_is_a_timestamp_shape() -> None:
     # The CLI is where a run id is minted (the orchestrator never reads a clock,
     # so it stays deterministic in tests). The id is a YYYYMMDD-HHMMSS stamp.
@@ -179,6 +197,9 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     ``docker run`` argv, so both the Runtime and its commands run in the
     container. Everything external is mocked: no real Docker, gh, or git.
     """
+    # No Dockerfile in this cwd, so image resolution falls back to the default
+    # tag and never touches docker -- the run stays hermetic.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
     monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
@@ -214,6 +235,9 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     argv into a docker run argv against the codex auth volume. Everything
     external is mocked.
     """
+    # No Dockerfile in this cwd, so image resolution falls back to the default
+    # tag and never touches docker -- the run stays hermetic.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
     monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
@@ -564,3 +588,369 @@ def test_sandbox_setup_codex_login_failure_returns_nonzero(
     monkeypatch.setattr(cli, "run_cmd", fake_runner)
 
     assert main(["sandbox", "setup", "--runtime", "codex"]) == 1
+
+
+# --- Agent-image resolution and on-demand build (ADR-0005, issue #25) --------
+#
+# `_resolve_agent_image` encodes the 3-way precedence: --image wins (no build,
+# no Dockerfile read); else a present Dockerfile is built on demand into its
+# content-addressed tag, skipping the build when that tag already exists; else
+# the default tag. docker is always mocked through run_cmd -- no real build.
+
+
+def _write_dockerfile(tmp_path: Path, text: str) -> Path:
+    """Write a ``Dockerfile`` into a ``.pycastle/`` fixture under ``tmp_path``."""
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "Dockerfile").write_text(text)
+    return fixture
+
+
+def _fake_docker(*, inspect_returncode: int) -> tuple[list[list[str]], object]:
+    """Build a run_cmd stand-in recording every docker argv it is handed.
+
+    ``docker image inspect`` returns ``inspect_returncode``; everything else
+    (the build) returns success. Returns the recording list and the callable.
+    """
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        if args[:3] == ["docker", "image", "inspect"]:
+            proc.returncode = inspect_returncode
+        else:
+            proc.returncode = 0
+        return proc
+
+    return calls, runner
+
+
+def test_resolve_agent_image_flag_wins_never_builds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Precedence 1: --image X is returned verbatim. The Dockerfile is never read
+    # and docker is never invoked (not even an inspect), so a present Dockerfile
+    # is irrelevant under bring-your-own-image.
+    fixture = _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    calls, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    image = cli._resolve_agent_image("my/agent:dev", fixture)
+
+    assert image == "my/agent:dev"
+    assert calls == []
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_resolve_agent_image_rejects_blank_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blank: str
+) -> None:
+    # An empty or whitespace-only --image must fail fast: returned verbatim it
+    # would slot into the docker run argv as the image name, shifting the real
+    # inner argv and failing opaquely deep in docker run. Nothing is built.
+    fixture = _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    calls, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    with pytest.raises(PreflightError):
+        cli._resolve_agent_image(blank, fixture)
+
+    assert calls == []
+
+
+def test_run_docker_exits_nonzero_on_blank_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: a blank --image aborts the run with a clean non-zero exit (not
+    # a traceback) before any runtime is resolved or docker is touched.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        raise AssertionError(f"docker should never run for a blank image: {args}")
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert (
+        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""]) == 1
+    )
+
+
+def test_resolve_agent_image_builds_when_tag_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Precedence 2, cold cache: Dockerfile present, `image inspect` non-zero ->
+    # exactly one `docker build -t <hashed tag> .pycastle`, then run that tag.
+    from pycastle import sandbox
+
+    text = "FROM node:22-slim\nRUN echo hi\n"
+    fixture = _write_dockerfile(tmp_path, text)
+    tag = sandbox.image_tag_for_dockerfile(text)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    image = cli._resolve_agent_image(None, fixture)
+
+    assert image == tag
+    inspects = [c for c in calls if c[:3] == ["docker", "image", "inspect"]]
+    builds = [c for c in calls if c[:2] == ["docker", "build"]]
+    assert len(inspects) == 1
+    assert len(builds) == 1
+    assert builds[0] == ["docker", "build", "-t", tag, str(fixture)]
+
+
+def test_resolve_agent_image_raises_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A failed `docker build` must surface, not be swallowed: returning the tag
+    # would let the run proceed against an image that was never built. The
+    # resolver raises PreflightError so the run never reaches `docker run`.
+    text = "FROM node:22-slim\nRUN false\n"
+    fixture = _write_dockerfile(tmp_path, text)
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        # The image is absent (inspect non-zero) and the build itself fails.
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    with pytest.raises(PreflightError):
+        cli._resolve_agent_image(None, fixture)
+
+    # The one build was attempted; the failure is what raised.
+    assert [c for c in calls if c[:2] == ["docker", "build"]]
+
+
+def test_run_docker_exits_nonzero_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: a failed build aborts the run with a clean non-zero exit (not a
+    # traceback) and never resolves a runtime or opens a PR.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 1  # inspect: absent; build: fails
+        return proc
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
+
+
+def test_sandbox_build_exits_nonzero_when_build_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `sandbox build` surfaces a build failure as a non-zero exit rather than
+    # claiming the image is ready.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "build"]) == 1
+
+
+def test_resolve_agent_image_skips_build_when_tag_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Precedence 2, warm cache: an unchanged Dockerfile resolves to a tag that
+    # already exists (`image inspect` returns 0), so no build runs -- instant run.
+    from pycastle import sandbox
+
+    text = "FROM node:22-slim\n"
+    fixture = _write_dockerfile(tmp_path, text)
+    tag = sandbox.image_tag_for_dockerfile(text)
+    calls, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    image = cli._resolve_agent_image(None, fixture)
+
+    assert image == tag
+    assert [c for c in calls if c[:2] == ["docker", "build"]] == []
+
+
+def test_resolve_agent_image_tag_tracks_dockerfile_edits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Editing the Dockerfile changes the resolved tag, so the rebuild is driven
+    # by content, not by a fixed default tag.
+    fixture = _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    _, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+    first = cli._resolve_agent_image(None, fixture)
+
+    (fixture / "Dockerfile").write_text("FROM node:22-slim\nRUN echo edited\n")
+    second = cli._resolve_agent_image(None, fixture)
+
+    assert first != second
+
+
+def test_resolve_agent_image_falls_back_to_default_without_dockerfile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Precedence 3: no --image and no Dockerfile -> the default tag, never a
+    # build (there is no recipe to build).
+    from pycastle import sandbox
+
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    calls, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    image = cli._resolve_agent_image(None, fixture)
+
+    assert image == sandbox.DEFAULT_IMAGE
+    assert [c for c in calls if c[:2] == ["docker", "build"]] == []
+
+
+def test_resolve_agent_image_builds_once_not_per_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A single resolve does one inspect and at most one build; the caller resolves
+    # once before the run loop, never per iteration.
+    fixture = _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    cli._resolve_agent_image(None, fixture)
+
+    assert len([c for c in calls if c[:2] == ["docker", "build"]]) == 1
+
+
+def test_run_docker_resolves_and_threads_image_into_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: `run --sandbox docker` resolves the image once and passes it to
+    # the runtime, so the docker run argv carries the resolved tag.
+    from pycastle import sandbox
+
+    text = "FROM node:22-slim\nRUN echo wired\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox.image_tag_for_dockerfile(text)
+    _, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    assert tag in wrapped
+
+
+def test_run_image_flag_threads_through_and_never_builds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `run --image X --sandbox docker` runs X and never builds, even with a
+    # Dockerfile present.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    monkeypatch.chdir(tmp_path)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert (
+        main(
+            [
+                "run",
+                "--sandbox",
+                "docker",
+                "--runtime",
+                "claude",
+                "--image",
+                "ci/agent:fixed",
+            ]
+        )
+        == 0
+    )
+
+    runtime = captured["runtime"]
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    assert "ci/agent:fixed" in wrapped
+    assert [c for c in calls if c[:2] == ["docker", "build"]] == []
+
+
+def test_run_host_never_resolves_an_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Resolution is docker-only: a host run never inspects or builds an image,
+    # even with a Dockerfile present.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    monkeypatch.chdir(tmp_path)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+    captured = _mock_run_externals(monkeypatch)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "claude"]) == 0
+
+    runtime = captured["runtime"]
+    assert getattr(runtime, "argv_wrapper", None) is None
+    assert calls == []
+
+
+def test_sandbox_build_builds_the_content_addressed_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `sandbox build` builds the Dockerfile into its content-addressed tag via
+    # the same build path the run takes implicitly.
+    from pycastle import sandbox
+
+    text = "FROM node:22-slim\nRUN echo built\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox.image_tag_for_dockerfile(text)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "build"]) == 0
+
+    # `sandbox build` builds the project fixture dir (the relative .pycastle).
+    builds = [c for c in calls if c[:2] == ["docker", "build"]]
+    assert builds == [["docker", "build", "-t", tag, str(cli.FIXTURE_DIR)]]
+
+
+def test_sandbox_build_without_dockerfile_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `sandbox build` with no Dockerfile has nothing to build: it errors with
+    # guidance, never falling back to the default tag.
+    (tmp_path / ".pycastle").mkdir()
+    monkeypatch.chdir(tmp_path)
+    _, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "build"]) == 1
+
+
+def test_sandbox_build_requires_docker_in_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The whole sandbox command group requires docker on PATH; build is covered.
+    seen: dict[str, list[str]] = {}
+
+    def record(commands: list[str]) -> None:
+        seen["commands"] = list(commands)
+
+    monkeypatch.setattr(cli, "check_required_commands", record)
+    monkeypatch.setattr(cli, "_cmd_sandbox_build", lambda _args: 0)
+
+    main(["sandbox", "build"])
+
+    assert "docker" in seen["commands"]
