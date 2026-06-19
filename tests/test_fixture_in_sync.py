@@ -74,7 +74,13 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     scaffolded = tmp_path / FIXTURE_DIRNAME
 
     # Same shape: the committed tree carries exactly the files init scaffolds.
-    assert _tree(committed) == _tree(scaffolded)
+    committed_tree, scaffolded_tree = _tree(committed), _tree(scaffolded)
+    missing = scaffolded_tree - committed_tree
+    extra = committed_tree - scaffolded_tree
+    assert committed_tree == scaffolded_tree, (
+        f"committed {FIXTURE_DIRNAME}/ shape has drifted from the scaffolder: "
+        f"missing {sorted(missing)}, unexpected {sorted(extra)}"
+    )
 
     # Byte-identical for everything except the project's own gate/prompts.
     for relative in _tree(scaffolded) - _EXEMPT_FROM_BYTES:
@@ -85,3 +91,21 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     # The exempt files must still be present (a repo customizes, never drops them).
     for relative in _EXEMPT_FROM_BYTES:
         assert (committed / relative).is_file(), f"{relative} is missing"
+
+
+def test_exempt_files_are_real_fixture_paths(tmp_path: Path) -> None:
+    """Every exempt path is a path the scaffolder actually writes.
+
+    The byte-equality skip list (:data:`_EXEMPT_FROM_BYTES`) is maintained by
+    hand. If the scaffolder ever renamed or dropped one of those files, a stale
+    entry here would silently exempt nothing -- and a real drift in the renamed
+    file would slip through. Pinning the set to the scaffolded shape keeps the
+    skip list honest.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    scaffolded = _tree(tmp_path / FIXTURE_DIRNAME)
+    stale = _EXEMPT_FROM_BYTES - scaffolded
+    assert not stale, (
+        f"_EXEMPT_FROM_BYTES names paths the scaffolder no longer writes: "
+        f"{sorted(stale)}"
+    )
