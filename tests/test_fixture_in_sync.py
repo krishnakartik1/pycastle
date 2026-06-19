@@ -23,6 +23,7 @@ fail the guard.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pycastle.scaffold import (
@@ -147,3 +148,30 @@ def test_guard_catches_shape_drift(tmp_path: Path) -> None:
     assert _tree(pristine) == _tree(drifted)
     (drifted / "main.py").unlink()
     assert _tree(pristine) != _tree(drifted)
+
+
+def test_scaffolder_gate_is_executable(tmp_path: Path) -> None:
+    """The scaffolder writes an executable ``gate``.
+
+    ``pycastle run`` invokes the gate directly, so a non-executable gate would
+    fail to launch. The byte/shape comparisons above ignore file mode (the gate
+    is exempt from byte-equality, and ``_tree`` only collects paths), so the gate
+    being runnable is pinned here rather than left to the in-sync guard.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    gate = tmp_path / FIXTURE_DIRNAME / "gate"
+    assert os.access(gate, os.X_OK), "scaffolded gate is not executable"
+
+
+def test_committed_gate_is_executable() -> None:
+    """The committed fixture's ``gate`` carries the executable bit.
+
+    The in-sync guard treats the gate as a project-owned customization and only
+    checks it exists, never its mode. But a committed gate that lost its
+    executable bit would ship a fixture ``pycastle run`` cannot launch, so the
+    one thing that makes the gate runnable is pinned directly on the committed
+    file.
+    """
+    gate = _repo_root() / FIXTURE_DIRNAME / "gate"
+    assert gate.is_file(), f"{gate} is missing"
+    assert os.access(gate, os.X_OK), f"{gate} is not executable"
