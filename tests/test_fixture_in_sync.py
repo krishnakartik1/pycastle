@@ -83,7 +83,7 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     )
 
     # Byte-identical for everything except the project's own gate/prompts.
-    for relative in _tree(scaffolded) - _EXEMPT_FROM_BYTES:
+    for relative in scaffolded_tree - _EXEMPT_FROM_BYTES:
         assert (committed / relative).read_bytes() == (
             scaffolded / relative
         ).read_bytes(), f"{relative} has drifted from the scaffolder output"
@@ -109,3 +109,41 @@ def test_exempt_files_are_real_fixture_paths(tmp_path: Path) -> None:
         f"_EXEMPT_FROM_BYTES names paths the scaffolder no longer writes: "
         f"{sorted(stale)}"
     )
+
+
+def test_guard_catches_byte_drift(tmp_path: Path) -> None:
+    """The byte comparison is not vacuous: it fails when a fixture file drifts.
+
+    The in-sync guard above passes only while the committed tree matches the
+    scaffolder. A future refactor of ``_tree`` or the comparison could make that
+    pass *trivially* (e.g. an empty tree compares equal to itself). This pins the
+    guard's teeth: two fresh scaffolds are byte-identical, and perturbing one
+    non-exempt file makes the byte comparison the guard relies on fail.
+    """
+    scaffold_fixture(tmp_path / "pristine", sandbox="host")
+    scaffold_fixture(tmp_path / "drifted", sandbox="host")
+    pristine = tmp_path / "pristine" / FIXTURE_DIRNAME
+    drifted = tmp_path / "drifted" / FIXTURE_DIRNAME
+
+    # Pick a non-exempt file and confirm a fresh scaffold matches byte for byte.
+    target = "Dockerfile"
+    assert target not in _EXEMPT_FROM_BYTES
+    assert (pristine / target).read_bytes() == (drifted / target).read_bytes()
+
+    # Now drift it and confirm the comparison the guard uses would flag it.
+    (drifted / target).write_text(
+        (drifted / target).read_text() + "\n# unexpected drift\n"
+    )
+    assert (pristine / target).read_bytes() != (drifted / target).read_bytes()
+
+
+def test_guard_catches_shape_drift(tmp_path: Path) -> None:
+    """The shape comparison is not vacuous: dropping a file changes the tree set."""
+    scaffold_fixture(tmp_path / "pristine", sandbox="host")
+    scaffold_fixture(tmp_path / "drifted", sandbox="host")
+    pristine = tmp_path / "pristine" / FIXTURE_DIRNAME
+    drifted = tmp_path / "drifted" / FIXTURE_DIRNAME
+
+    assert _tree(pristine) == _tree(drifted)
+    (drifted / "main.py").unlink()
+    assert _tree(pristine) != _tree(drifted)
