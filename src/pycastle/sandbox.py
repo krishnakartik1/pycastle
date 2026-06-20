@@ -28,15 +28,12 @@ Credential file contents are never read, printed, or copied by any builder.
 Auth is proved only by the runtime's own ``status`` subcommand (see
 :func:`build_status_command`), never by ``cat``-ing the volume.
 
-Headless token fallback
-------------------------
+Headless fallback
+-----------------
 :func:`build_login_command` performs the *interactive* browser login, which
 needs a TTY. On a headless host (CI, a server with no browser) run the login on
 a machine that has a browser, then move the resulting credentials into the same
-named volume the host uses, or pass a long-lived token into the container via
-the ``CLAUDE_CODE_OAUTH_TOKEN`` environment variable instead of mounting the
-volume. The token is read from the host environment at run time and is never
-written to the argv these builders return.
+named volume the host uses.
 """
 
 from __future__ import annotations

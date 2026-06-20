@@ -54,13 +54,10 @@ Onboard auth with:
 pycastle sandbox setup --runtime claude
 ```
 
-**Headless token fallback.** `sandbox setup` runs the interactive browser login,
-which needs a TTY. On a headless host (CI, a server with no browser), either run
-the login on a machine that has a browser and move the resulting credentials
-into the same named volume, or skip the volume and pass a long-lived token into
-the container via the `CLAUDE_CODE_OAUTH_TOKEN` environment variable. The token
-is read from the host environment at run time and never written to the command
-line.
+**Headless fallback.** `sandbox setup` runs the interactive browser login,
+which needs a TTY. On a headless host (CI, a server with no browser), run the
+login on a machine that has a browser, then move the resulting credentials into
+the same named volume the host uses.
 
 ## How it fits together
 
