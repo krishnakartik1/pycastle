@@ -66,6 +66,87 @@ def _git_aware_runner(
     return MagicMock(side_effect=side_effect)
 
 
+def test_thinking_sink_appends_phase_prefixed_lines_to_run_dir(
+    fixture_dir: Path,
+) -> None:
+    # The per-issue sink writes each thinking chunk, prefixed with its phase, to
+    # .pycastle/runs/<run_id>/issue-<n>-thinking.log beside the telemetry/log.
+    sink = orchestrator._thinking_sink(fixture_dir, "20260613-101500", 7)
+    sink("implement", "first thought")
+    sink("review", "second thought")
+
+    path = fixture_dir / "runs" / "20260613-101500" / "issue-7-thinking.log"
+    assert path.is_file()
+    contents = path.read_text()
+    assert "[implement] first thought" in contents
+    assert "[review] second thought" in contents
+
+
+def test_verbose_run_binds_a_per_issue_thinking_sink(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A verbose run binds the runtime's thinking_sink before working each issue so
+    # the runtime can persist thinking to that issue's log without knowing run_id.
+    issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+    runtime = StubRuntime()
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        verbose=True,
+    )
+
+    # The runtime now carries a sink bound to issue #2's thinking log.
+    assert runtime.thinking_sink is not None
+    runtime.thinking_sink("implement", "bound thought")
+    path = fixture_dir / "runs" / "20260613-101500" / "issue-2-thinking.log"
+    assert path.is_file()
+    assert "bound thought" in path.read_text()
+
+
+def test_non_verbose_run_does_not_bind_a_thinking_sink(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # Without verbose, no sink is bound, so the runtime's thinking_sink stays None
+    # and no thinking log is written — behaviour unchanged.
+    issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+    runtime = StubRuntime()
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert getattr(runtime, "thinking_sink", None) is None
+    assert not (
+        fixture_dir / "runs" / "20260613-101500" / "issue-2-thinking.log"
+    ).is_file()
+
+
 def test_batch_works_up_to_n_issues_into_one_pr(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
