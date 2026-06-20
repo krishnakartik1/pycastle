@@ -107,6 +107,21 @@ def test_build_command_appends_skip_permissions() -> None:
     assert runtime.build_command("hi")[-1] == "--dangerously-skip-permissions"
 
 
+def test_host_build_command_does_not_skip_permissions() -> None:
+    # The host run must never auto-skip permissions: the user's machine is not
+    # the isolation boundary, so the in-agent permission prompts stay in force.
+    assert "--dangerously-skip-permissions" not in ClaudeRuntime().build_command("hi")
+
+
+def test_in_docker_build_command_skips_permissions(tmp_path: Path) -> None:
+    # The Docker container is the isolation boundary (ADR-0003), so the inner
+    # claude argv skips permissions there; otherwise headless claude denies
+    # every Write and each phase silently no-ops (issue #44). This mirrors
+    # CodexRuntime.in_docker carrying CODEX_DOCKER_BYPASS.
+    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    assert "--dangerously-skip-permissions" in runtime.build_command("hi")
+
+
 @pytest.fixture
 def mock_popen(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Patch subprocess.Popen in the runtime module and return the mock."""

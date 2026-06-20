@@ -116,7 +116,7 @@ class ClaudeRuntime:
         image: str = sandbox.DEFAULT_IMAGE,
         model: str | None = None,
         max_turns: int | None = None,
-        dangerously_skip_permissions: bool = False,
+        dangerously_skip_permissions: bool = True,
     ) -> ClaudeRuntime:
         """Build a Claude runtime that runs each phase inside the Docker sandbox.
 
@@ -124,6 +124,15 @@ class ClaudeRuntime:
         :func:`pycastle.sandbox.build_run_command`) so the agent runs as
         non-root ``node`` against the per-Runtime auth volume, with
         ``workspace`` bind-mounted so it can read and write the real tree.
+
+        ``dangerously_skip_permissions`` defaults to ``True`` here: the Docker
+        container is the isolation boundary (ADR-0003), so the in-agent
+        permission prompts are skipped in the container and only there. Without
+        this, headless ``claude`` runs under ``permissionMode: default`` and
+        denies every ``Write``, so each phase silently no-ops. This mirrors
+        :meth:`CodexRuntime.in_docker` setting ``bypass_sandbox=True`` to carry
+        :data:`CODEX_DOCKER_BYPASS`. The host constructor's default stays
+        ``False`` so host runs never auto-skip.
         """
 
         def wrap(inner_argv: list[str]) -> list[str]:
