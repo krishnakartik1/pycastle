@@ -721,6 +721,38 @@ def test_sandbox_setup_errors_without_dockerfile_and_image(
     assert main(["sandbox", "setup", "--runtime", runtime]) == 1
 
 
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_sandbox_setup_failed_build_surfaces_no_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime: str
+) -> None:
+    # A failed on-demand build during setup must surface (exit 1), not be
+    # swallowed: _resolve_agent_image raises PreflightError, main turns it into a
+    # non-zero exit, and no login/status ever runs against an unbuilt tag.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        if args[:3] == ["docker", "image", "inspect"]:
+            proc.returncode = 1  # cold cache, force a build
+        elif args[:2] == ["docker", "build"]:
+            proc.returncode = 1  # the build fails
+        else:
+            proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", runtime]) == 1
+    # The failed build is the last docker call; no login or status followed it.
+    assert calls[-1][:2] == ["docker", "build"]
+    assert not any("login" in c or "status" in c for c in calls)
+
+
 def test_sandbox_setup_tag_matches_build_and_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
