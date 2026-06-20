@@ -418,10 +418,52 @@ def test_in_docker_resolves_relative_workspace(
     runtime.run("p", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
+    # -w now follows the run cwd (covered elsewhere); the relative-workspace
+    # guarantee is about the bind-mount *source*, which must be resolved so the
+    # container does not fail to start on a relative mount.
+    repo = str((tmp_path / "repo").resolve())
+    assert f"{repo}:{repo}" in argv
+
+
+def test_docker_workdir_is_run_cwd_not_workspace(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # Regression for #50: under docker the container -w must be the per-issue
+    # worktree (the run cwd), not the workspace root, so claude writes into the
+    # worktree the orchestrator commits. The bind-mount source stays the root so
+    # the worktree's .git file resolves to the parent repo inside the container.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+    root = tmp_path / "root"
+    worktree = root / ".pycastle" / "worktrees" / "issue-3"
+    worktree.mkdir(parents=True)
+
+    runtime = ClaudeRuntime.in_docker(workspace=root)
+    runtime.run("p", cwd=worktree, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    assert argv[argv.index("-w") + 1] == str(worktree.resolve())
+    # Mount source is the workspace root, never the worktree.
+    assert f"{root.resolve()}:{root.resolve()}" in argv
+    assert f"{worktree}:{worktree}" not in argv
+
+
+def test_docker_resolves_relative_run_cwd_for_w(
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A relative run cwd is resolved to absolute before it reaches -w, so the
+    # container workdir is never a broken relative path (and agrees with codex's
+    # resolved -C).
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "worktree").mkdir()
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime.run("p", cwd=Path("worktree"), phase="implement")
+
+    argv = mock_popen.call_args.args[0]
     workdir = argv[argv.index("-w") + 1]
     assert Path(workdir).is_absolute()
-    assert workdir.endswith("/repo")
-    assert f"{workdir}:{workdir}" in argv
+    assert workdir == str((tmp_path / "worktree").resolve())
 
 
 def test_host_runtime_still_invokes_bare_claude(
