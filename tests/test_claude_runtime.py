@@ -430,8 +430,14 @@ def test_run_works_one_issue_end_to_end_via_claude(
     """
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    def _ok(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+    def _ok(
+        argv: list[str], *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        # A non-empty diff (exit 1) for the post-commit no-change check, so the
+        # mocked agent's work is treated as a real change rather than a no-op.
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
 
     issue = IssueRef(number=7, title="Wire claude", assignees=["krishna"])
     source = MagicMock()

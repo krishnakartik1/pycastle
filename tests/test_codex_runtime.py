@@ -94,7 +94,8 @@ def test_make_runtime_selects_codex() -> None:
 
 
 def test_build_command_host_is_codex_exec_json(tmp_path: Path) -> None:
-    # The host path uses Codex's own sandbox, so it carries no bypass flag.
+    # The host path scopes writes to the worktree with -s workspace-write (Codex's
+    # default sandbox is read-only) and carries no docker-only bypass flag.
     runtime = CodexRuntime(model="gpt-test")
     # build_command always emits the resolved (absolute) -C; assert against
     # tmp_path.resolve() so the test holds where the temp root is symlinked
@@ -105,6 +106,8 @@ def test_build_command_host_is_codex_exec_json(tmp_path: Path) -> None:
         str(tmp_path.resolve()),
         "--model",
         "gpt-test",
+        "-s",
+        "workspace-write",
         "exec",
         "--json",
         "do the work",
@@ -116,10 +119,21 @@ def test_build_command_minimal_omits_model_and_bypass(tmp_path: Path) -> None:
         "codex",
         "-C",
         str(tmp_path.resolve()),
+        "-s",
+        "workspace-write",
         "exec",
         "--json",
         "hi",
     ]
+
+
+def test_build_command_host_carries_workspace_write(tmp_path: Path) -> None:
+    # On host the scoped sandbox is -s workspace-write, placed before exec (where
+    # the docker bypass otherwise sits), and the docker-only bypass is absent.
+    cmd = CodexRuntime().build_command("hi", cwd=tmp_path)
+    assert cmd[cmd.index("-s") + 1] == "workspace-write"
+    assert cmd.index("-s") < cmd.index("exec")
+    assert CODEX_DOCKER_BYPASS not in cmd
 
 
 def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
@@ -138,6 +152,10 @@ def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
     ]
     # The bypass flag precedes the exec subcommand (it is a global codex flag).
     assert cmd.index(CODEX_DOCKER_BYPASS) < cmd.index("exec")
+    # The bypass and the host -s sandbox are mutually exclusive: a docker run
+    # carries the bypass and never the scoped host sandbox (no double flag).
+    assert "-s" not in cmd
+    assert "workspace-write" not in cmd
 
 
 def test_build_command_resume_places_thread_id(tmp_path: Path) -> None:
@@ -274,6 +292,8 @@ def test_run_invokes_host_codex_argv(mock_popen: MagicMock, tmp_path: Path) -> N
         str(tmp_path),
         "--model",
         "gpt-test",
+        "-s",
+        "workspace-write",
         "exec",
         "--json",
         "do work",
@@ -552,8 +572,13 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     assert sandbox.DEFAULT_IMAGE in argv
     image_idx = argv.index(sandbox.DEFAULT_IMAGE)
     # The inner argv starts the codex command and carries the bypass flag.
-    assert argv[image_idx + 1] == "codex"
-    assert CODEX_DOCKER_BYPASS in argv[image_idx + 1 :]
+    inner = argv[image_idx + 1 :]
+    assert inner[0] == "codex"
+    assert CODEX_DOCKER_BYPASS in inner
+    # The Docker path is not double-flagged: it carries the bypass, not the
+    # scoped host -s workspace-write sandbox.
+    assert "workspace-write" not in inner
+    assert "-s" not in inner
     # CODEX_HOME and the codex auth volume are pinned, not Claude's.
     assert "pycastle-codex-auth:/home/node/.codex" in argv
     assert "CODEX_HOME=/home/node/.codex" in argv
@@ -585,6 +610,8 @@ def test_host_runtime_invokes_bare_codex(mock_popen: MagicMock, tmp_path: Path) 
     assert argv[0] == "codex"
     # The host path never carries the docker-only bypass flag.
     assert CODEX_DOCKER_BYPASS not in argv
+    # It carries the scoped host sandbox so codex may write the worktree (#35).
+    assert argv[argv.index("-s") + 1] == "workspace-write"
 
 
 def test_run_works_one_issue_end_to_end_via_codex(
@@ -597,8 +624,14 @@ def test_run_works_one_issue_end_to_end_via_codex(
     """
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    def _ok(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+    def _ok(
+        argv: list[str], *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        # A non-empty diff (exit 1) for the post-commit no-change check, so the
+        # mocked agent's work is treated as a real change rather than a no-op.
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
 
     issue = IssueRef(number=9, title="Wire codex", assignees=["krishna"])
     source = MagicMock()
@@ -631,8 +664,14 @@ def test_run_works_one_issue_end_to_end_via_codex_in_docker(
     """The orchestrator completes an issue using Codex inside the Docker sandbox."""
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    def _ok(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+    def _ok(
+        argv: list[str], *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        # A non-empty diff (exit 1) for the post-commit no-change check, so the
+        # mocked agent's work is treated as a real change rather than a no-op.
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
 
     issue = IssueRef(number=10, title="Codex in docker", assignees=["krishna"])
     source = MagicMock()

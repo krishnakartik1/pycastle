@@ -588,6 +588,23 @@ def _work_issue(
         cwd=issue_worktree,
     )
 
+    if _branch_has_no_diff(
+        branch, run_branch=run_branch, run_worktree=run_worktree, runner=runner
+    ):
+        # The walk reached DONE but the phase produced no change (e.g. a runtime
+        # that silently no-ops): the issue branch equals the run branch, so a
+        # merge would be a clean no-op and report a phantom success with no PR.
+        # Hand the issue to a human instead of counting it completed (#35).
+        issue_source.mark_for_human(issue.number)
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"#{issue.number} produced no changes; marked ready-for-human.",
+        )
+        cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
+        runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
+        return IssueOutcome(issue=issue, branch=branch, merged=False)
+
     merged = _merge_issue_branch(
         branch,
         issue=issue,
@@ -609,6 +626,31 @@ def _work_issue(
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
     return IssueOutcome(issue=issue, branch=branch, merged=merged)
+
+
+def _branch_has_no_diff(
+    branch: str,
+    *,
+    run_branch: str,
+    run_worktree: Path,
+    runner: Runner,
+) -> bool:
+    """Whether the issue branch introduced no change over the run branch.
+
+    After the walk commits, ``git diff --quiet <run_branch> <branch>`` exits 0
+    when the two trees are identical (no change) and non-zero when they differ.
+    An empty diff means the phase silently no-opped: merging it would be a clean
+    no-op that reports a phantom success and opens no PR, so the caller routes the
+    issue to a human instead (#35). The check runs in the run worktree, which can
+    resolve both branch refs. It stays git-only and does not touch the Issue
+    source.
+    """
+    diff = runner(
+        ["git", "diff", "--quiet", run_branch, branch],
+        capture=True,
+        cwd=run_worktree,
+    )
+    return getattr(diff, "returncode", 1) == 0
 
 
 def _merge_issue_branch(
