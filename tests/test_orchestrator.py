@@ -25,16 +25,23 @@ def _calls_containing(runner: MagicMock, *needles: str) -> bool:
     return False
 
 
-def _git_aware_runner(merge_fails_for: set[int] | None = None) -> MagicMock:
+def _git_aware_runner(
+    merge_fails_for: set[int] | None = None,
+    empty_diff_for: set[int] | None = None,
+) -> MagicMock:
     """A fake runner that simulates the git side effects the run depends on.
 
     ``git worktree add <path> <branch>`` creates the worktree directory so the
     graph's stub runtime has a real ``cwd`` to write its marker into. A merge of
     a branch whose issue number is in ``merge_fails_for`` returns non-zero so the
-    conflict-skip seam can be exercised. Everything else is a clean success. No
-    real git or gh is ever invoked.
+    conflict-skip seam can be exercised. ``git diff --quiet`` reports a non-empty
+    diff (exit 1, "changes present") by default — the normal case where the phase
+    wrote something — unless the branch's issue number is in ``empty_diff_for``,
+    where it reports an empty diff (exit 0) to exercise the no-change seam (#35).
+    Everything else is a clean success. No real git or gh is ever invoked.
     """
     merge_fails_for = merge_fails_for or set()
+    empty_diff_for = empty_diff_for or set()
 
     def side_effect(
         argv: list[str], **_kwargs: object
@@ -42,6 +49,13 @@ def _git_aware_runner(merge_fails_for: set[int] | None = None) -> MagicMock:
         if argv[:3] == ["git", "worktree", "add"]:
             Path(argv[3]).mkdir(parents=True, exist_ok=True)
             return _ok()
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            branch = argv[-1]
+            number = int(branch.split("-")[1])
+            # Exit 0 means "no diff"; exit 1 means "changes present". The normal
+            # case has changes, so default to a non-empty diff.
+            code = 0 if number in empty_diff_for else 1
+            return subprocess.CompletedProcess(args=argv, returncode=code, stdout="")
         if argv[:2] == ["git", "merge"] and "--abort" not in argv:
             branch = argv[2]
             number = int(branch.split("-")[1])
@@ -283,6 +297,88 @@ def test_merge_conflict_on_the_first_issue_still_runs_the_rest(
     assert "#2" not in body
 
 
+def test_empty_diff_routes_to_human_no_phantom_success(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A walk that reaches DONE but leaves the issue branch identical to the run
+    # branch (the runtime silently no-opped, e.g. codex stuck read-only #35) must
+    # not report a phantom success: the issue is handed to a human, recorded as
+    # not merged, kept out of `completed`, and no PR is opened.
+    issues = [
+        IssueRef(number=2, title="No change", assignees=["krishna"]),
+        IssueRef(number=4, title="Real change", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner(empty_diff_for={2})
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=5,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    # The empty-diff issue is handed to a human and is not counted completed; the
+    # real-change issue still merges, so one no-op item does not sink the batch.
+    source.mark_for_human.assert_called_once_with(2)
+    merged = {o.issue.number: o.merged for o in outcome.issues}
+    assert merged == {2: False, 4: True}
+    assert outcome.completed == [4]
+
+    # The no-change branch is never merged: no `git merge` of issue-2 ran.
+    assert not _calls_containing(runner, "git", "merge", "pycastle/issue-2-no-change")
+
+    # A PR opens for the real change only; the empty-diff issue is absent from it.
+    pr_calls = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "create"]
+    ]
+    body = pr_calls[0][pr_calls[0].index("--body") + 1]
+    assert "- Closes #4" in body
+    assert "#2" not in body
+
+
+def test_empty_diff_on_only_issue_opens_no_pull_request(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # When the only issue produces no change, the run opens no PR at all (avoiding
+    # the `gh pr create` failure "No commits between main and <run-branch>") and
+    # the issue is left ready-for-human rather than claimed-but-open (#35).
+    issue = IssueRef(number=2, title="No change", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner(empty_diff_for={2})
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == []
+    assert outcome.pr_opened is False
+    source.mark_for_human.assert_called_once_with(2)
+    # No pull request is even attempted.
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
 def test_telemetry_and_run_log_are_written_into_the_fixture(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -468,6 +564,9 @@ def _timeline_runner(timeline: list[str]) -> MagicMock:
     ) -> subprocess.CompletedProcess[str]:
         if argv[:3] == ["git", "worktree", "add"]:
             Path(argv[3]).mkdir(parents=True, exist_ok=True)
+        elif argv[:3] == ["git", "diff", "--quiet"]:
+            # A non-empty diff (exit 1): the phases wrote real changes.
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
         elif argv[:2] == ["git", "commit"]:
             timeline.append("git:commit")
         elif argv[:2] == ["git", "merge"] and "--abort" not in argv:

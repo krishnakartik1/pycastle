@@ -43,6 +43,9 @@ def _git_aware_runner() -> MagicMock:
         if argv[:3] == ["git", "worktree", "add"]:
             Path(argv[3]).mkdir(parents=True, exist_ok=True)
             return _ok()
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            # A non-empty diff (exit 1): the worked issue produced real changes.
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
         return _ok()
 
     return MagicMock(side_effect=side_effect)
@@ -724,6 +727,9 @@ def _gating_runner(fixture_dir: Path, *gate_results: int) -> MagicMock:
         if argv[:3] == ["git", "worktree", "add"]:
             Path(argv[3]).mkdir(parents=True, exist_ok=True)
             return _ok()
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            # A non-empty diff (exit 1): the worked issue produced real changes.
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
         return _ok()
 
     return MagicMock(side_effect=side_effect)

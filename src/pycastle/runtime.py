@@ -277,6 +277,15 @@ def _build_telemetry(
 #: the wrapper stays runtime-agnostic.
 CODEX_DOCKER_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 
+#: The sandbox mode Codex runs under on the host. Codex's default sandbox is
+#: read-only, so a host run would silently reject every patch ("writing is
+#: blocked by read-only sandbox"). ``workspace-write`` scopes writes to the
+#: per-item git worktree (the cwd) without the full Docker bypass, which stays
+#: reserved for the container where Docker is the isolation boundary (ADR-0003).
+#: It is passed as ``-s workspace-write`` before the ``exec`` subcommand, the
+#: same spot the bypass occupies, so the two paths stay symmetric.
+CODEX_HOST_SANDBOX = "workspace-write"
+
 
 class CodexRuntime:
     """Drive the real ``codex`` CLI behind the Runtime interface.
@@ -296,7 +305,9 @@ class CodexRuntime:
     Like :class:`ClaudeRuntime`, an ``argv_wrapper`` (or :meth:`in_docker`)
     wraps the inner ``codex …`` argv before launch — for the Docker sandbox,
     into a ``docker run`` argv. When sandboxed in Docker the inner argv carries
-    :data:`CODEX_DOCKER_BYPASS` so Codex can write inside the container.
+    :data:`CODEX_DOCKER_BYPASS` so Codex can write inside the container; on the
+    host the inner argv carries ``-s`` :data:`CODEX_HOST_SANDBOX` so Codex may
+    write within the worktree instead of falling back to its read-only default.
     """
 
     name = "codex"
@@ -311,7 +322,8 @@ class CodexRuntime:
     ) -> None:
         """Configure the CLI invocation shared across phases.
 
-        ``bypass_sandbox`` adds :data:`CODEX_DOCKER_BYPASS` to the inner argv;
+        ``bypass_sandbox`` swaps the scoped host sandbox (``-s``
+        :data:`CODEX_HOST_SANDBOX`) for the full :data:`CODEX_DOCKER_BYPASS`;
         :meth:`in_docker` sets it so Codex can write inside the container.
         """
         self.command = command
@@ -363,12 +375,20 @@ class CodexRuntime:
         (e.g. ``…/issue-3/.pycastle/worktrees/issue-3``) and fail. Resolving
         here mirrors :func:`pycastle.sandbox.build_run_command`, which resolves
         the bind-mount source for the same reason.
+
+        The sandbox argument sits before ``exec``: a Docker run carries
+        :data:`CODEX_DOCKER_BYPASS`; a host run carries ``-s``
+        :data:`CODEX_HOST_SANDBOX` so Codex may write within the worktree rather
+        than using its read-only default. The two are mutually exclusive, so a
+        host run never gets the bypass and a Docker run never gets ``-s``.
         """
         cmd = [self.command, "-C", str(Path(cwd).resolve())]
         if self.model is not None:
             cmd += ["--model", self.model]
         if self.bypass_sandbox:
             cmd.append(CODEX_DOCKER_BYPASS)
+        else:
+            cmd += ["-s", CODEX_HOST_SANDBOX]
         cmd.append("exec")
         if resume_thread_id is not None:
             cmd.append("resume")
