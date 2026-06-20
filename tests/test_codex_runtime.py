@@ -96,10 +96,13 @@ def test_make_runtime_selects_codex() -> None:
 def test_build_command_host_is_codex_exec_json(tmp_path: Path) -> None:
     # The host path uses Codex's own sandbox, so it carries no bypass flag.
     runtime = CodexRuntime(model="gpt-test")
+    # build_command always emits the resolved (absolute) -C; assert against
+    # tmp_path.resolve() so the test holds where the temp root is symlinked
+    # (e.g. macOS /var -> /private/var) rather than only where it is not.
     assert runtime.build_command("do the work", cwd=tmp_path) == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         "--model",
         "gpt-test",
         "exec",
@@ -112,7 +115,7 @@ def test_build_command_minimal_omits_model_and_bypass(tmp_path: Path) -> None:
     assert CodexRuntime().build_command("hi", cwd=tmp_path) == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         "exec",
         "--json",
         "hi",
@@ -127,7 +130,7 @@ def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
     assert cmd == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         CODEX_DOCKER_BYPASS,
         "exec",
         "--json",
@@ -185,6 +188,22 @@ def test_run_relative_cwd_does_not_double_dash_c_path(
     # -C and the process cwd agree, so no second relative resolution is possible.
     assert dash_c_value == str(relative.resolve())
     assert mock_popen.call_args.kwargs["cwd"] == relative.resolve()
+
+
+def test_run_absolute_cwd_is_idempotent(mock_popen: MagicMock, tmp_path: Path) -> None:
+    # The common case: the orchestrator hands an already-absolute, already-real
+    # worktree path. Resolving it (once in run, again in build_command) must be a
+    # no-op — the -C value and the Popen cwd both equal the input unchanged, so
+    # the fix never mangles a path that was already correct.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+    absolute = tmp_path.resolve()
+
+    CodexRuntime().run("p", cwd=absolute, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    dash_c_value = argv[argv.index("-C") + 1]
+    assert dash_c_value == str(absolute)
+    assert mock_popen.call_args.kwargs["cwd"] == absolute
 
 
 def test_docker_relative_cwd_yields_absolute_inner_dash_c(
