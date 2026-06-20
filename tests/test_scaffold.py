@@ -234,6 +234,31 @@ def test_scaffolded_dockerfile_extends_the_node22_agent_image(
     assert "RUN" in dockerfile
 
 
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_scaffolded_dockerfile_precreates_node_owned_auth_dirs(
+    tmp_path: Path, choice: str
+) -> None:
+    """The auth-volume mount dirs are created node-owned before USER node.
+
+    A fresh Docker named volume mounted at a path absent from the image
+    initializes root-owned, which blocks the non-root `node` user from writing
+    its login. The Dockerfile must mkdir + chown both auth dirs as root, before
+    dropping to `node`, so a brand-new volume inherits node ownership.
+    """
+    scaffold_fixture(tmp_path, sandbox=choice)
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+
+    # Both auth-volume mount points are created and chowned to node.
+    assert "mkdir -p /home/node/.claude /home/node/.codex" in dockerfile
+    assert "chown -R node:node /home/node/.claude /home/node/.codex" in dockerfile
+
+    # Both the mkdir and the chown run as root, before the image drops to
+    # USER node -- a non-root user cannot create or chown a root-owned path.
+    user_node = dockerfile.index("USER node")
+    assert dockerfile.index("mkdir -p /home/node/.claude") < user_node
+    assert dockerfile.index("chown -R node:node") < user_node
+
+
 def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None:
     """The default gate is an executable shell script (so retries are reachable)."""
     scaffold_fixture(tmp_path, sandbox="host")

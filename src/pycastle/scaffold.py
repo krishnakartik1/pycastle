@@ -223,6 +223,13 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --
 # Leave this block empty if a plain Node toolchain is all your repo needs.
 # ---------------------------------------------------------------------------
 
+# Pre-create the auth-volume mount dirs owned by `node`. A fresh Docker named
+# volume mounted at a path absent from the image initializes root-owned, which
+# would block the non-root `node` user from writing its login. Creating them
+# node-owned here means a brand-new auth volume inherits node ownership.
+RUN mkdir -p /home/node/.claude /home/node/.codex \\
+    && chown -R node:node /home/node/.claude /home/node/.codex
+
 # The agent runs as the non-root `node` user (the Claude CLI refuses root, and
 # files it writes stay owned by a real user rather than root).
 USER node
