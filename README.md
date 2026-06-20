@@ -59,6 +59,24 @@ which needs a TTY. On a headless host (CI, a server with no browser), run the
 login on a machine that has a browser, then move the resulting credentials into
 the same named volume the host uses.
 
+**The Codex runtime needs IPv6-capable Docker.** Codex's HTTP client is
+IPv6-first and does not fall back to IPv4, but Docker's default bridge network
+is IPv4-only. So on an otherwise IPv6-capable host, `pycastle sandbox setup
+--runtime codex` (and any `--runtime codex --sandbox docker` run) fails to reach
+`auth.openai.com` with `error logging in ... error sending request for url`,
+while Claude is unaffected (its client falls back to IPv4). Enable IPv6 for
+Docker once, in `/etc/docker/daemon.json`:
+
+```json
+{ "ipv6": true, "ip6tables": true, "fixed-cidr-v6": "fd00:dead:beef::/48" }
+```
+
+then restart the daemon: `sudo systemctl restart docker` (this stops running
+containers, so do it between runs). On Docker older than 27, also add
+`"experimental": true`. This gives containers NAT'd IPv6 egress. Note the
+trade-off: published ports (`-p`) then bind IPv6 as well as IPv4, so make sure
+any host firewalling covers IPv6.
+
 ## How it fits together
 
 PyCastle owns the reusable runner; a project owns its prompts, gates, and the
