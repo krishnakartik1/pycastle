@@ -493,15 +493,21 @@ def test_build_runtime_host_path_is_a_bare_runtime(tmp_path: Path) -> None:
 
 
 def test_sandbox_setup_claude_runs_login_then_status(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``sandbox setup --runtime claude`` runs the login then the status check.
 
     The interactive login is not unit-tested; the command *construction* and
-    ordering are. Docker is never really invoked: the runner is a mock.
+    ordering are. Docker is never really invoked: the runner is a mock. A
+    Dockerfile is present so image resolution succeeds and threads the resolved
+    tag into both the login and the status argv.
     """
     from pycastle import sandbox as sandbox_mod
 
+    text = "FROM node:22-slim\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox_mod.image_tag_for_dockerfile(text)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
 
     calls: list[list[str]] = []
@@ -509,15 +515,20 @@ def test_sandbox_setup_claude_runs_login_then_status(
     def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
         calls.append(list(args))
         proc = MagicMock()
-        proc.returncode = 0
+        if args[:3] == ["docker", "image", "inspect"]:
+            proc.returncode = 0  # warm cache: tag already built, no build runs
+        else:
+            proc.returncode = 0
         return proc
 
     monkeypatch.setattr(cli, "run_cmd", fake_runner)
 
     assert main(["sandbox", "setup", "--runtime", "claude"]) == 0
 
-    assert calls[0] == sandbox_mod.build_login_command("claude")
-    assert calls[1] == sandbox_mod.build_status_command("claude")
+    # Skip the image-inspect call; the login then status run against the tag.
+    flow = [c for c in calls if c[:3] != ["docker", "image", "inspect"]]
+    assert flow[0] == sandbox_mod.build_login_command("claude", image=tag)
+    assert flow[1] == sandbox_mod.build_status_command("claude", image=tag)
     # Credentials are never read: no cat/echo of the volume anywhere.
     for argv in calls:
         joined = " ".join(argv)
@@ -526,15 +537,20 @@ def test_sandbox_setup_claude_runs_login_then_status(
 
 
 def test_sandbox_setup_status_failure_returns_nonzero(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
 
     def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
         proc = MagicMock()
-        # Login succeeds, the fresh-container status check fails. The login
-        # argv carries `login`; the status argv carries `status`.
-        proc.returncode = 0 if "login" in args else 1
+        if args[:3] == ["docker", "image", "inspect"]:
+            proc.returncode = 0  # tag present, no build
+        else:
+            # Login succeeds, the fresh-container status check fails. The login
+            # argv carries `login`; the status argv carries `status`.
+            proc.returncode = 0 if "login" in args else 1
         return proc
 
     monkeypatch.setattr(cli, "run_cmd", fake_runner)
@@ -543,16 +559,21 @@ def test_sandbox_setup_status_failure_returns_nonzero(
 
 
 def test_sandbox_setup_codex_uses_device_auth_flow(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``sandbox setup --runtime codex`` runs the device-authorization login.
 
     The login command construction is asserted (no localhost callback, no TTY);
     Docker is never really invoked. A device-auth login is the whole flow: no
-    fresh-container status check runs, unlike Claude.
+    fresh-container status check runs, unlike Claude. A Dockerfile is present so
+    image resolution succeeds and threads the resolved tag into the login argv.
     """
     from pycastle import sandbox as sandbox_mod
 
+    text = "FROM node:22-slim\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox_mod.image_tag_for_dockerfile(text)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
 
     calls: list[list[str]] = []
@@ -567,27 +588,186 @@ def test_sandbox_setup_codex_uses_device_auth_flow(
 
     assert main(["sandbox", "setup", "--runtime", "codex"]) == 0
 
-    # Exactly one command: the device-authorization login. No status check.
-    assert calls == [sandbox_mod.build_login_command("codex")]
-    login = calls[0]
+    # Exactly one command after the image inspect: the device-auth login. No
+    # status check.
+    flow = [c for c in calls if c[:3] != ["docker", "image", "inspect"]]
+    assert flow == [sandbox_mod.build_login_command("codex", image=tag)]
+    login = flow[0]
     assert login[-3:] == ["codex", "login", "--device-auth"]
     # The device flow needs no TTY, so -it is never passed.
     assert "-it" not in login
 
 
 def test_sandbox_setup_codex_login_failure_returns_nonzero(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
 
-    def fake_runner(_args: list[str], **_kwargs: object) -> MagicMock:
+    def fake_runner(args: list[str], **_kwargs: object) -> MagicMock:
         proc = MagicMock()
-        proc.returncode = 1
+        # The image inspect reports the tag present; the login itself fails.
+        proc.returncode = 0 if args[:3] == ["docker", "image", "inspect"] else 1
         return proc
 
     monkeypatch.setattr(cli, "run_cmd", fake_runner)
 
     assert main(["sandbox", "setup", "--runtime", "codex"]) == 1
+
+
+def test_sandbox_setup_parses_image_flag() -> None:
+    # `setup --image X` is bring-your-own-image, parsed verbatim onto args;
+    # omitted it parses to None so the Dockerfile is the source of truth.
+    args = build_parser().parse_args(["sandbox", "setup", "--image", "my/agent:dev"])
+    assert args.image == "my/agent:dev"
+
+    args = build_parser().parse_args(["sandbox", "setup"])
+    assert args.image is None
+
+
+def test_sandbox_setup_claude_builds_and_uses_dockerfile_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # With a Dockerfile present and a cold cache, setup builds it once into its
+    # content-addressed tag and threads that tag into both login and status --
+    # never the bare DEFAULT_IMAGE (the original bug).
+    from pycastle import sandbox as sandbox_mod
+
+    text = "FROM node:22-slim\nRUN echo hi\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox_mod.image_tag_for_dockerfile(text)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", "claude"]) == 0
+
+    builds = [c for c in calls if c[:2] == ["docker", "build"]]
+    assert builds == [["docker", "build", "-t", tag, str(cli.FIXTURE_DIR)]]
+    flow = [c for c in calls if c[:3] != ["docker", "image", "inspect"]]
+    flow = [c for c in flow if c[:2] != ["docker", "build"]]
+    assert flow[0] == sandbox_mod.build_login_command("claude", image=tag)
+    assert flow[1] == sandbox_mod.build_status_command("claude", image=tag)
+    assert sandbox_mod.DEFAULT_IMAGE not in flow[0]
+    assert sandbox_mod.DEFAULT_IMAGE not in flow[1]
+
+
+def test_sandbox_setup_codex_builds_and_uses_dockerfile_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Same as claude: one build, the single device-auth login carries the tag,
+    # never DEFAULT_IMAGE.
+    from pycastle import sandbox as sandbox_mod
+
+    text = "FROM node:22-slim\nRUN echo hi\n"
+    _write_dockerfile(tmp_path, text)
+    monkeypatch.chdir(tmp_path)
+    tag = sandbox_mod.image_tag_for_dockerfile(text)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", "codex"]) == 0
+
+    builds = [c for c in calls if c[:2] == ["docker", "build"]]
+    assert builds == [["docker", "build", "-t", tag, str(cli.FIXTURE_DIR)]]
+    flow = [c for c in calls if c[:3] != ["docker", "image", "inspect"]]
+    flow = [c for c in flow if c[:2] != ["docker", "build"]]
+    assert flow == [sandbox_mod.build_login_command("codex", image=tag)]
+    assert sandbox_mod.DEFAULT_IMAGE not in flow[0]
+
+
+def test_sandbox_setup_honors_image_flag_never_builds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `setup --image X` is bring-your-own-image: even with a Dockerfile present,
+    # no build runs and login/status carry X verbatim.
+    from pycastle import sandbox as sandbox_mod
+
+    _write_dockerfile(tmp_path, "FROM node:22-slim\n")
+    monkeypatch.chdir(tmp_path)
+    calls, runner = _fake_docker(inspect_returncode=1)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert (
+        main(["sandbox", "setup", "--runtime", "claude", "--image", "my/agent:dev"])
+        == 0
+    )
+
+    assert [c for c in calls if c[:2] == ["docker", "build"]] == []
+    flow = [c for c in calls if c[:3] != ["docker", "image", "inspect"]]
+    assert flow[0] == sandbox_mod.build_login_command("claude", image="my/agent:dev")
+    assert flow[1] == sandbox_mod.build_status_command("claude", image="my/agent:dev")
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_sandbox_setup_errors_without_dockerfile_and_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime: str
+) -> None:
+    # No Dockerfile and no --image: setup must error with guidance and return 1
+    # rather than onboarding auth against an unbuildable default tag. run_cmd is
+    # never reached -- no login, no status, no `docker run pycastle/agent:node22`.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        raise AssertionError(f"run_cmd must not run without a Dockerfile: {args}")
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", runtime]) == 1
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_sandbox_setup_failed_build_surfaces_no_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime: str
+) -> None:
+    # A failed on-demand build during setup must surface (exit 1), not be
+    # swallowed: _resolve_agent_image raises PreflightError, main turns it into a
+    # non-zero exit, and no login/status ever runs against an unbuilt tag.
+    _write_dockerfile(tmp_path, "FROM node:22-slim\nRUN false\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], **_kwargs: object) -> MagicMock:
+        calls.append(list(args))
+        proc = MagicMock()
+        if args[:3] == ["docker", "image", "inspect"]:
+            proc.returncode = 1  # cold cache, force a build
+        elif args[:2] == ["docker", "build"]:
+            proc.returncode = 1  # the build fails
+        else:
+            proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    assert main(["sandbox", "setup", "--runtime", runtime]) == 1
+    # The failed build is the last docker call; no login or status followed it.
+    assert calls[-1][:2] == ["docker", "build"]
+    assert not any("login" in c or "status" in c for c in calls)
+
+
+def test_sandbox_setup_tag_matches_build_and_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Agreement check (acceptance criterion 2): for one Dockerfile text, the tag
+    # setup threads in equals the tag `_resolve_agent_image(None, ...)` returns
+    # (what run uses) and `image_tag_for_dockerfile` reports (what build uses).
+    from pycastle import sandbox as sandbox_mod
+
+    text = "FROM node:22-slim\nRUN echo agree\n"
+    fixture = _write_dockerfile(tmp_path, text)
+    _, runner = _fake_docker(inspect_returncode=0)
+    monkeypatch.setattr(cli, "run_cmd", runner)
+
+    expected = sandbox_mod.image_tag_for_dockerfile(text)
+    assert cli._resolve_agent_image(None, fixture) == expected
 
 
 # --- Agent-image resolution and on-demand build (ADR-0005, issue #25) --------

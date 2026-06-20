@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
         "setup", help="Log a runtime into its Docker auth volume (coming soon)"
     )
     setup.add_argument("--runtime", choices=RUNTIMES, default="claude")
+    setup.add_argument(
+        "--image",
+        default=None,
+        help=(
+            "Agent image to onboard auth against (bring-your-own-image). When "
+            "omitted, .pycastle/Dockerfile is built on demand into a "
+            "content-addressed tag -- the same image `run` uses. With neither a "
+            "Dockerfile nor --image present, setup errors (run `pycastle init`)."
+        ),
+    )
     sandbox_sub.add_parser(
         "build",
         help="Build .pycastle/Dockerfile into its content-addressed agent image",
@@ -283,11 +293,27 @@ def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
     which prints a code and a verification URL and polls in the background — no
     localhost callback and no TTY. The flow's own zero exit is the success
     signal, so no fresh-container status check is run.
+
+    The auth image is resolved through the *same* :func:`_resolve_agent_image`
+    path ``run`` uses, so setup onboards auth against the exact image a run will
+    drive (ADR-0006). With no ``--image`` and no ``.pycastle/Dockerfile`` there
+    is no buildable image, so setup errors with guidance (``pycastle init``)
+    rather than onboarding auth against the unbuildable default tag -- the one
+    place setup diverges from ``run``'s precedence, which there falls back to the
+    default image.
     """
+    if args.image is None and not (FIXTURE_DIR / DOCKERFILE_NAME).is_file():
+        logger.error(
+            "No %s found and no --image given; run `pycastle init` to scaffold "
+            "a Project fixture with an agent Dockerfile first, or pass --image.",
+            FIXTURE_DIR / DOCKERFILE_NAME,
+        )
+        return 1
+    image = _resolve_agent_image(args.image, FIXTURE_DIR)
     if args.runtime == "codex":
-        return _setup_codex()
+        return _setup_codex(image)
     if args.runtime == "claude":
-        return _setup_claude()
+        return _setup_claude(image)
     logger.error(
         "`pycastle sandbox setup --runtime %s` is not supported.", args.runtime
     )
@@ -316,18 +342,25 @@ def _cmd_sandbox_build(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _setup_claude() -> int:
-    """Run the Claude browser login, then confirm auth from a fresh container."""
+def _setup_claude(image: str) -> int:
+    """Run the Claude browser login, then confirm auth from a fresh container.
+
+    ``image`` is the already-resolved agent image (the same one ``run`` uses;
+    see :func:`_resolve_agent_image`); both the login and the fresh-container
+    status check run against it. The per-Runtime auth *volume* is independent of
+    the image and shared across projects (ADR-0002), so credentials onboarded
+    here are reused by every run, whatever image it resolves.
+    """
     logger.info(
         "Logging the claude runtime into volume %s", sandbox.auth_volume("claude")
     )
-    login = run_cmd(sandbox.build_login_command("claude"))
+    login = run_cmd(sandbox.build_login_command("claude", image=image))
     if getattr(login, "returncode", 1) != 0:
         logger.error("Login failed; the auth volume was not onboarded.")
         return 1
 
     logger.info("Confirming auth from a fresh container...")
-    status = run_cmd(sandbox.build_status_command("claude"))
+    status = run_cmd(sandbox.build_status_command("claude", image=image))
     if getattr(status, "returncode", 1) != 0:
         logger.error("Fresh-container auth check failed; credentials are not usable.")
         return 1
@@ -336,14 +369,20 @@ def _setup_claude() -> int:
     return 0
 
 
-def _setup_codex() -> int:
-    """Run the Codex device-authorization login into its auth volume."""
+def _setup_codex(image: str) -> int:
+    """Run the Codex device-authorization login into its auth volume.
+
+    ``image`` is the already-resolved agent image (the same one ``run`` uses;
+    see :func:`_resolve_agent_image`); the login runs against it. The per-Runtime
+    auth *volume* is independent of the image and shared across projects
+    (ADR-0002), so the onboarded credentials are reused by every run.
+    """
     logger.info(
         "Logging the codex runtime into volume %s via the device-authorization "
         "flow; follow the printed code and URL to finish.",
         sandbox.auth_volume("codex"),
     )
-    login = run_cmd(sandbox.build_login_command("codex"))
+    login = run_cmd(sandbox.build_login_command("codex", image=image))
     if getattr(login, "returncode", 1) != 0:
         logger.error("Device-authorization login failed; the volume was not onboarded.")
         return 1
