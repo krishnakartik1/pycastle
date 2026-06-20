@@ -646,6 +646,61 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     assert runtime.thinking_sink is sink
 
 
+def test_verbose_flattens_codex_reasoning_content_list(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Codex often carries reasoning as a content/summary list of parts rather than
+    # a plain text string. The parts are joined into one string so neither the log
+    # line nor the sink ever sees a raw Python list repr.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "first part "},
+                    {"type": "summary_text", "text": "second part"},
+                ],
+            },
+        },
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+    captured: list[tuple[str, str]] = []
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        CodexRuntime(
+            verbose=True,
+            thinking_sink=lambda phase, text: captured.append((phase, text)),
+        ).run("p", cwd=tmp_path, phase="implement")
+
+    assert "[THINKING:implement] first part second part" in caplog.text
+    assert ("implement", "first part second part") in captured
+
+
+def test_verbose_does_not_crash_on_malformed_reasoning_type(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A malformed item whose type is not a string must not crash the parse (the
+    # "reasoning" membership test would otherwise raise on a non-string); the run
+    # finishes and falls back to the unavailable note.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": {"type": 123}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+
+    assert result.output == "done"
+    assert "codex reasoning text is unavailable" in caplog.text
+
+
 def test_docker_runtime_wraps_inner_argv_into_docker_run(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:

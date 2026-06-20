@@ -613,23 +613,56 @@ def _collect_codex_item(
     ``item`` is not a mapping contributes nothing rather than crashing the parse.
 
     When ``on_thinking`` is given (verbose runs) any reasoning item — matched
-    defensively as a ``type`` containing ``"reasoning"`` carrying ``text`` (or
-    ``content``) — is routed to it instead, mirroring how Claude thinking is
-    surfaced. Returns whether this item was a reasoning item, so the caller can
-    note "reasoning unavailable" once when a whole run emits none.
+    defensively as a ``type`` containing ``"reasoning"`` — has its text routed to
+    it instead, mirroring how Claude thinking is surfaced. Returns whether this
+    item was a reasoning item, so the caller can note "reasoning unavailable" once
+    when a whole run emits none. A malformed item (non-mapping, or a ``type`` that
+    is not a string) contributes nothing rather than crashing the parse.
     """
     if not isinstance(item, dict):
         return False
     item_type = item.get("type", "")
+    if not isinstance(item_type, str):
+        return False
     if item_type == "agent_message":
         text = item.get("text", "")
         if text:
             output_buf.append(text)
         return False
     if on_thinking is not None and "reasoning" in item_type:
-        on_thinking(item.get("text") or item.get("content") or "")
+        on_thinking(_codex_reasoning_text(item))
         return True
     return False
+
+
+def _codex_reasoning_text(item: dict[str, Any]) -> str:
+    """Flatten a Codex reasoning item's text out of the shapes it can take.
+
+    Codex carries reasoning either as a plain ``text`` string or as a
+    ``content``/``summary`` list of parts, each a mapping with its own ``text``
+    (a list of plain strings is also tolerated). This returns one joined string
+    so the emitter never logs or persists a raw Python ``repr`` of a list. An
+    unrecognised shape yields ``""``, which the emitter drops.
+    """
+    text = item.get("text")
+    if isinstance(text, str):
+        return text
+    for key in ("content", "summary"):
+        parts = item.get(key)
+        if isinstance(parts, str):
+            return parts
+        if isinstance(parts, list):
+            chunks: list[str] = []
+            for part in parts:
+                if isinstance(part, str):
+                    chunks.append(part)
+                elif isinstance(part, dict):
+                    piece = part.get("text")
+                    if isinstance(piece, str):
+                        chunks.append(piece)
+            if chunks:
+                return "".join(chunks)
+    return ""
 
 
 def _build_codex_telemetry(
