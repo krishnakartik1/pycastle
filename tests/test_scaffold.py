@@ -259,6 +259,27 @@ def test_scaffolded_dockerfile_precreates_node_owned_auth_dirs(
     assert dockerfile.index("chown -R node:node") < user_node
 
 
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_scaffolded_dockerfile_installs_ca_certificates(
+    tmp_path: Path, choice: str
+) -> None:
+    """ca-certificates is installed as root before USER node (#46).
+
+    node:22-slim ships an empty system trust store. Codex is a Rust binary
+    whose TLS stack verifies certs against that store, so without
+    ca-certificates it cannot reach auth.openai.com. Claude is unaffected
+    because the Node CLI bundles its own roots.
+    """
+    scaffold_fixture(tmp_path, sandbox=choice)
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+
+    # The package is installed.
+    assert "ca-certificates" in dockerfile
+    # Installed as root, before the image drops to USER node -- a non-root
+    # user cannot apt-get install into the system trust store.
+    assert dockerfile.index("ca-certificates") < dockerfile.index("USER node")
+
+
 def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None:
     """The default gate is an executable shell script (so retries are reachable)."""
     scaffold_fixture(tmp_path, sandbox="host")
