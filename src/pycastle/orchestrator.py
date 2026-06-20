@@ -184,6 +184,30 @@ def _write_telemetry(
     path.write_text(json.dumps(records, indent=2) + "\n")
 
 
+def _thinking_sink(
+    fixture_dir: Path, run_id: str, issue_number: int
+) -> Callable[[str, str], None]:
+    """Build a sink that persists thinking chunks to an issue's thinking log.
+
+    The runtime captures the agent's thinking trace but does not know ``run_id``
+    or the issue number (its :meth:`run` only gets ``cwd`` and ``phase``), so the
+    orchestrator — which owns both — binds this sink onto the runtime per issue
+    (#48). Each chunk is appended to
+    ``.pycastle/runs/<run_id>/issue-<n>-thinking.log``, prefixed with its phase,
+    beside the per-issue telemetry and the run log. Thinking is model reasoning,
+    not credentials, so writing it to the (gitignored) run dir is fine; it makes a
+    finished run auditable even if nobody watched it live.
+    """
+    run_dir = _telemetry_dir(fixture_dir, run_id)
+    path = run_dir / f"issue-{issue_number}-thinking.log"
+
+    def _sink(phase: str, text: str) -> None:
+        with path.open("a") as handle:
+            handle.write(f"[{phase}] {text}\n")
+
+    return _sink
+
+
 def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
     """Append one line to the run log and emit it through ``logging``."""
     logger.info(message)
@@ -521,6 +545,7 @@ def _work_issue(
     runner: Runner,
     impl_retries: int,
     gate_check: GateCheck,
+    verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
 
@@ -546,6 +571,17 @@ def _work_issue(
     branch = issue_branch_name(issue)
     issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
+
+    if verbose:
+        # The runtime is shared across issues (built once so a Docker image builds
+        # once), so its thinking sink is rebound per issue to point at this
+        # issue's thinking log. The runtime keeps surfacing [THINKING:<phase>]
+        # lines live regardless; the sink is only the run-dir persistence target.
+        # A deliberate mutation of the shared runtime: the Claude/Codex runtimes
+        # read this attribute, a runtime that does not just ignores it.
+        runtime.thinking_sink = _thinking_sink(  # type: ignore[attr-defined]
+            fixture_dir, run_id, issue.number
+        )
 
     issue_worktree = worktree_root / f"issue-{issue.number}"
     runner(["git", "branch", branch, run_branch], capture=True, cwd=workspace)
@@ -705,6 +741,7 @@ def run_batch(
     worktree_root: Path | None = None,
     include_unassigned: bool = False,
     runner: Runner = run_cmd,
+    verbose: bool = False,
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
@@ -722,6 +759,12 @@ def run_batch(
     gates passed (default: every attempt passes, so no retry fires). An issue
     that exhausts its retries is labelled ``ready-for-human`` and the run
     continues to the next issue.
+
+    ``verbose`` (#48) turns on thinking-trace persistence: before each issue is
+    worked the runtime's thinking sink is bound to that issue's thinking log
+    under ``.pycastle/runs/<run_id>/`` (live ``[THINKING:<phase>]`` surfacing is
+    already on in the runtime itself). Off by default, so a normal run writes no
+    thinking log and behaves exactly as before.
     """
     gate_check = gate_check or _gates_always_pass
     workspace = workspace or Path.cwd()
@@ -778,6 +821,7 @@ def run_batch(
                         runner=runner,
                         impl_retries=impl_retries,
                         gate_check=gate_check,
+                        verbose=verbose,
                     )
                 )
                 in_flight = None

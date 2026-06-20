@@ -564,6 +564,88 @@ def test_empty_agent_message_text_contributes_nothing(
     assert result.output == "real"
 
 
+def test_verbose_surfaces_codex_reasoning_when_emitted(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # If codex exec --json emits a reasoning item, --verbose captures it the same
+    # way claude thinking is captured: a [THINKING:<phase>] line plus the sink.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "item.completed",
+            "item": {"type": "reasoning", "text": "weighing the approach"},
+        },
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+    captured: list[tuple[str, str]] = []
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = CodexRuntime(
+            verbose=True,
+            thinking_sink=lambda phase, text: captured.append((phase, text)),
+        ).run("p", cwd=tmp_path, phase="implement")
+
+    assert "[THINKING:implement] weighing the approach" in caplog.text
+    assert ("implement", "weighing the approach") in captured
+    # Reasoning never folds into output; only agent_message prose does.
+    assert result.output == "done"
+
+
+def test_verbose_logs_unavailable_when_no_codex_reasoning(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # When codex emits no reasoning item, --verbose logs once that reasoning text
+    # is unavailable; output and telemetry are unchanged from the non-verbose run.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+
+    assert "codex reasoning text is unavailable" in caplog.text
+    assert result.output == "implemented"
+    assert result.telemetry.num_turns == 1
+
+
+def test_non_verbose_drops_codex_reasoning(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The behaviour-unchanged guard: without --verbose, no thinking lines and no
+    # unavailable note, and the sink is never called.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {
+            "type": "item.completed",
+            "item": {"type": "reasoning", "text": "weighing the approach"},
+        },
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+    captured: list[tuple[str, str]] = []
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = CodexRuntime(
+            thinking_sink=lambda phase, text: captured.append((phase, text))
+        ).run("p", cwd=tmp_path, phase="implement")
+
+    assert "[THINKING:" not in caplog.text
+    assert "unavailable" not in caplog.text
+    assert captured == []
+    assert result.output == "done"
+
+
+def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
+    # in_docker forwards verbose and the sink onto the constructed codex runtime.
+    sink = MagicMock()
+    runtime = CodexRuntime.in_docker(
+        workspace=tmp_path, verbose=True, thinking_sink=sink
+    )
+    assert runtime.verbose is True
+    assert runtime.thinking_sink is sink
+
+
 def test_docker_runtime_wraps_inner_argv_into_docker_run(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:

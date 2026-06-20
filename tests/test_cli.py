@@ -23,6 +23,30 @@ def test_parses_run_arguments() -> None:
     assert args.sandbox is None
 
 
+def test_run_verbose_flag_parses() -> None:
+    # --verbose (and its -v alias) turns on thinking-trace capture; default off.
+    assert build_parser().parse_args(["run", "--verbose"]).verbose is True
+    assert build_parser().parse_args(["run", "-v"]).verbose is True
+    assert build_parser().parse_args(["run"]).verbose is False
+
+
+def test_build_runtime_host_verbose_sets_runtime_verbose(tmp_path: Path) -> None:
+    # The host path honours verbose: it builds a runtime whose .verbose is True,
+    # rather than the bare make_runtime path used when verbose is off.
+    runtime = cli._build_runtime("claude", "host", tmp_path, verbose=True)
+    assert runtime.verbose is True
+    runtime = cli._build_runtime("codex", "host", tmp_path, verbose=True)
+    assert runtime.verbose is True
+
+
+def test_build_runtime_docker_verbose_sets_runtime_verbose(tmp_path: Path) -> None:
+    # The docker path threads verbose into the sandboxed runtime too.
+    runtime = cli._build_runtime("claude", "docker", tmp_path, verbose=True)
+    assert runtime.verbose is True
+    runtime = cli._build_runtime("codex", "docker", tmp_path, verbose=True)
+    assert runtime.verbose is True
+
+
 def test_run_sandbox_flag_defaults_to_none_for_marker_resolution() -> None:
     # No --sandbox flag parses to None, which signals "consult the marker".
     args = build_parser().parse_args(["run"])

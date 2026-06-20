@@ -77,6 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also work issues that have no assignee",
     )
     run_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Capture and surface the agent's thinking/reasoning trace, live as "
+            "[THINKING:<phase>] lines and persisted under "
+            ".pycastle/runs/<run_id>/. High-volume; off by default."
+        ),
+    )
+    run_parser.add_argument(
         "--sandbox",
         choices=("host", "docker"),
         default=None,
@@ -203,6 +213,7 @@ def _build_runtime(
     workspace: Path,
     *,
     image: str = sandbox.DEFAULT_IMAGE,
+    verbose: bool = False,
 ) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
@@ -213,16 +224,32 @@ def _build_runtime(
     Both Claude and Codex support this; every other combination runs the runtime
     on the host as before. The docker-vs-host choice is orthogonal to which
     runtime runs.
+
+    ``verbose`` turns on thinking-trace capture (#48). It is threaded into the
+    real Claude/Codex runtimes as a constructor attribute, so the ``Runtime.run``
+    signature stays unchanged. The per-issue thinking sink is bound later by the
+    orchestrator (which owns ``run_id`` and the issue number); here the runtime
+    is built only with ``verbose`` so live ``[THINKING:<phase>]`` surfacing turns
+    on. With ``verbose`` off the host path stays the bare :func:`make_runtime`
+    runtime, so nothing changes.
     """
     if sandbox_kind == "docker":
         if runtime_name == "claude":
-            return ClaudeRuntime.in_docker(workspace=workspace, image=image)
+            return ClaudeRuntime.in_docker(
+                workspace=workspace, image=image, verbose=verbose
+            )
         if runtime_name == "codex":
-            return CodexRuntime.in_docker(workspace=workspace, image=image)
+            return CodexRuntime.in_docker(
+                workspace=workspace, image=image, verbose=verbose
+            )
         raise NotImplementedError(
             f"The Docker sandbox for the {runtime_name!r} runtime is not "
             "available; run it with --sandbox host for now."
         )
+    if verbose and runtime_name == "claude":
+        return ClaudeRuntime(verbose=True)
+    if verbose and runtime_name == "codex":
+        return CodexRuntime(verbose=True)
     return make_runtime(runtime_name)
 
 
@@ -238,9 +265,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # built exactly once rather than per iteration. Resolution is docker-only.
     if args.sandbox == "docker":
         image = _resolve_agent_image(args.image, FIXTURE_DIR)
-        runtime = _build_runtime(args.runtime, args.sandbox, workspace, image=image)
+        runtime = _build_runtime(
+            args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
+        )
     else:
-        runtime = _build_runtime(args.runtime, args.sandbox, workspace)
+        runtime = _build_runtime(
+            args.runtime, args.sandbox, workspace, verbose=args.verbose
+        )
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
@@ -264,6 +295,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         iterations=args.iterations,
         include_unassigned=args.include_unassigned,
         gate_check=gate_check,
+        verbose=args.verbose,
     )
     if not outcome.issues:
         logger.info("Nothing to do.")
