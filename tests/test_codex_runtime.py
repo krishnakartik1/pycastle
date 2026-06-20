@@ -14,6 +14,7 @@ from pycastle import orchestrator
 from pycastle.models import IssueRef
 from pycastle.runtime import (
     CODEX_DOCKER_BYPASS,
+    CODEX_REASONING_SUMMARY_CONFIG,
     AgentCrashError,
     CodexRuntime,
     Runtime,
@@ -125,6 +126,20 @@ def test_build_command_minimal_omits_model_and_bypass(tmp_path: Path) -> None:
         "--json",
         "hi",
     ]
+
+
+def test_build_command_verbose_enables_reasoning_summary(tmp_path: Path) -> None:
+    # Codex exec --json emits no reasoning item unless asked, so a verbose run
+    # turns on the summary via -c model_reasoning_summary=detailed, placed before
+    # exec (a global codex flag) so the reasoning item appears for capture (#48).
+    cmd = CodexRuntime(verbose=True).build_command("hi", cwd=tmp_path)
+    assert cmd[cmd.index("-c") + 1] == CODEX_REASONING_SUMMARY_CONFIG
+    assert cmd.index("-c") < cmd.index("exec")
+
+
+def test_build_command_non_verbose_omits_reasoning_summary(tmp_path: Path) -> None:
+    # The summary costs extra tokens, so a non-verbose run never requests it.
+    assert "-c" not in CodexRuntime(verbose=False).build_command("hi", cwd=tmp_path)
 
 
 def test_build_command_host_carries_workspace_write(tmp_path: Path) -> None:

@@ -366,6 +366,15 @@ CODEX_DOCKER_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 #: same spot the bypass occupies, so the two paths stay symmetric.
 CODEX_HOST_SANDBOX = "workspace-write"
 
+#: Config override that makes ``codex exec --json`` emit its reasoning summary as
+#: an ``item.completed`` event whose item ``type`` is ``reasoning`` and whose
+#: ``text`` is the summary. Without it Codex still *reasons* (the
+#: ``reasoning_output_tokens`` count is non-zero) but emits no reasoning item, so
+#: there is no thinking text to surface — which is why a plain ``exec --json`` run
+#: always reported "reasoning unavailable". Passed as ``-c <this>`` before
+#: ``exec`` and only on a verbose run, since the summary costs extra tokens.
+CODEX_REASONING_SUMMARY_CONFIG = "model_reasoning_summary=detailed"
+
 
 class CodexRuntime:
     """Drive the real ``codex`` CLI behind the Runtime interface.
@@ -480,10 +489,18 @@ class CodexRuntime:
         :data:`CODEX_HOST_SANDBOX` so Codex may write within the worktree rather
         than using its read-only default. The two are mutually exclusive, so a
         host run never gets the bypass and a Docker run never gets ``-s``.
+
+        On a verbose run a ``-c`` :data:`CODEX_REASONING_SUMMARY_CONFIG` override
+        also sits before ``exec`` so Codex emits its reasoning summary as a
+        ``reasoning`` item; without it ``exec --json`` carries no reasoning text
+        to surface (see the constant). It is omitted on a non-verbose run to
+        avoid paying for a summary nothing consumes.
         """
         cmd = [self.command, "-C", str(Path(cwd).resolve())]
         if self.model is not None:
             cmd += ["--model", self.model]
+        if self.verbose:
+            cmd += ["-c", CODEX_REASONING_SUMMARY_CONFIG]
         if self.bypass_sandbox:
             cmd.append(CODEX_DOCKER_BYPASS)
         else:
@@ -563,9 +580,11 @@ class CodexRuntime:
             proc.wait()
 
         if self.verbose and not saw_reasoning:
-            # Match Ralph: Codex's stream may carry no reasoning item, so there is
-            # no thinking text to surface. Note it once (the reasoning_output_tokens
-            # count is still in telemetry) rather than silently emitting nothing.
+            # build_command asks for a reasoning summary on a verbose run, so a
+            # reasoning item is the norm; this fires only as a fallback — a turn
+            # that did no reasoning, or a codex too old to honor the config. Note
+            # it once (the reasoning_output_tokens count is still in telemetry)
+            # rather than silently emitting nothing.
             logger.info(
                 "[%s] codex reasoning text is unavailable "
                 "(reasoning_output_tokens=%s in telemetry)",
