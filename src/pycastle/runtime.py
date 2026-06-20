@@ -99,11 +99,16 @@ class ClaudeRuntime:
         model: str | None = None,
         max_turns: int | None = None,
         dangerously_skip_permissions: bool = False,
-        argv_wrapper: Callable[[list[str]], list[str]] | None = None,
+        argv_wrapper: Callable[[list[str], Path], list[str]] | None = None,
         verbose: bool = False,
         thinking_sink: Callable[[str, str], None] | None = None,
     ) -> None:
         """Configure the CLI invocation shared across phases.
+
+        ``argv_wrapper``, when set, rewrites the inner ``claude …`` argv just
+        before launch; it receives both that argv and the resolved per-phase
+        run ``cwd`` so a Docker wrapper can set the container ``-w`` to the cwd
+        (the issue worktree) rather than the fixed workspace root.
 
         ``verbose`` turns on thinking-trace capture (off by default, it is
         high-volume): each ``thinking`` block in the stream is surfaced as a
@@ -149,11 +154,15 @@ class ClaudeRuntime:
         ``False`` so host runs never auto-skip.
         """
 
-        def wrap(inner_argv: list[str]) -> list[str]:
+        def wrap(inner_argv: list[str], cwd: Path) -> list[str]:
+            # The mount source stays the workspace root so a linked worktree's
+            # .git file resolves inside the container; -w follows the per-phase
+            # cwd (the issue worktree) so the agent writes there, not the root.
             return sandbox.build_run_command(
                 cls.name,
                 inner_argv=inner_argv,
                 workspace=workspace,
+                workdir=cwd,
                 image=image,
             )
 
@@ -188,10 +197,16 @@ class ClaudeRuntime:
         """Run the agent for one phase and return its parsed result.
 
         Raises :class:`AgentCrashError` when the agent exits non-zero.
+
+        ``cwd`` is resolved to an absolute path once (mirroring Codex) so a
+        Docker wrapper's container ``-w`` and the bind-mount agree; on the host
+        (no wrapper) this only normalises the path the subprocess already runs
+        in, so host behaviour is unchanged.
         """
+        cwd = Path(cwd).resolve()
         cmd = self.build_command(prompt)
         if self.argv_wrapper is not None:
-            cmd = self.argv_wrapper(cmd)
+            cmd = self.argv_wrapper(cmd, cwd)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -407,7 +422,7 @@ class CodexRuntime:
         command: str = "codex",
         model: str | None = None,
         bypass_sandbox: bool = False,
-        argv_wrapper: Callable[[list[str]], list[str]] | None = None,
+        argv_wrapper: Callable[[list[str], Path], list[str]] | None = None,
         verbose: bool = False,
         thinking_sink: Callable[[str, str], None] | None = None,
     ) -> None:
@@ -451,11 +466,15 @@ class CodexRuntime:
         tree.
         """
 
-        def wrap(inner_argv: list[str]) -> list[str]:
+        def wrap(inner_argv: list[str], cwd: Path) -> list[str]:
+            # -w follows the per-phase cwd so it agrees with the inner ``-C``
+            # (both the resolved worktree); the mount source stays the workspace
+            # root so a linked worktree's .git file resolves in the container.
             return sandbox.build_run_command(
                 cls.name,
                 inner_argv=inner_argv,
                 workspace=workspace,
+                workdir=cwd,
                 image=image,
             )
 
@@ -535,7 +554,7 @@ class CodexRuntime:
         cwd = Path(cwd).resolve()
         cmd = self.build_command(prompt, cwd=cwd, resume_thread_id=resume_thread_id)
         if self.argv_wrapper is not None:
-            cmd = self.argv_wrapper(cmd)
+            cmd = self.argv_wrapper(cmd, cwd)
         started_at = time.perf_counter()
         proc = subprocess.Popen(
             cmd,

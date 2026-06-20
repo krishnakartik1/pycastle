@@ -163,6 +163,7 @@ def build_run_command(
     *,
     inner_argv: Sequence[str],
     workspace: Path,
+    workdir: Path | None = None,
     image: str = DEFAULT_IMAGE,
 ) -> list[str]:
     """Wrap an inner agent argv into a ``docker run`` argv.
@@ -174,15 +175,29 @@ def build_run_command(
     — this wrapper stays runtime-agnostic and adds no runtime-specific flags).
     The container runs as non-root ``node``, mounts the per-Runtime auth volume,
     bind-mounts ``workspace`` at the same path so the agent reads and writes the
-    real tree, sets the working directory to it, and pins the runtime's
-    config-dir env var (``CLAUDE_CONFIG_DIR`` for Claude, ``CODEX_HOME`` for
-    Codex).
+    real tree, and pins the runtime's config-dir env var
+    (``CLAUDE_CONFIG_DIR`` for Claude, ``CODEX_HOME`` for Codex).
 
-    ``workspace`` is resolved to an absolute path first: Docker rejects a
-    relative bind-mount source, so a relative ``Path`` would otherwise produce a
-    silently broken ``docker run`` argv.
+    The bind-mount source stays ``workspace`` — the repo (or workspace) root —
+    *not* the in-container working directory. ``workdir`` is the ``-w`` value,
+    the cwd the agent actually runs in; it defaults to ``workspace`` so every
+    existing caller behaves exactly as before. Under Docker the orchestrator
+    passes the per-issue git worktree as ``workdir`` while keeping the mount at
+    the workspace root, so a *linked* worktree's ``.git`` FILE (which points at
+    ``<root>/.git/worktrees/<name>``) still resolves back to the parent repo
+    inside the container. Mounting only the worktree would orphan that link and
+    the agent's commits would land nowhere the orchestrator can see — which is
+    exactly the phantom-empty-diff bug (#50) this guards against.
+
+    Both ``workspace`` and ``workdir`` are resolved to absolute paths first:
+    Docker rejects a relative bind-mount source, and a relative ``-w`` would
+    likewise produce a silently broken ``docker run`` argv. Resolving ``workdir``
+    independently also keeps it in agreement with Codex's own resolved ``-C``.
     """
     workspace_path = str(Path(workspace).resolve())
+    workdir_path = (
+        str(Path(workdir).resolve()) if workdir is not None else workspace_path
+    )
     return [
         "docker",
         "run",
@@ -190,7 +205,7 @@ def build_run_command(
         "-u",
         SANDBOX_USER,
         "-w",
-        workspace_path,
+        workdir_path,
         *_auth_mount_args(runtime_name),
         "-v",
         f"{workspace_path}:{workspace_path}",

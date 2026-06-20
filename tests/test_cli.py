@@ -245,9 +245,13 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     runtime = captured["runtime"]
     # The handed-off runtime carries a wrapper that produces a docker argv.
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    worktree = Path("/repo/worktree")
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"], worktree)
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-claude-auth:/home/node/.claude" in wrapped
+    # The wrapper threads the per-phase cwd into the container ``-w`` so claude
+    # writes in the issue worktree, not the workspace root (#50).
+    assert wrapped[wrapped.index("-w") + 1] == str(worktree.resolve())
 
 
 def test_run_docker_builds_a_sandboxed_codex_runtime(
@@ -283,7 +287,9 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     runtime = captured["runtime"]
     assert runtime.name == "codex"
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"])
+    wrapped = runtime.argv_wrapper(
+        ["codex", "exec", "--json", "x"], Path("/repo/worktree")
+    )
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-codex-auth:/home/node/.codex" in wrapped
 
@@ -337,7 +343,7 @@ def test_run_defaults_sandbox_from_docker_marker(
 
     runtime = captured["runtime"]
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"], Path("/repo/worktree"))
     assert wrapped[:3] == ["docker", "run", "--rm"]
 
 
@@ -381,7 +387,7 @@ def test_run_flag_overrides_host_marker(
 
     runtime = captured["runtime"]
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"], Path("/repo/worktree"))
     assert wrapped[:3] == ["docker", "run", "--rm"]
 
 
@@ -503,7 +509,9 @@ def test_build_runtime_docker_codex_builds_a_sandboxed_runtime(
     runtime = cli._build_runtime("codex", "docker", tmp_path)
     assert runtime.name == "codex"
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"])
+    wrapped = runtime.argv_wrapper(
+        ["codex", "exec", "--json", "x"], Path("/repo/worktree")
+    )
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-codex-auth:/home/node/.codex" in wrapped
     assert "CODEX_HOME=/home/node/.codex" in wrapped
@@ -1053,7 +1061,7 @@ def test_run_docker_resolves_and_threads_image_into_runtime(
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
 
     runtime = captured["runtime"]
-    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"], Path("/repo/worktree"))
     assert tag in wrapped
 
 
@@ -1084,7 +1092,7 @@ def test_run_image_flag_threads_through_and_never_builds(
     )
 
     runtime = captured["runtime"]
-    wrapped = runtime.argv_wrapper(["claude", "-p", "x"])
+    wrapped = runtime.argv_wrapper(["claude", "-p", "x"], Path("/repo/worktree"))
     assert "ci/agent:fixed" in wrapped
     assert [c for c in calls if c[:2] == ["docker", "build"]] == []
 

@@ -85,6 +85,46 @@ def test_build_run_command_keeps_absolute_workspace_unchanged() -> None:
     assert "/home/krishna/proj:/home/krishna/proj" in argv
 
 
+def test_build_run_command_defaults_workdir_to_workspace() -> None:
+    # With no explicit workdir the container -w equals the (resolved) workspace
+    # and the bind-mount source is the same path, so every existing caller keeps
+    # its byte-for-byte behaviour.
+    workspace = Path("/home/krishna/proj")
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=workspace
+    )
+    assert argv[argv.index("-w") + 1] == str(workspace.resolve())
+    assert f"{workspace.resolve()}:{workspace.resolve()}" in argv
+
+
+def test_build_run_command_workdir_overrides_w_but_not_mount() -> None:
+    # The fix for #50: -w follows the per-issue worktree while the bind-mount
+    # source stays the workspace root, so the worktree's .git file resolves back
+    # to the parent repo inside the container.
+    workspace = Path("/repo")
+    workdir = Path("/repo/.pycastle/worktrees/issue-3")
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=workspace, workdir=workdir
+    )
+    assert argv[argv.index("-w") + 1] == "/repo/.pycastle/worktrees/issue-3"
+    # Mount source/target both stay the workspace root, not the worktree.
+    assert "/repo:/repo" in argv
+    assert f"{workdir}:{workdir}" not in argv
+
+
+def test_build_run_command_resolves_relative_workdir() -> None:
+    # A relative workdir is resolved to an absolute path, so -w is never a broken
+    # relative value and always agrees with codex's resolved -C.
+    argv = sandbox.build_run_command(
+        "claude",
+        inner_argv=["claude"],
+        workspace=Path("/repo"),
+        workdir=Path("worktrees/issue-3"),
+    )
+    workdir = argv[argv.index("-w") + 1]
+    assert Path(workdir).is_absolute()
+
+
 def test_build_run_command_preserves_spaces_as_single_argv_elements() -> None:
     # A workspace path with spaces stays one argv element on both the mount and
     # -w (no shell-joining), so the container sees the real directory name.

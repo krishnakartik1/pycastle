@@ -274,6 +274,34 @@ def test_docker_relative_cwd_yields_absolute_inner_dash_c(
     assert inner_dash_c_value == str(relative.resolve())
 
 
+def test_docker_workdir_matches_inner_dash_c(
+    mock_popen: MagicMock, tmp_path: Path
+) -> None:
+    # The symmetric half of the #50 fix: under docker the container -w and the
+    # inner codex -C must agree (both the resolved worktree), and the bind-mount
+    # source must stay the workspace root, not the worktree.
+    from pycastle import sandbox
+
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+    root = tmp_path / "root"
+    worktree = root / ".pycastle" / "worktrees" / "issue-3"
+    worktree.mkdir(parents=True)
+
+    runtime = CodexRuntime.in_docker(workspace=root)
+    runtime.run("p", cwd=worktree, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    workdir = argv[argv.index("-w") + 1]
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    inner = argv[image_idx + 1 :]
+    inner_dash_c = inner[inner.index("-C") + 1]
+    assert workdir == inner_dash_c == str(worktree.resolve())
+    assert Path(workdir).is_absolute()
+    # Mount source stays the workspace root, never the worktree.
+    assert f"{root.resolve()}:{root.resolve()}" in argv
+    assert f"{worktree}:{worktree}" not in argv
+
+
 def test_parses_jsonl_into_output_and_telemetry(
     mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
