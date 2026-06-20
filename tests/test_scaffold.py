@@ -277,7 +277,16 @@ def test_scaffolded_dockerfile_installs_ca_certificates(
     assert "ca-certificates" in dockerfile
     # Installed as root, before the image drops to USER node -- a non-root
     # user cannot apt-get install into the system trust store.
-    assert dockerfile.index("ca-certificates") < dockerfile.index("USER node")
+    ca_at = dockerfile.index("ca-certificates")
+    assert ca_at < dockerfile.index("USER node")
+    # The apt cache is dropped in the *same* RUN layer as the install, so the
+    # ca-certificates install does not bloat the image with the package lists.
+    # The cleanup must land between the install and the next RUN (the npm one) --
+    # asserting only "before USER node" is vacuous because the commented example
+    # block further down also carries an apt-cache cleanup line.
+    install_block_end = dockerfile.index("RUN npm install")
+    block = dockerfile[ca_at:install_block_end]
+    assert "rm -rf /var/lib/apt/lists/*" in block
 
 
 def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None:
