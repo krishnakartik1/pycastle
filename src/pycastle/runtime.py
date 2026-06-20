@@ -356,8 +356,15 @@ class CodexRuntime:
         (``codex … exec --json <prompt>``); with one it resumes that thread
         (``codex … exec resume --json <thread_id> <prompt>``) so a handoff
         continues the conversation that did the failed attempt.
+
+        ``cwd`` is resolved to an absolute path for the ``-C`` value. Codex
+        resolves a relative ``-C`` against its own process working directory,
+        which :meth:`run` also sets to ``cwd``; a relative value would double
+        (e.g. ``…/issue-3/.pycastle/worktrees/issue-3``) and fail. Resolving
+        here mirrors :func:`pycastle.sandbox.build_run_command`, which resolves
+        the bind-mount source for the same reason.
         """
-        cmd = [self.command, "-C", str(cwd)]
+        cmd = [self.command, "-C", str(Path(cwd).resolve())]
         if self.model is not None:
             cmd += ["--model", self.model]
         if self.bypass_sandbox:
@@ -384,7 +391,12 @@ class CodexRuntime:
         Pass ``resume_thread_id`` to continue a prior thread (used for
         handoffs). Raises :class:`AgentCrashError` when the agent exits
         non-zero.
+
+        ``cwd`` is resolved to an absolute path once so the ``-C`` value and the
+        subprocess working directory agree; otherwise Codex would re-resolve a
+        relative ``-C`` against the process cwd and double the path.
         """
+        cwd = Path(cwd).resolve()
         cmd = self.build_command(prompt, cwd=cwd, resume_thread_id=resume_thread_id)
         if self.argv_wrapper is not None:
             cmd = self.argv_wrapper(cmd)

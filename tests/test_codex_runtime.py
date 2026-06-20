@@ -96,10 +96,13 @@ def test_make_runtime_selects_codex() -> None:
 def test_build_command_host_is_codex_exec_json(tmp_path: Path) -> None:
     # The host path uses Codex's own sandbox, so it carries no bypass flag.
     runtime = CodexRuntime(model="gpt-test")
+    # build_command always emits the resolved (absolute) -C; assert against
+    # tmp_path.resolve() so the test holds where the temp root is symlinked
+    # (e.g. macOS /var -> /private/var) rather than only where it is not.
     assert runtime.build_command("do the work", cwd=tmp_path) == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         "--model",
         "gpt-test",
         "exec",
@@ -112,7 +115,7 @@ def test_build_command_minimal_omits_model_and_bypass(tmp_path: Path) -> None:
     assert CodexRuntime().build_command("hi", cwd=tmp_path) == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         "exec",
         "--json",
         "hi",
@@ -127,7 +130,7 @@ def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
     assert cmd == [
         "codex",
         "-C",
-        str(tmp_path),
+        str(tmp_path.resolve()),
         CODEX_DOCKER_BYPASS,
         "exec",
         "--json",
@@ -149,6 +152,81 @@ def test_build_command_resume_places_thread_id(tmp_path: Path) -> None:
         "thread-456",
         "write handoff",
     ]
+
+
+def test_build_command_resolves_relative_cwd_to_absolute_dash_c() -> None:
+    # The orchestrator hands the runtime a relative worktree path derived from a
+    # relative FIXTURE_DIR. Codex resolves a relative -C against its own process
+    # cwd (which run() also sets to cwd), so the -C value must be absolute or it
+    # doubles. build_command resolves it regardless of how it is called.
+    relative = Path(".pycastle/worktrees/issue-3")
+    cmd = CodexRuntime().build_command("p", cwd=relative)
+
+    dash_c_value = cmd[cmd.index("-C") + 1]
+    assert Path(dash_c_value).is_absolute()
+    assert dash_c_value == str(relative.resolve())
+
+
+def test_run_relative_cwd_does_not_double_dash_c_path(
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The exact failure from the issue: a relative cwd used for both -C and the
+    # Popen cwd makes Codex re-resolve -C against the process cwd and enter
+    # …/issue-3/.pycastle/worktrees/issue-3 (os error 2). Resolving once means
+    # -C is absolute, carries no doubled segment, and matches the Popen cwd.
+    monkeypatch.chdir(tmp_path)
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    relative = Path(".pycastle/worktrees/issue-3")
+    CodexRuntime().run("p", cwd=relative, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    dash_c_value = argv[argv.index("-C") + 1]
+    assert Path(dash_c_value).is_absolute()
+    # The doubled segment from the bug must not appear.
+    assert "worktrees/issue-3/.pycastle" not in dash_c_value
+    # -C and the process cwd agree, so no second relative resolution is possible.
+    assert dash_c_value == str(relative.resolve())
+    assert mock_popen.call_args.kwargs["cwd"] == relative.resolve()
+
+
+def test_run_absolute_cwd_is_idempotent(mock_popen: MagicMock, tmp_path: Path) -> None:
+    # The common case: the orchestrator hands an already-absolute, already-real
+    # worktree path. Resolving it (once in run, again in build_command) must be a
+    # no-op — the -C value and the Popen cwd both equal the input unchanged, so
+    # the fix never mangles a path that was already correct.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+    absolute = tmp_path.resolve()
+
+    CodexRuntime().run("p", cwd=absolute, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    dash_c_value = argv[argv.index("-C") + 1]
+    assert dash_c_value == str(absolute)
+    assert mock_popen.call_args.kwargs["cwd"] == absolute
+
+
+def test_docker_relative_cwd_yields_absolute_inner_dash_c(
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Under Docker the inner -C must also be absolute so it matches the
+    # bind-mount path that build_run_command already resolves; a relative inner
+    # -C would double under -w.
+    from pycastle import sandbox
+
+    monkeypatch.chdir(tmp_path)
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    relative = Path(".pycastle/worktrees/issue-3")
+    runtime = CodexRuntime.in_docker(workspace=tmp_path)
+    runtime.run("p", cwd=relative, phase="implement")
+
+    argv = mock_popen.call_args.args[0]
+    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    inner = argv[image_idx + 1 :]
+    inner_dash_c_value = inner[inner.index("-C") + 1]
+    assert Path(inner_dash_c_value).is_absolute()
+    assert inner_dash_c_value == str(relative.resolve())
 
 
 def test_parses_jsonl_into_output_and_telemetry(
