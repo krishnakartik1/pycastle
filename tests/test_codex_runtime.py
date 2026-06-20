@@ -172,6 +172,18 @@ def test_build_command_resume_places_thread_id(tmp_path: Path) -> None:
     ]
 
 
+def test_build_command_host_resume_carries_workspace_write(tmp_path: Path) -> None:
+    # The handoff path resumes a prior thread, and it must still scope writes to
+    # the worktree: a host resume carries -s workspace-write before exec, just
+    # like a fresh host run, or the retry attempt would silently no-op too (#35).
+    cmd = CodexRuntime().build_command(
+        "write handoff", cwd=tmp_path, resume_thread_id="thread-456"
+    )
+    assert cmd[cmd.index("-s") + 1] == "workspace-write"
+    assert cmd.index("-s") < cmd.index("exec")
+    assert CODEX_DOCKER_BYPASS not in cmd
+
+
 def test_build_command_resolves_relative_cwd_to_absolute_dash_c() -> None:
     # The orchestrator hands the runtime a relative worktree path derived from a
     # relative FIXTURE_DIR. Codex resolves a relative -C against its own process
