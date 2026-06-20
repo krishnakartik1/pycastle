@@ -210,6 +210,14 @@ _DOCKERFILE = """\
 #
 FROM node:22-slim
 
+# Codex's Rust TLS stack verifies certificates against the system trust store,
+# which node:22-slim ships empty. Install ca-certificates as root so codex can
+# reach auth.openai.com; the Node-based Claude CLI bundles its own roots and is
+# unaffected.
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
+
 # Install the agent CLIs your runtime needs. Pin versions to taste.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 
