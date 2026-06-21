@@ -260,6 +260,67 @@ USER node
 WORKDIR /home/node
 """
 
+# The empty PROJECT EXTENSION POINT block exactly as it appears in `_DOCKERFILE`
+# (non-Python: nothing to install). This is the verbatim replacement target the
+# Python Dockerfile swaps out, so it must stay a byte-exact, unique substring of
+# `_DOCKERFILE` -- a test pins that invariant so the two cannot drift.
+_EXTENSION_EMPTY = """\
+# --- PROJECT EXTENSION POINT ------------------------------------------------
+# Add your project's own language toolchains and system packages here, e.g.:
+#
+#   RUN apt-get update && apt-get install -y --no-install-recommends \\
+#         python3 python3-pip \\
+#     && rm -rf /var/lib/apt/lists/*
+#
+# Leave this block empty if a plain Node toolchain is all your repo needs.
+# ---------------------------------------------------------------------------"""
+
+# The filled PROJECT EXTENSION POINT block for a Python project: install python3
+# plus the gate toolchain (ruff/black/pytest) so the in-container gate (#28) can
+# run. The Docker sandbox runs the quality gate INSIDE this image, and a
+# toolchain-less image makes that gate fail loud, so these must be baked in.
+# node:22-slim (Debian 12) marks the system interpreter externally-managed, so
+# `--break-system-packages` is required to pip-install into it.
+_EXTENSION_PYTHON = """\
+# --- PROJECT EXTENSION POINT ------------------------------------------------
+# This is a Python project (a pyproject.toml was present at scaffold time), so
+# the image carries python3 plus the gate toolchain (ruff/black/pytest). The
+# Docker sandbox runs the quality gate INSIDE this image, and a toolchain-less
+# image makes that gate fail loud, so these must be baked in.
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends python3 python3-pip \\
+    && rm -rf /var/lib/apt/lists/*
+
+# node:22-slim (Debian 12) marks the system interpreter externally-managed, so
+# --break-system-packages is required to pip-install into it.
+RUN pip install --break-system-packages --no-cache-dir ruff black pytest
+
+# ALSO add your project's own runtime and test dependencies here (e.g. install
+# from pyproject.toml) so pytest can import your package when the gate runs.
+# NOTE: only the Python gate toolchain is handled automatically today; carrying
+# the toolchain for non-Python stacks (Go/JS/Rust) is a follow-up.
+# ---------------------------------------------------------------------------"""
+
+
+def _dockerfile(*, python: bool) -> str:
+    """Return the agent Dockerfile, gate-toolchain-filled for a Python project.
+
+    For a non-Python project this is ``_DOCKERFILE`` unchanged (empty extension
+    point). For a Python project the PROJECT EXTENSION POINT block is replaced
+    with a real python3 + ruff/black/pytest install so the in-container gate
+    (#28) can run. Both share the same base template, so they cannot drift.
+
+    Args:
+        python: Whether the scaffolded project is a Python project.
+
+    Returns:
+        The Dockerfile text for the agent image.
+    """
+    if not python:
+        return _DOCKERFILE
+    return _DOCKERFILE.replace(_EXTENSION_EMPTY, _EXTENSION_PYTHON)
+
+
 # Excludes the transient run logs and generated run artifacts so they are never
 # committed. Mirrors the paths the repo's own root .gitignore excludes.
 _GITIGNORE = """\
@@ -270,18 +331,23 @@ worktrees/
 """
 
 
-def _fixture_files(sandbox: SandboxChoice) -> dict[str, str]:
+def _fixture_files(sandbox: SandboxChoice, *, python: bool) -> dict[str, str]:
     """Return the fixture's relative paths mapped to their text content.
 
     The mapping is identical for both choices except the ``sandbox`` marker,
     which records ``host`` or ``docker`` -- the one observable difference
-    between a host-first and a Docker-first scaffold.
+    between a host-first and a Docker-first scaffold -- and the Dockerfile, whose
+    PROJECT EXTENSION POINT carries the gate toolchain when ``python`` is set.
+
+    Args:
+        sandbox: The host-first/Docker-first choice recorded in the marker file.
+        python: Whether to emit the Python Dockerfile (gate toolchain pre-filled).
     """
     return {
         "main.py": _MAIN_PY,
         "gate": _GATE,
         SANDBOX_MARKER: f"{sandbox}\n",
-        "Dockerfile": _DOCKERFILE,
+        "Dockerfile": _dockerfile(python=python),
         ".gitignore": _GITIGNORE,
         "prompts/plan.md": _PLAN_MD,
         "prompts/implement.md": _IMPLEMENT_MD,
@@ -315,8 +381,14 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
             "remove it first or scaffold into a fresh repo."
         )
 
+    # Detect a Python project so the agent image can carry the gate toolchain
+    # (#19): the Docker sandbox runs the gate inside the image, and a
+    # toolchain-less image makes a Python project's in-container gate fail loud
+    # (#28). Presence-check only -- an empty/malformed pyproject.toml still counts.
+    python = (target_dir / "pyproject.toml").exists()
+
     written: list[Path] = []
-    for relative, content in _fixture_files(sandbox).items():
+    for relative, content in _fixture_files(sandbox, python=python).items():
         path = fixture_dir / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
