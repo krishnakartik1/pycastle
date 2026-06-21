@@ -397,7 +397,53 @@ CODEX_DOCKER_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 #: reserved for the container where Docker is the isolation boundary (ADR-0003).
 #: It is passed as ``-s workspace-write`` before the ``exec`` subcommand, the
 #: same spot the bypass occupies, so the two paths stay symmetric.
+#:
+#: ``workspace-write`` makes only the cwd (the worktree) writable, but PyCastle
+#: works each issue in a *linked* git worktree whose ``.git`` is a file pointing
+#: back at the main repo's common git dir. The branch refs, ``index.lock``,
+#: ``packed-refs`` and logs a ``git commit`` writes all live in that common dir,
+#: which sits *outside* the worktree — so under ``workspace-write`` alone the
+#: commit fails read-only and the run lands no commit (#56). The host branch of
+#: :meth:`CodexRuntime.build_command` therefore grants the common git dir
+#: explicitly as an extra writable root via Codex's ``--add-dir`` flag.
 CODEX_HOST_SANDBOX = "workspace-write"
+
+#: Codex's flag for granting an extra writable root alongside the primary
+#: ``workspace-write`` workspace ("Additional directories that should be writable
+#: alongside the primary workspace"). The host branch uses it to grant the linked
+#: worktree's common git dir so ``git commit`` can write its refs and locks (#56).
+CODEX_ADD_DIR = "--add-dir"
+
+
+def _resolve_git_common_dir(cwd: Path) -> Path | None:
+    """Resolve the common git dir backing ``cwd``, or ``None`` if not a repo.
+
+    In a linked git worktree the per-worktree dir is ``<repo>/.git/worktrees/<n>``,
+    but the branch refs, ``packed-refs`` and logs a commit updates live in the
+    *common* dir ``<repo>/.git``. ``git rev-parse --git-common-dir`` returns that
+    common dir (covering the per-worktree subdir too), so granting it as a
+    writable root lets ``git commit`` succeed under Codex's host sandbox (#56).
+
+    ``git`` may return a relative path, so the result is resolved against ``cwd``.
+    Resolving an extra writable root must never break the launch, so any failure
+    — ``cwd`` not in a git repo (``rev-parse`` exits non-zero), a missing ``git``,
+    or any other subprocess error — is caught and reported as ``None`` so the run
+    skips the extra root rather than crashing.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        return None
+    return (Path(cwd) / common_dir).resolve()
+
 
 #: Config override that makes ``codex exec --json`` emit its reasoning summary as
 #: an ``item.completed`` event whose item ``type`` is ``reasoning`` and whose
@@ -530,6 +576,14 @@ class CodexRuntime:
         than using its read-only default. The two are mutually exclusive, so a
         host run never gets the bypass and a Docker run never gets ``-s``.
 
+        A host run also appends :data:`CODEX_ADD_DIR` ``<common git dir>`` so the
+        linked worktree's git metadata (refs, ``index.lock``, ``packed-refs``,
+        logs) — which lives in the parent repo's common git dir, outside the
+        cwd ``workspace-write`` grants — is writable and ``git commit`` succeeds
+        (#56). It is resolved via :func:`_resolve_git_common_dir` and omitted when
+        ``cwd`` is not a git repo. The Docker branch keeps its full bypass and a
+        bind-mounted workspace, so it never gets ``--add-dir``.
+
         On a verbose run a ``-c`` :data:`CODEX_REASONING_SUMMARY_CONFIG` override
         also sits before ``exec`` so Codex emits its reasoning summary as a
         ``reasoning`` item; without it ``exec --json`` carries no reasoning text
@@ -545,6 +599,13 @@ class CodexRuntime:
             cmd.append(CODEX_DOCKER_BYPASS)
         else:
             cmd += ["-s", CODEX_HOST_SANDBOX]
+            # workspace-write makes only the worktree (cwd) writable; a linked
+            # worktree's git metadata lives in the parent repo's common git dir,
+            # so grant that dir explicitly or git commit fails read-only (#56).
+            # Skipped when cwd is not in a git repo so a non-repo run still works.
+            common_git_dir = _resolve_git_common_dir(Path(cwd).resolve())
+            if common_git_dir is not None:
+                cmd += [CODEX_ADD_DIR, str(common_git_dir)]
         cmd.append("exec")
         if resume_thread_id is not None:
             cmd.append("resume")

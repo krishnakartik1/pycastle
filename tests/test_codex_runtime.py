@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -13,6 +14,7 @@ import pytest
 from pycastle import orchestrator
 from pycastle.models import IssueRef
 from pycastle.runtime import (
+    CODEX_ADD_DIR,
     CODEX_DOCKER_BYPASS,
     CODEX_REASONING_SUMMARY_CONFIG,
     AgentCrashError,
@@ -20,6 +22,39 @@ from pycastle.runtime import (
     Runtime,
     make_runtime,
 )
+
+
+def _make_linked_worktree(root: Path) -> tuple[Path, Path]:
+    """Create a git repo with a linked worktree; return (worktree, common dir).
+
+    The worktree's ``.git`` is a file pointing back at the main repo, so the
+    common git dir (where commit refs and locks live) is the main repo's
+    ``.git`` — exactly the dir the host codex run must grant as writable (#56).
+    """
+    main = root / "main"
+    main.mkdir()
+    env = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "HOME": str(root),
+    }
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            check=True,
+            capture_output=True,
+            env={**os.environ, **env},
+        )
+
+    git("init", "-b", "main", cwd=main)
+    git("config", "user.email", "t@t", cwd=main)
+    git("config", "user.name", "t", cwd=main)
+    git("commit", "--allow-empty", "-m", "init", cwd=main)
+    worktree = root / "wt"
+    git("worktree", "add", "-b", "feature", str(worktree), cwd=main)
+    common_dir = (main / ".git").resolve()
+    return worktree, common_dir
 
 
 def _stream(events: list[dict]) -> io.StringIO:
@@ -171,6 +206,33 @@ def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
     # carries the bypass and never the scoped host sandbox (no double flag).
     assert "-s" not in cmd
     assert "workspace-write" not in cmd
+
+
+def test_build_command_host_grants_common_git_dir(tmp_path: Path) -> None:
+    # workspace-write makes only the worktree writable; a linked worktree's git
+    # metadata (refs, index.lock) lives in the parent repo's common git dir, so
+    # the host run grants it via --add-dir or git commit fails read-only (#56).
+    worktree, common_dir = _make_linked_worktree(tmp_path)
+    cmd = CodexRuntime().build_command("hi", cwd=worktree)
+    assert CODEX_ADD_DIR in cmd
+    assert cmd[cmd.index(CODEX_ADD_DIR) + 1] == str(common_dir)
+    # The extra writable root is a global codex flag, before the exec subcommand.
+    assert cmd.index(CODEX_ADD_DIR) < cmd.index("exec")
+
+
+def test_build_command_host_skips_add_dir_outside_repo(tmp_path: Path) -> None:
+    # tmp_path is not a git repo, so rev-parse fails; the host run skips
+    # --add-dir rather than crashing (defensive resolution).
+    cmd = CodexRuntime().build_command("hi", cwd=tmp_path)
+    assert CODEX_ADD_DIR not in cmd
+
+
+def test_build_command_docker_never_grants_add_dir(tmp_path: Path) -> None:
+    # The Docker branch bypasses codex's sandbox and bind-mounts the workspace,
+    # so it never needs (and must not get) the host-only --add-dir grant (#56).
+    worktree, _ = _make_linked_worktree(tmp_path)
+    cmd = CodexRuntime(bypass_sandbox=True).build_command("hi", cwd=worktree)
+    assert CODEX_ADD_DIR not in cmd
 
 
 def test_build_command_resume_places_thread_id(tmp_path: Path) -> None:
