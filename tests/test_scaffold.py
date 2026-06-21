@@ -296,6 +296,29 @@ def test_scaffolded_dockerfile_installs_ca_certificates(
     assert "rm -rf /var/lib/apt/lists/*" in block
 
 
+@pytest.mark.parametrize("python", [True, False])
+def test_scaffolded_dockerfile_installs_git(tmp_path: Path, python: bool) -> None:
+    """git is installed in the base image for every stack (#57).
+
+    The implement/review prompts tell the agent to commit and to read "the diff
+    produced so far", which need git regardless of language. node:22-slim ships
+    no git, so without this layer codex burns the run reinventing it (Dulwich).
+    git lives in the base layer, before the PROJECT EXTENSION POINT, so a
+    Python project (python=True) and a non-Python one (python=False) both get
+    it, and it is installed as root before the image drops to USER node.
+    """
+    if python:
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    scaffold_fixture(tmp_path, sandbox="docker")
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+
+    # git is installed as root, before the image drops to the non-root node user.
+    git_at = dockerfile.index("install -y --no-install-recommends ca-certificates git")
+    assert git_at < dockerfile.index("USER node")
+    # It lives in the base, before the extension point -- not in a stack block.
+    assert git_at < dockerfile.index("# --- PROJECT EXTENSION POINT")
+
+
 # --------------------------------------------------------------------------- #
 # Python-aware Dockerfile: the agent image carries the gate toolchain (#19)     #
 # --------------------------------------------------------------------------- #

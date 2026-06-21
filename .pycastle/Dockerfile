@@ -14,9 +14,12 @@ FROM node:22-slim
 # Codex's Rust TLS stack verifies certificates against the system trust store,
 # which node:22-slim ships empty. Install ca-certificates as root so codex can
 # reach auth.openai.com; the Node-based Claude CLI bundles its own roots and is
-# unaffected.
+# unaffected. git is installed here too: the implement/review prompts tell the
+# agent to commit and to read "the diff produced so far", which need git
+# regardless of language, so it belongs in the base image, not a stack-specific
+# extension point.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the agent CLIs your runtime needs. Pin versions to taste.
