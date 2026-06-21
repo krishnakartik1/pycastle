@@ -66,27 +66,32 @@ def _git_aware_runner(
     return MagicMock(side_effect=side_effect)
 
 
-def test_thinking_sink_appends_phase_prefixed_lines_to_run_dir(
+def test_transcript_sink_interleaves_tagged_lines(
     fixture_dir: Path,
 ) -> None:
-    # The per-issue sink writes each thinking chunk, prefixed with its phase, to
-    # .pycastle/runs/<run_id>/issue-<n>-thinking.log beside the telemetry/log.
-    sink = orchestrator._thinking_sink(fixture_dir, "20260613-101500", 7)
-    sink("implement", "first thought")
-    sink("review", "second thought")
+    # The per-issue sink writes each chunk, tagged with its stream and prefixed
+    # with its phase, to one .pycastle/runs/<run_id>/issue-<n>-transcript.log, so
+    # THINKING and OUTPUT interleave in chronological (append) order in one file.
+    sink = orchestrator._transcript_sink(fixture_dir, "20260613-101500", 7)
+    sink("implement", "THINKING", "first thought")
+    sink("implement", "OUTPUT", "did the thing")
 
-    path = fixture_dir / "runs" / "20260613-101500" / "issue-7-thinking.log"
+    path = fixture_dir / "runs" / "20260613-101500" / "issue-7-transcript.log"
     assert path.is_file()
     contents = path.read_text()
-    assert "[implement] first thought" in contents
-    assert "[review] second thought" in contents
+    assert "[implement] [THINKING] first thought" in contents
+    assert "[implement] [OUTPUT] did the thing" in contents
+    assert contents.index("[THINKING] first thought") < contents.index(
+        "[OUTPUT] did the thing"
+    )
 
 
-def test_verbose_run_binds_a_per_issue_thinking_sink(
+def test_verbose_run_binds_a_per_issue_transcript_sink(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
-    # A verbose run binds the runtime's thinking_sink before working each issue so
-    # the runtime can persist thinking to that issue's log without knowing run_id.
+    # A verbose run binds the runtime's transcript_sink before working each issue
+    # so the runtime can persist its transcript to that issue's log without
+    # knowing run_id.
     issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
     source = MagicMock()
     source.list_ready.return_value = [issue]
@@ -108,19 +113,19 @@ def test_verbose_run_binds_a_per_issue_thinking_sink(
         verbose=True,
     )
 
-    # The runtime now carries a sink bound to issue #2's thinking log.
-    assert runtime.thinking_sink is not None
-    runtime.thinking_sink("implement", "bound thought")
-    path = fixture_dir / "runs" / "20260613-101500" / "issue-2-thinking.log"
+    # The runtime now carries a sink bound to issue #2's transcript log.
+    assert runtime.transcript_sink is not None
+    runtime.transcript_sink("implement", "OUTPUT", "bound output")
+    path = fixture_dir / "runs" / "20260613-101500" / "issue-2-transcript.log"
     assert path.is_file()
-    assert "bound thought" in path.read_text()
+    assert "bound output" in path.read_text()
 
 
-def test_non_verbose_run_does_not_bind_a_thinking_sink(
+def test_non_verbose_run_does_not_bind_a_transcript_sink(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
-    # Without verbose, no sink is bound, so the runtime's thinking_sink stays None
-    # and no thinking log is written — behaviour unchanged.
+    # Without verbose, no sink is bound, so the runtime's transcript_sink stays
+    # None and no transcript log is written — behaviour unchanged.
     issue = IssueRef(number=2, title="Walking skeleton", assignees=["krishna"])
     source = MagicMock()
     source.list_ready.return_value = [issue]
@@ -141,9 +146,9 @@ def test_non_verbose_run_does_not_bind_a_thinking_sink(
         runner=runner,
     )
 
-    assert getattr(runtime, "thinking_sink", None) is None
+    assert getattr(runtime, "transcript_sink", None) is None
     assert not (
-        fixture_dir / "runs" / "20260613-101500" / "issue-2-thinking.log"
+        fixture_dir / "runs" / "20260613-101500" / "issue-2-transcript.log"
     ).is_file()
 
 
