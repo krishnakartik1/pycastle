@@ -509,6 +509,27 @@ def test_scaffolded_gate_text_has_counter_and_fail_branch(tmp_path: Path) -> Non
     assert "exit 1" in text
 
 
+def test_scaffolded_gate_fail_message_names_both_sandboxes(tmp_path: Path) -> None:
+    """The fail-loud remediation covers host (PATH/venv) and docker (#58).
+
+    The gate can't tell whether it runs on the host or in the Docker sandbox, so a
+    Docker-only remediation misleads host users (whose fix is to put the toolchain
+    on PATH / activate the venv). The message must name both contexts while keeping
+    the 'verified nothing' line and the Dockerfile extension point intact.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    text = (tmp_path / ".pycastle" / "gate").read_text()
+
+    # Unchanged fail-loud markers (depended on by the negative-gate check).
+    assert "verified nothing" in text
+    # Host remediation: install on PATH / activate the project venv.
+    assert "PATH" in text
+    assert "venv" in text
+    # Docker remediation still points at the Dockerfile extension point.
+    assert ".pycastle/Dockerfile" in text
+    assert "PROJECT EXTENSION POINT" in text
+
+
 # --------------------------------------------------------------------------- #
 # Every scaffolded file is non-empty                                           #
 # --------------------------------------------------------------------------- #
