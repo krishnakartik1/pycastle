@@ -204,7 +204,9 @@ run_if_available pytest -q
 if [ "$ran" -eq 0 ]; then
   echo "ERROR: no gate tools were available, so this gate verified nothing." >&2
   echo "Missing: ${missing[*]}" >&2
-  echo "Add the gate toolchain to .pycastle/Dockerfile (the PROJECT EXTENSION POINT)." >&2
+  echo "No gate tools found on PATH. Install ruff/black/pytest where the gate runs:" >&2
+  echo "  - host sandbox: install them into your environment / activate your project venv" >&2
+  echo "  - docker sandbox: add them to .pycastle/Dockerfile (the PROJECT EXTENSION POINT)" >&2
   exit 1
 fi
 """
