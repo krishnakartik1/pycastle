@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pycastle import cli, orchestrator
+from pycastle import cli, orchestrator, sandbox
 from pycastle.cli import main
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import AgentCrashError
@@ -74,11 +74,18 @@ class _RecordingRuntime:
 
 
 def _gate(*results: bool) -> MagicMock:
-    """A gate check that returns ``results`` in order, then ``True`` forever."""
+    """A gate check returning ``GateOutcome``s for ``results``, then pass forever.
+
+    Each ``results`` entry is the ``passed`` verdict; the remaining calls pass.
+    A failing outcome carries a little output so the surfacing path has text.
+    """
     seq = list(results)
 
-    def side_effect(_cwd: Path) -> bool:
-        return seq.pop(0) if seq else True
+    def side_effect(_cwd: Path) -> orchestrator.GateOutcome:
+        passed = seq.pop(0) if seq else True
+        return orchestrator.GateOutcome(
+            passed=passed, output="" if passed else "gates red\n"
+        )
 
     return MagicMock(side_effect=side_effect)
 
@@ -630,8 +637,10 @@ def test_prior_attempt_block_carries_the_failing_gate_info(
     retry_prompt = [c for c in runtime.calls if c["phase"] == "implement"][1]["prompt"]
     assert "## Previous Attempt" in retry_prompt
     assert HANDOFF_REL in retry_prompt
-    # The failing-gate output reaches the next attempt's prompt verbatim.
-    assert "quality gates reported a failure" in retry_prompt
+    # The gate's REAL captured output reaches the next attempt's prompt verbatim
+    # (the static "quality gates reported a failure" string is only a fallback for
+    # a gate that produced no output) (#28).
+    assert "gates red" in retry_prompt
     assert "Fix the failing gates before finishing." in retry_prompt
 
 
@@ -969,7 +978,7 @@ def test_gate_that_cannot_be_executed_is_a_failure_not_a_crash(
     )
 
     # No exception escapes; the unlaunchable gate is reported as failing.
-    assert gate_check(tmp_path) is False
+    assert gate_check(tmp_path).passed is False
 
 
 def test_unexecutable_fixture_gate_marks_for_human_not_crash_the_run(
@@ -1052,6 +1061,286 @@ def test_fixture_gate_path_is_resolved_absolute_regardless_of_cwd(
 
     worktree = tmp_path / "elsewhere"
     worktree.mkdir()
-    assert gate_check(worktree) is True
+    assert gate_check(worktree).passed is True
     # The runner saw the absolute gate path, not a path relative to the worktree.
     assert captured["argv"] == [abs_gate]
+
+
+# --------------------------------------------------------------------------- #
+# Gate runs where the phases run: in-container under --sandbox docker (#28).    #
+# --------------------------------------------------------------------------- #
+
+
+def test_docker_gate_wraps_canonical_gate_through_build_run_command(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """The docker gate wraps the CANONICAL gate through ``build_run_command``.
+
+    Under ``--sandbox docker`` the gate must run inside the same agent image as
+    the phases, via the same wrapper the runtime uses: the resolved image, the
+    issue worktree as ``-w``, the repo root bind-mounted at its own path (the #50
+    contract), the runtime's auth mount reused as-is, and the inner argv running
+    ``bash`` on the repo-root gate — NOT the worktree's copy, so an attempt cannot
+    weaken its own gate.
+    """
+    _write_gate(fixture_dir)
+    repo_root = tmp_path
+    worktree = tmp_path / "wt" / "issue-9"
+    worktree.mkdir(parents=True)
+
+    captured: dict[str, object] = {}
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+
+    gate_check = orchestrator.make_fixture_gate_check(
+        fixture_dir,
+        runner=runner,
+        sandbox="docker",
+        image="img:tag",
+        runtime_name="claude",
+        workspace=repo_root,
+    )
+    assert gate_check(worktree).passed is True
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert "img:tag" in argv
+    # -w is the issue worktree: the gate gets the same cwd it has on the host.
+    assert argv[argv.index("-w") + 1] == str(worktree.resolve())
+    # The repo root is mounted at its own path (mount = workspace, not worktree).
+    assert f"{repo_root.resolve()}:{repo_root.resolve()}" in argv
+    # The runtime's auth mount is reused verbatim (inert for the gate).
+    assert f"{sandbox.auth_volume('claude')}:{sandbox.CLAUDE_CONFIG_DIR}" in argv
+    # The inner argv runs bash on the CANONICAL repo-root gate, absolute.
+    canonical = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+    assert argv[-2:] == ["bash", canonical]
+    # And NOT the worktree's own copy of the gate.
+    assert canonical != str((worktree / orchestrator.FIXTURE_GATE).resolve())
+
+
+def test_docker_gate_returns_outcome_with_captured_output(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """The docker gate carries the captured stdout+stderr back in the outcome."""
+    _write_gate(fixture_dir)
+    worktree = tmp_path / "wt" / "issue-1"
+    worktree.mkdir(parents=True)
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=argv, returncode=1, stdout="boom\n", stderr="err\n"
+        )
+
+    gate_check = orchestrator.make_fixture_gate_check(
+        fixture_dir,
+        runner=runner,
+        sandbox="docker",
+        image="img:tag",
+        runtime_name="claude",
+        workspace=tmp_path,
+    )
+    outcome = gate_check(worktree)
+    assert outcome.passed is False
+    assert "boom" in outcome.output
+    assert "err" in outcome.output
+
+
+def test_host_gate_unchanged(fixture_dir: Path, tmp_path: Path) -> None:
+    """The host gate is byte-for-byte unchanged: bare argv, cwd=worktree, no docker."""
+    _write_gate(fixture_dir)
+    abs_gate = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+    worktree = tmp_path / "wt" / "issue-1"
+    worktree.mkdir(parents=True)
+
+    captured: dict[str, object] = {}
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+    assert gate_check(worktree).passed is True
+    assert captured["argv"] == [abs_gate]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["cwd"] == worktree
+    assert "docker" not in captured["argv"]
+
+
+def test_docker_gate_oserror_is_failing_outcome(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A docker gate whose ``docker run`` cannot be spawned is a failing outcome."""
+    _write_gate(fixture_dir)
+    worktree = tmp_path / "wt" / "issue-1"
+    worktree.mkdir(parents=True)
+
+    def runner(argv: list[str], **_kwargs: object) -> object:
+        raise OSError("docker not found")
+
+    gate_check = orchestrator.make_fixture_gate_check(
+        fixture_dir,
+        runner=runner,
+        sandbox="docker",
+        image="img:tag",
+        runtime_name="claude",
+        workspace=tmp_path,
+    )
+    outcome = gate_check(worktree)
+    assert outcome.passed is False
+    assert outcome.output
+
+
+# --------------------------------------------------------------------------- #
+# Surface gate output into the per-issue transcript (#28).                      #
+# --------------------------------------------------------------------------- #
+
+
+def _gating_runner_with_output(fixture_dir: Path, code: int, output: str) -> MagicMock:
+    """A git-aware runner whose gate returns a fixed exit code and stdout."""
+    gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv == [gate_path]:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=code, stdout=output
+            )
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def _transcript_path(fixture_dir: Path, run_id: str, issue_number: int) -> Path:
+    return fixture_dir / "runs" / run_id / f"issue-{issue_number}-transcript.log"
+
+
+def test_gate_output_surfaced_on_failure_without_verbose(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A failing gate surfaces its output ALWAYS, even with verbose off (#28)."""
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=4, title="Red gate", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    # Gate fails once (with output) then passes, so the run still merges.
+    gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
+    codes = [1, 0]
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv == [gate_path]:
+            code = codes.pop(0) if codes else 0
+            return subprocess.CompletedProcess(
+                args=argv, returncode=code, stdout="lint broke\n" if code else ""
+            )
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        if argv[:3] == ["git", "diff", "--quiet"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        return _ok()
+
+    runner = MagicMock(side_effect=side_effect)
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        verbose=False,
+    )
+
+    transcript = _transcript_path(fixture_dir, "20260613-101500", 4)
+    assert transcript.is_file()
+    assert "[gate] [GATE] lint broke" in transcript.read_text()
+
+
+def test_gate_output_not_surfaced_on_success_without_verbose(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A passing gate is NOT surfaced unless --verbose (#28)."""
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=6, title="Green gate", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    runner = _gating_runner_with_output(fixture_dir, 0, "all good\n")
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        verbose=False,
+    )
+
+    transcript = _transcript_path(fixture_dir, "20260613-101500", 6)
+    # No transcript line tagged GATE: a green gate stays silent without verbose.
+    assert not transcript.is_file() or "[GATE]" not in transcript.read_text()
+
+
+def test_gate_output_surfaced_on_success_under_verbose(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A passing gate IS surfaced under --verbose (#28)."""
+    _write_gate(fixture_dir)
+    issue = IssueRef(number=8, title="Green verbose", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _RecordingRuntime()
+    runner = _gating_runner_with_output(fixture_dir, 0, "all green\n")
+    gate_check = orchestrator.make_fixture_gate_check(fixture_dir, runner=runner)
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        impl_retries=2,
+        gate_check=gate_check,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        verbose=True,
+    )
+
+    transcript = _transcript_path(fixture_dir, "20260613-101500", 8)
+    assert transcript.is_file()
+    assert "[gate] [GATE] all green" in transcript.read_text()

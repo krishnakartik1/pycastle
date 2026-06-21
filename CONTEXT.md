@@ -68,8 +68,9 @@ default tag (see ADR-0005).
 _Avoid_: container, box, sandbox image.
 
 **Image contract**:
-What any agent image must satisfy to be runnable: the runtime CLI on PATH, a
-`node` user with home `/home/node`, write access to the mounted auth volume and
+What any agent image must satisfy to be runnable: the runtime CLI on PATH, the
+project's gate toolchain on PATH (the gate runs in this image, not on the host),
+a `node` user with home `/home/node`, write access to the mounted auth volume and
 the bind-mounted workspace, and honoring the runtime's config-dir env var. The
 scaffolded Dockerfile is one adapter that satisfies it.
 _Avoid_: requirements, spec.
@@ -91,9 +92,12 @@ _Avoid_: credentials mount, secret.
 ## Example
 
 > **Dev:** The Docker run can't find pytest in the container.
-> **Maintainer:** Right — the **gate** runs on the host, not in the **agent
-> image**. The image only has to satisfy the **image contract**: the **runtime**
-> CLI and a `node` user. The toolchain is the project's to add to its Dockerfile.
+> **Maintainer:** Right — in a `docker` sandbox the **gate** runs *inside* the
+> **agent image**, same as the phases, so the image must carry the project's
+> toolchain. That's part of the **image contract** now; add pytest to your
+> Dockerfile. If the gate runs and finds no tools at all, it fails loudly rather
+> than passing silently.
 > **Dev:** So if I bring my own image with `--image`?
 > **Maintainer:** Then PyCastle runs it as-is and never builds the Dockerfile —
-> but it still has to meet the contract, including the `node` user.
+> but it still has to meet the contract: the `node` user, the **runtime** CLI,
+> and your gate toolchain.

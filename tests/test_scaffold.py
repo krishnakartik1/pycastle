@@ -316,14 +316,14 @@ def test_scaffolded_gate_mode_is_exactly_0755(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not on PATH")
-def test_scaffolded_gate_passes_in_a_fresh_repo_with_no_tooling(tmp_path: Path) -> None:
-    """The default gate exits 0 in a brand-new repo before any tools are added.
+def test_scaffolded_gate_fails_when_no_tools_present(tmp_path: Path) -> None:
+    """The default gate FAILS LOUD when zero gate tools are available (#28).
 
-    Each step is guarded by ``command -v``, so a missing ruff/black/pytest is
-    skipped rather than failing. This keeps the #14 retry-with-handoff path
-    reachable (the gate is real and runnable) without an empty project's first
-    run spuriously failing its own gate. We run it with a minimal PATH that has
-    bash and coreutils but none of the Python tools.
+    A toolchain-less image would let every ``command -v`` guard skip, leaving the
+    gate verifying nothing and exiting 0 -- a vacuous green that ships unverified
+    code. The fail-if-zero rule turns that into a non-zero exit naming the missing
+    tools and pointing at the Dockerfile extension point. We run with a PATH that
+    has bash + coreutils but none of ruff/black/pytest.
     """
     scaffold_fixture(tmp_path, sandbox="host")
     gate = tmp_path / ".pycastle" / "gate"
@@ -338,9 +338,59 @@ def test_scaffolded_gate_passes_in_a_fresh_repo_with_no_tooling(tmp_path: Path) 
         env=env,
     )
 
+    assert proc.returncode != 0
+    # The failure names the missing tools and the Dockerfile extension point.
+    assert "verified nothing" in proc.stderr
+    assert "ruff" in proc.stderr
+    assert ".pycastle/Dockerfile" in proc.stderr
+
+
+def test_scaffolded_gate_passes_when_at_least_one_tool_present(
+    tmp_path: Path,
+) -> None:
+    """A partially-equipped image still PASSES on the checks it can run (#28).
+
+    Fail-if-zero is NOT fail-if-any-missing: with ruff present but black/pytest
+    absent, the gate runs ruff (which passes here) and exits 0. We put a fake
+    ``ruff`` (a no-op script) on a scrubbed PATH alongside bash/coreutils.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    gate = tmp_path / ".pycastle" / "gate"
+
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    fake_ruff = bindir / "ruff"
+    fake_ruff.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_ruff.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:/usr/bin:/bin"  # ruff present; black/pytest absent
+    proc = subprocess.run(
+        [str(gate)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
     assert proc.returncode == 0, proc.stderr
-    # The absent tools are skipped, not run, so the empty repo passes its gate.
+    # black/pytest were skipped, but ruff ran, so the gate is non-vacuous.
     assert "skipping gate step" in proc.stdout
+
+
+def test_scaffolded_gate_text_has_counter_and_fail_branch(tmp_path: Path) -> None:
+    """The gate template carries the fail-if-zero counter and exit branch (#28).
+
+    A lightweight guard against template regressions without spawning bash: the
+    scaffolded gate must count steps that ran and fail loud when none did.
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    text = (tmp_path / ".pycastle" / "gate").read_text()
+    assert "ran=0" in text
+    assert "ran=$((ran + 1))" in text
+    assert 'if [ "$ran" -eq 0 ]; then' in text
+    assert "verified nothing" in text
+    assert "exit 1" in text
 
 
 # --------------------------------------------------------------------------- #

@@ -175,15 +175,24 @@ _GATE = """\
 # edit it to define what "passing" means for your repo (linters, formatters,
 # type checkers, your test suite -- whatever a green build requires here).
 #
-# The default below runs ruff/black/pytest when they are available and skips a
-# tool that is not installed, so a fresh scaffolded repo passes its gate before
-# you have added your own checks. Replace these with your real gate commands.
+# The default below runs ruff/black/pytest. Each step runs only when its tool is
+# installed; a partially-equipped image (say ruff present, pytest absent) still
+# PASSES on the checks it CAN run. But if ZERO tools are present the gate has
+# verified nothing, so it FAILS LOUD rather than reporting a vacuous green --
+# add the gate toolchain to the project Dockerfile (.pycastle/Dockerfile) so the
+# image the gate runs in actually carries ruff/black/pytest. Replace these with
+# your real gate commands.
 set -euo pipefail
+
+ran=0
+missing=()
 
 run_if_available() {
   if command -v "$1" >/dev/null 2>&1; then
+    ran=$((ran + 1))
     "$@"
   else
+    missing+=("$1")
     echo "skipping gate step (not installed): $1"
   fi
 }
@@ -191,6 +200,13 @@ run_if_available() {
 run_if_available ruff check . --exit-non-zero-on-fix
 run_if_available black --check .
 run_if_available pytest -q
+
+if [ "$ran" -eq 0 ]; then
+  echo "ERROR: no gate tools were available, so this gate verified nothing." >&2
+  echo "Missing: ${missing[*]}" >&2
+  echo "Add the gate toolchain to .pycastle/Dockerfile (the PROJECT EXTENSION POINT)." >&2
+  exit 1
+fi
 """
 
 # The agent image the project extends with its own language dependencies (#4).
