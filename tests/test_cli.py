@@ -24,7 +24,8 @@ def test_parses_run_arguments() -> None:
 
 
 def test_run_verbose_flag_parses() -> None:
-    # --verbose (and its -v alias) turns on thinking-trace capture; default off.
+    # --verbose (and its -v alias) turns on transcript capture (thinking +
+    # output); default off.
     assert build_parser().parse_args(["run", "--verbose"]).verbose is True
     assert build_parser().parse_args(["run", "-v"]).verbose is True
     assert build_parser().parse_args(["run"]).verbose is False

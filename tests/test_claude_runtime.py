@@ -492,19 +492,53 @@ def test_verbose_surfaces_thinking_live(
     assert result.output == "Implemented the feature."
 
 
+def test_verbose_surfaces_output_live(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # With --verbose on, the text block is also surfaced as an [OUTPUT:<phase>]
+    # line so a reader sees what the model did; the returned output still equals
+    # only the text block (surfacing is additive, never folded into handoff).
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+
+    assert "[OUTPUT:implement] Implemented the feature." in caplog.text
+    assert result.output == "Implemented the feature."
+
+
 def test_verbose_persists_thinking_to_sink(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:
-    # The thinking sink (which the orchestrator binds to the run dir) receives
-    # each thinking chunk as (phase, text) so a finished run is auditable.
+    # The transcript sink (which the orchestrator binds to the run dir) receives
+    # each thinking chunk as (phase, tag, text) so a finished run is auditable.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, str]] = []
 
     ClaudeRuntime(
-        verbose=True, thinking_sink=lambda phase, text: captured.append((phase, text))
+        verbose=True,
+        transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text)),
     ).run("p", cwd=tmp_path, phase="implement")
 
-    assert ("implement", "planning the change") in captured
+    assert ("implement", "THINKING", "planning the change") in captured
+
+
+def test_verbose_persists_output_to_sink(mock_popen: MagicMock, tmp_path: Path) -> None:
+    # The text block is also persisted to the sink, tagged OUTPUT, and — because
+    # the fixture orders thinking before text — it lands after the THINKING chunk,
+    # proving the single sink interleaves both streams in chronological order.
+    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
+    captured: list[tuple[str, str, str]] = []
+
+    ClaudeRuntime(
+        verbose=True,
+        transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text)),
+    ).run("p", cwd=tmp_path, phase="implement")
+
+    assert ("implement", "OUTPUT", "Implemented the feature.") in captured
+    thinking_idx = captured.index(("implement", "THINKING", "planning the change"))
+    output_idx = captured.index(("implement", "OUTPUT", "Implemented the feature."))
+    assert thinking_idx < output_idx
 
 
 def test_verbose_surfaces_thinking_delta_fallback(
@@ -528,33 +562,58 @@ def test_verbose_surfaces_thinking_delta_fallback(
     assert "[THINKING:plan] delta reasoning" in caplog.text
 
 
-def test_non_verbose_drops_thinking(
+def test_verbose_surfaces_text_delta_fallback(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # The behaviour-unchanged guard: without --verbose, thinking is dropped
-    # exactly as before — no [THINKING:...] log line and the sink is never called.
+    # The OUTPUT side of the SSE-style fallback: a content_block_delta with a
+    # text_delta is surfaced AND appended to output_buf, so a delta-only stream
+    # still yields handoff output (matching Ralph's run.py).
+    events = [
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "delta out"},
+        },
+        {"type": "result", "result": "done", "is_error": False, "num_turns": 1},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="plan")
+
+    assert "[OUTPUT:plan] delta out" in caplog.text
+    assert result.output == "delta out"
+
+
+def test_non_verbose_drops_thinking_and_output_surfacing(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The behaviour-unchanged guard: without --verbose, neither thinking nor
+    # output is surfaced — no [THINKING:...]/[OUTPUT:...] log line, the sink is
+    # never called — but the output is still computed for handoff.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, str]] = []
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = ClaudeRuntime(
-            thinking_sink=lambda phase, text: captured.append((phase, text))
+            transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text))
         ).run("p", cwd=tmp_path, phase="implement")
 
     assert "[THINKING:" not in caplog.text
+    assert "[OUTPUT:" not in caplog.text
     assert captured == []
     assert result.output == "Implemented the feature."
 
 
 def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # in_docker forwards verbose and the sink onto the constructed runtime so a
-    # docker run captures thinking just like the host path.
+    # docker run captures the transcript just like the host path.
     sink = MagicMock()
     runtime = ClaudeRuntime.in_docker(
-        workspace=tmp_path, verbose=True, thinking_sink=sink
+        workspace=tmp_path, verbose=True, transcript_sink=sink
     )
     assert runtime.verbose is True
-    assert runtime.thinking_sink is sink
+    assert runtime.transcript_sink is sink
 
 
 def test_run_works_one_issue_end_to_end_via_claude(

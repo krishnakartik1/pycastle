@@ -622,17 +622,46 @@ def test_verbose_surfaces_codex_reasoning_when_emitted(
         {"type": "turn.completed", "usage": {}},
     ]
     mock_popen.return_value = _fake_proc(events)
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, str]] = []
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(
             verbose=True,
-            thinking_sink=lambda phase, text: captured.append((phase, text)),
+            transcript_sink=lambda phase, tag, text: captured.append(
+                (phase, tag, text)
+            ),
         ).run("p", cwd=tmp_path, phase="implement")
 
     assert "[THINKING:implement] weighing the approach" in caplog.text
-    assert ("implement", "weighing the approach") in captured
+    assert ("implement", "THINKING", "weighing the approach") in captured
     # Reasoning never folds into output; only agent_message prose does.
+    assert result.output == "done"
+
+
+def test_verbose_surfaces_codex_agent_message_output(
+    mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The headline thinking-less case: a codex run with only an agent_message (no
+    # reasoning item) is still legible under --verbose because the prose narration
+    # is surfaced as an [OUTPUT:<phase>] line and persisted to the sink.
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    mock_popen.return_value = _fake_proc(events)
+    captured: list[tuple[str, str, str]] = []
+
+    with caplog.at_level("INFO", logger="pycastle.runtime"):
+        result = CodexRuntime(
+            verbose=True,
+            transcript_sink=lambda phase, tag, text: captured.append(
+                (phase, tag, text)
+            ),
+        ).run("p", cwd=tmp_path, phase="implement")
+
+    assert "[OUTPUT:implement] done" in caplog.text
+    assert ("implement", "OUTPUT", "done") in captured
     assert result.output == "done"
 
 
@@ -640,13 +669,15 @@ def test_verbose_logs_unavailable_when_no_codex_reasoning(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # When codex emits no reasoning item, --verbose logs once that reasoning text
-    # is unavailable; output and telemetry are unchanged from the non-verbose run.
+    # is unavailable; the agent_message still produces an [OUTPUT:<phase>] line so
+    # the run stays legible, and output and telemetry are unchanged.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
 
     assert "codex reasoning text is unavailable" in caplog.text
+    assert "[OUTPUT:implement] implemented" in caplog.text
     assert result.output == "implemented"
     assert result.telemetry.num_turns == 1
 
@@ -666,14 +697,15 @@ def test_non_verbose_drops_codex_reasoning(
         {"type": "turn.completed", "usage": {}},
     ]
     mock_popen.return_value = _fake_proc(events)
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, str]] = []
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(
-            thinking_sink=lambda phase, text: captured.append((phase, text))
+            transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text))
         ).run("p", cwd=tmp_path, phase="implement")
 
     assert "[THINKING:" not in caplog.text
+    assert "[OUTPUT:" not in caplog.text
     assert "unavailable" not in caplog.text
     assert captured == []
     assert result.output == "done"
@@ -683,10 +715,10 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # in_docker forwards verbose and the sink onto the constructed codex runtime.
     sink = MagicMock()
     runtime = CodexRuntime.in_docker(
-        workspace=tmp_path, verbose=True, thinking_sink=sink
+        workspace=tmp_path, verbose=True, transcript_sink=sink
     )
     assert runtime.verbose is True
-    assert runtime.thinking_sink is sink
+    assert runtime.transcript_sink is sink
 
 
 def test_verbose_flattens_codex_reasoning_content_list(
@@ -711,16 +743,18 @@ def test_verbose_flattens_codex_reasoning_content_list(
         {"type": "turn.completed", "usage": {}},
     ]
     mock_popen.return_value = _fake_proc(events)
-    captured: list[tuple[str, str]] = []
+    captured: list[tuple[str, str, str]] = []
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         CodexRuntime(
             verbose=True,
-            thinking_sink=lambda phase, text: captured.append((phase, text)),
+            transcript_sink=lambda phase, tag, text: captured.append(
+                (phase, tag, text)
+            ),
         ).run("p", cwd=tmp_path, phase="implement")
 
     assert "[THINKING:implement] first part second part" in caplog.text
-    assert ("implement", "first part second part") in captured
+    assert ("implement", "THINKING", "first part second part") in captured
 
 
 def test_verbose_does_not_crash_on_malformed_reasoning_type(

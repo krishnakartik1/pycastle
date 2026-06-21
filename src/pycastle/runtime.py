@@ -101,7 +101,7 @@ class ClaudeRuntime:
         dangerously_skip_permissions: bool = False,
         argv_wrapper: Callable[[list[str], Path], list[str]] | None = None,
         verbose: bool = False,
-        thinking_sink: Callable[[str, str], None] | None = None,
+        transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> None:
         """Configure the CLI invocation shared across phases.
 
@@ -110,12 +110,15 @@ class ClaudeRuntime:
         run ``cwd`` so a Docker wrapper can set the container ``-w`` to the cwd
         (the issue worktree) rather than the fixed workspace root.
 
-        ``verbose`` turns on thinking-trace capture (off by default, it is
-        high-volume): each ``thinking`` block in the stream is surfaced as a
-        ``[THINKING:<phase>]`` log line and, when ``thinking_sink`` is set, handed
-        to it as ``(phase, text)`` so a run can persist it. The sink keeps the
-        runtime ignorant of the run directory — the orchestrator binds it per
-        issue — so the :class:`Runtime` ``run`` signature stays unchanged.
+        ``verbose`` turns on transcript capture (off by default, it is
+        high-volume): each ``thinking`` block is surfaced as a
+        ``[THINKING:<phase>]`` log line and each ``text`` block as an
+        ``[OUTPUT:<phase>]`` line, so a verbose run shows what the model did even
+        when a phase emits no thinking (#52). When ``transcript_sink`` is set each
+        chunk is also handed to it as ``(phase, tag, text)`` so a run can persist
+        both streams interleaved. The sink keeps the runtime ignorant of the run
+        directory — the orchestrator binds it per issue — so the
+        :class:`Runtime` ``run`` signature stays unchanged.
         """
         self.command = command
         self.model = model
@@ -123,7 +126,7 @@ class ClaudeRuntime:
         self.dangerously_skip_permissions = dangerously_skip_permissions
         self.argv_wrapper = argv_wrapper
         self.verbose = verbose
-        self.thinking_sink = thinking_sink
+        self.transcript_sink = transcript_sink
 
     @classmethod
     def in_docker(
@@ -135,7 +138,7 @@ class ClaudeRuntime:
         max_turns: int | None = None,
         dangerously_skip_permissions: bool = True,
         verbose: bool = False,
-        thinking_sink: Callable[[str, str], None] | None = None,
+        transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> ClaudeRuntime:
         """Build a Claude runtime that runs each phase inside the Docker sandbox.
 
@@ -172,7 +175,7 @@ class ClaudeRuntime:
             dangerously_skip_permissions=dangerously_skip_permissions,
             argv_wrapper=wrap,
             verbose=verbose,
-            thinking_sink=thinking_sink,
+            transcript_sink=transcript_sink,
         )
 
     def build_command(self, prompt: str) -> list[str]:
@@ -218,7 +221,10 @@ class ClaudeRuntime:
         output_buf: list[str] = []
         result_info: dict[str, Any] | None = None
         result_text = ""
-        emit_thinking = self._make_thinking_emitter(phase)
+        emit_thinking = _make_emitter(
+            "THINKING", phase, self.verbose, self.transcript_sink
+        )
+        emit_output = _make_emitter("OUTPUT", phase, self.verbose, self.transcript_sink)
 
         try:
             assert proc.stdout is not None
@@ -231,7 +237,12 @@ class ClaudeRuntime:
                 except json.JSONDecodeError:
                     continue
 
-                _collect_assistant_text(event, output_buf, on_thinking=emit_thinking)
+                _collect_assistant_text(
+                    event,
+                    output_buf,
+                    on_thinking=emit_thinking,
+                    on_output=emit_output,
+                )
 
                 if event.get("type") == "result":
                     result_text = event.get("result", "")
@@ -259,28 +270,21 @@ class ClaudeRuntime:
         telemetry = _build_telemetry(self.name, phase, result_info)
         return RuntimeResult(output=output, telemetry=telemetry)
 
-    def _make_thinking_emitter(self, phase: str) -> Callable[[str], None] | None:
-        """Return a callback that surfaces a thinking chunk, or ``None`` if off.
 
-        When :attr:`verbose` is set the callback logs each chunk as a
-        ``[THINKING:<phase>]`` line and, if a :attr:`thinking_sink` is bound,
-        hands it ``(phase, text)`` to persist. When ``verbose`` is off it returns
-        ``None`` so the stream parser drops thinking exactly as before.
-        """
-        return _make_thinking_emitter(phase, self.verbose, self.thinking_sink)
-
-
-def _make_thinking_emitter(
+def _make_emitter(
+    tag: str,
     phase: str,
     verbose: bool,
-    thinking_sink: Callable[[str, str], None] | None,
+    sink: Callable[[str, str, str], None] | None,
 ) -> Callable[[str], None] | None:
-    """Build the thinking-emitter both runtimes share, or ``None`` when off.
+    """Build a tagged live+persist emitter, or ``None`` when not verbose.
 
-    The emitter is the only place a thinking chunk has a side effect: it logs the
-    ``[THINKING:<phase>]`` line (live surfacing) and forwards to the sink (run-dir
-    persistence). Returning ``None`` when ``verbose`` is off lets the stream
-    parsers skip thinking with no per-event flag check.
+    ``tag`` is ``"THINKING"`` or ``"OUTPUT"``. The emitter is the single place a
+    chunk has a side effect: it logs the ``[<tag>:<phase>]`` line (live surfacing,
+    symmetric across both streams) and forwards ``(phase, tag, text)`` to the sink
+    (run-dir persistence). Returning ``None`` when ``verbose`` is off lets the
+    stream parsers skip the chunk with no per-event flag check, so non-verbose
+    behaviour is byte-for-byte unchanged.
     """
     if not verbose:
         return None
@@ -288,9 +292,9 @@ def _make_thinking_emitter(
     def emit(text: str) -> None:
         if not text:
             return
-        logger.info("[THINKING:%s] %s", phase, text)
-        if thinking_sink is not None:
-            thinking_sink(phase, text)
+        logger.info("[%s:%s] %s", tag, phase, text)
+        if sink is not None:
+            sink(phase, tag, text)
 
     return emit
 
@@ -300,14 +304,20 @@ def _collect_assistant_text(
     output_buf: list[str],
     *,
     on_thinking: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> None:
     """Append assistant ``text`` blocks from one stream-json event.
 
-    When ``on_thinking`` is given (verbose runs) it is also called with each
-    ``thinking`` block's text and, as a format-shift fallback mirroring Ralph,
-    with the ``thinking`` of any ``content_block_delta`` whose delta is a
-    ``thinking_delta``. With ``on_thinking`` ``None`` thinking is dropped, which
-    keeps non-verbose behaviour byte-for-byte unchanged.
+    ``text`` blocks always accumulate into ``output_buf`` (the handoff output);
+    on a verbose run they are *also* surfaced via ``on_output``, so a reader sees
+    what the model said even when the phase emitted no thinking (#52). When
+    ``on_thinking`` is given it is called with each ``thinking`` block's text.
+
+    As a format-shift fallback mirroring Ralph, a ``content_block_delta`` is
+    handled too: a ``thinking_delta`` routes to ``on_thinking``; a ``text_delta``
+    both appends to ``output_buf`` (so a delta-only stream still yields handoff
+    output) and routes to ``on_output``. A callback left ``None`` drops its
+    stream's surfacing, keeping non-verbose behaviour byte-for-byte unchanged.
     """
     event_type = event.get("type")
     if event_type == "assistant":
@@ -318,12 +328,20 @@ def _collect_assistant_text(
                 text = block.get("text", "")
                 if text:
                     output_buf.append(text)
+                    if on_output is not None:
+                        on_output(text)
             elif block_type == "thinking" and on_thinking is not None:
                 on_thinking(block.get("thinking", ""))
-    elif event_type == "content_block_delta" and on_thinking is not None:
+    elif event_type == "content_block_delta":
         delta = event.get("delta", {})
-        if delta.get("type") == "thinking_delta":
+        delta_type = delta.get("type")
+        if delta_type == "thinking_delta" and on_thinking is not None:
             on_thinking(delta.get("thinking", ""))
+        elif delta_type == "text_delta" and on_output is not None:
+            text = delta.get("text", "")
+            if text:
+                output_buf.append(text)
+                on_output(text)
 
 
 def _parse_result_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -424,7 +442,7 @@ class CodexRuntime:
         bypass_sandbox: bool = False,
         argv_wrapper: Callable[[list[str], Path], list[str]] | None = None,
         verbose: bool = False,
-        thinking_sink: Callable[[str, str], None] | None = None,
+        transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> None:
         """Configure the CLI invocation shared across phases.
 
@@ -432,19 +450,22 @@ class CodexRuntime:
         :data:`CODEX_HOST_SANDBOX`) for the full :data:`CODEX_DOCKER_BYPASS`;
         :meth:`in_docker` sets it so Codex can write inside the container.
 
-        ``verbose`` turns on thinking-trace capture: if Codex's stream emits a
-        reasoning item it is surfaced as a ``[THINKING:<phase>]`` line (and handed
-        to ``thinking_sink`` to persist), exactly like Claude thinking; when no
-        reasoning item appears the run logs once that codex reasoning text is
-        unavailable (the ``reasoning_output_tokens`` count still lands in
-        telemetry). Off by default.
+        ``verbose`` turns on transcript capture: each ``agent_message`` (the
+        model's prose narration) is surfaced as an ``[OUTPUT:<phase>]`` line so a
+        thinking-less codex run is still legible (#52), and if Codex's stream
+        emits a reasoning item it is surfaced as a ``[THINKING:<phase>]`` line,
+        exactly like Claude. Both are also handed to ``transcript_sink`` as
+        ``(phase, tag, text)`` to persist; when no reasoning item appears the run
+        logs once that codex reasoning text is unavailable (the
+        ``reasoning_output_tokens`` count still lands in telemetry). Off by
+        default.
         """
         self.command = command
         self.model = model
         self.bypass_sandbox = bypass_sandbox
         self.argv_wrapper = argv_wrapper
         self.verbose = verbose
-        self.thinking_sink = thinking_sink
+        self.transcript_sink = transcript_sink
 
     @classmethod
     def in_docker(
@@ -454,7 +475,7 @@ class CodexRuntime:
         image: str = sandbox.DEFAULT_IMAGE,
         model: str | None = None,
         verbose: bool = False,
-        thinking_sink: Callable[[str, str], None] | None = None,
+        transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> CodexRuntime:
         """Build a Codex runtime that runs each phase inside the Docker sandbox.
 
@@ -483,7 +504,7 @@ class CodexRuntime:
             bypass_sandbox=True,
             argv_wrapper=wrap,
             verbose=verbose,
-            thinking_sink=thinking_sink,
+            transcript_sink=transcript_sink,
         )
 
     def build_command(
@@ -568,7 +589,10 @@ class CodexRuntime:
         thread_id: str | None = None
         usage: dict[str, Any] = {}
         num_turns = 0
-        emit_thinking = _make_thinking_emitter(phase, self.verbose, self.thinking_sink)
+        emit_thinking = _make_emitter(
+            "THINKING", phase, self.verbose, self.transcript_sink
+        )
+        emit_output = _make_emitter("OUTPUT", phase, self.verbose, self.transcript_sink)
         saw_reasoning = False
 
         try:
@@ -587,7 +611,10 @@ class CodexRuntime:
                     thread_id = event.get("thread_id")
                 elif event_type == "item.completed":
                     if _collect_codex_item(
-                        event.get("item", {}), output_buf, on_thinking=emit_thinking
+                        event.get("item", {}),
+                        output_buf,
+                        on_thinking=emit_thinking,
+                        on_output=emit_output,
                     ):
                         saw_reasoning = True
                 elif event_type == "turn.completed":
@@ -642,13 +669,16 @@ def _collect_codex_item(
     output_buf: list[str],
     *,
     on_thinking: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> bool:
     """Append the text of an ``agent_message`` Codex item, ignoring the rest.
 
     Codex narrates tool runs and file changes as their own ``item.completed``
     events; only ``agent_message`` items are the model's prose output, so the
-    verbose command/file-change items are dropped. A malformed event whose
-    ``item`` is not a mapping contributes nothing rather than crashing the parse.
+    verbose command/file-change items are dropped. The ``agent_message`` text
+    always accumulates into ``output_buf`` (the handoff output); on a verbose run
+    it is *also* routed to ``on_output``, so a thinking-less codex run is still
+    legible from the streamed transcript alone (#52).
 
     When ``on_thinking`` is given (verbose runs) any reasoning item — matched
     defensively as a ``type`` containing ``"reasoning"`` — has its text routed to
@@ -666,6 +696,8 @@ def _collect_codex_item(
         text = item.get("text", "")
         if text:
             output_buf.append(text)
+            if on_output is not None:
+                on_output(text)
         return False
     if on_thinking is not None and "reasoning" in item_type:
         on_thinking(_codex_reasoning_text(item))

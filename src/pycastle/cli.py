@@ -225,13 +225,14 @@ def _build_runtime(
     on the host as before. The docker-vs-host choice is orthogonal to which
     runtime runs.
 
-    ``verbose`` turns on thinking-trace capture (#48). It is threaded into the
-    real Claude/Codex runtimes as a constructor attribute, so the ``Runtime.run``
-    signature stays unchanged. The per-issue thinking sink is bound later by the
-    orchestrator (which owns ``run_id`` and the issue number); here the runtime
-    is built only with ``verbose`` so live ``[THINKING:<phase>]`` surfacing turns
-    on. With ``verbose`` off the host path stays the bare :func:`make_runtime`
-    runtime, so nothing changes.
+    ``verbose`` turns on transcript capture (thinking + output, #48/#52). It is
+    threaded into the real Claude/Codex runtimes as a constructor attribute, so
+    the ``Runtime.run`` signature stays unchanged. The per-issue transcript sink
+    is bound later by the orchestrator (which owns ``run_id`` and the issue
+    number); here the runtime is built only with ``verbose`` so live
+    ``[THINKING:<phase>]`` and ``[OUTPUT:<phase>]`` surfacing turns on. With
+    ``verbose`` off the host path stays the bare :func:`make_runtime` runtime, so
+    nothing changes.
     """
     if sandbox_kind == "docker":
         if runtime_name == "claude":
