@@ -18,7 +18,14 @@ from pathlib import Path
 import pytest
 
 from pycastle.graph import DONE, PhaseGraph, load_graph
-from pycastle.scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
+from pycastle.scaffold import (
+    _DOCKERFILE,
+    _EXTENSION_EMPTY,
+    _EXTENSION_PYTHON,
+    FixtureExistsError,
+    read_sandbox,
+    scaffold_fixture,
+)
 
 # The files every scaffolded fixture carries, relative to the fixture dir.
 EXPECTED_TREE = {
@@ -287,6 +294,115 @@ def test_scaffolded_dockerfile_installs_ca_certificates(
     install_block_end = dockerfile.index("RUN npm install")
     block = dockerfile[ca_at:install_block_end]
     assert "rm -rf /var/lib/apt/lists/*" in block
+
+
+# --------------------------------------------------------------------------- #
+# Python-aware Dockerfile: the agent image carries the gate toolchain (#19)     #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_python_project_dockerfile_carries_the_gate_toolchain(
+    tmp_path: Path, choice: str
+) -> None:
+    """A pyproject.toml at scaffold time pre-fills the extension point (#19).
+
+    The Docker sandbox runs the quality gate INSIDE the agent image, and a
+    toolchain-less image makes a Python project's in-container gate fail loud
+    (#28). So a detected Python project gets python3 + ruff/black/pytest baked
+    into the PROJECT EXTENSION POINT. The Dockerfile is identical across the
+    sandbox choice, hence the parametrize.
+    """
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    scaffold_fixture(tmp_path, sandbox=choice)
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+
+    # python3 + pip are installed via apt, and the gate toolchain via pip.
+    assert (
+        "apt-get install -y --no-install-recommends python3 python3-pip" in dockerfile
+    )
+    assert (
+        "pip install --break-system-packages --no-cache-dir ruff black pytest"
+        in dockerfile
+    )
+    # The installs are root operations, so they land before the image drops to
+    # the non-root `node` user.
+    assert dockerfile.index("pip install --break-system-packages") < dockerfile.index(
+        "USER node"
+    )
+
+
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_python_dockerfile_keeps_the_shared_base_unchanged(
+    tmp_path: Path, choice: str
+) -> None:
+    """The Python Dockerfile changes only the extension block; the base holds."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    scaffold_fixture(tmp_path, sandbox=choice)
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+
+    # Everything outside the extension block is intact.
+    assert "FROM node:22-slim" in dockerfile
+    assert "ca-certificates" in dockerfile
+    assert "RUN npm install" in dockerfile
+    assert "mkdir -p /home/node/.claude /home/node/.codex" in dockerfile
+    assert "chown -R node:node /home/node/.claude /home/node/.codex" in dockerfile
+    assert "USER node" in dockerfile
+
+
+def test_non_python_project_dockerfile_is_byte_for_byte_unchanged(
+    tmp_path: Path,
+) -> None:
+    """No pyproject.toml -> today's Dockerfile, unchanged byte for byte (#19)."""
+    scaffold_fixture(tmp_path, sandbox="host")
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+    assert dockerfile == _DOCKERFILE
+
+
+def test_non_python_dockerfile_has_an_empty_extension_point(tmp_path: Path) -> None:
+    """A non-Python Dockerfile never accidentally fills the extension point."""
+    scaffold_fixture(tmp_path, sandbox="host")
+    dockerfile = (tmp_path / ".pycastle" / "Dockerfile").read_text()
+    # The example apt-get line in the empty block is commented out, so the real
+    # (uncommented) install RUN lines must be absent.
+    assert "pip install --break-system-packages" not in dockerfile
+    assert (
+        "apt-get install -y --no-install-recommends python3 python3-pip"
+        not in dockerfile
+    )
+
+
+def test_python_and_non_python_dockerfiles_differ_only_in_the_extension_block(
+    tmp_path: Path,
+) -> None:
+    """The two Dockerfiles differ only in the extension block (anti-drift)."""
+    py_dir = tmp_path / "py_repo"
+    nonpy_dir = tmp_path / "nonpy_repo"
+    py_dir.mkdir()
+    nonpy_dir.mkdir()
+    (py_dir / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+
+    scaffold_fixture(py_dir, sandbox="host")
+    scaffold_fixture(nonpy_dir, sandbox="host")
+
+    py = (py_dir / ".pycastle" / "Dockerfile").read_text()
+    nonpy = (nonpy_dir / ".pycastle" / "Dockerfile").read_text()
+
+    # They genuinely differ, but only in the extension block: swapping the
+    # filled block back to the empty one recovers the non-Python Dockerfile.
+    assert py != nonpy
+    assert py.replace(_EXTENSION_PYTHON, _EXTENSION_EMPTY) == nonpy
+
+
+def test_extension_block_constants_stay_in_sync() -> None:
+    """The empty extension block is a unique, verbatim substring of _DOCKERFILE.
+
+    The Python Dockerfile is built by string-replacing this block, so the
+    constant must match the base template exactly and exactly once -- otherwise
+    the two could silently fall out of sync.
+    """
+    assert _EXTENSION_EMPTY in _DOCKERFILE
+    assert _DOCKERFILE.count(_EXTENSION_EMPTY) == 1
 
 
 def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None:
