@@ -264,26 +264,32 @@ def _cmd_run(args: argparse.Namespace) -> int:
     workspace = Path.cwd()
     # Resolve the agent image once, before the run loop, so a missing image is
     # built exactly once rather than per iteration. Resolution is docker-only.
+    # The single --sandbox flag drives BOTH the runtime and the gate onto the
+    # same side (#28): under docker the gate runs inside the SAME resolved agent
+    # image as the phases, wrapped through the same sandbox wrapper; under host it
+    # runs as a host subprocess (unchanged). Building the gate-check here, in the
+    # branch that already resolves the image, keeps them in lockstep.
     if args.sandbox == "docker":
         image = _resolve_agent_image(args.image, FIXTURE_DIR)
         runtime = _build_runtime(
             args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
         )
+        gate_check = make_fixture_gate_check(
+            FIXTURE_DIR,
+            sandbox="docker",
+            image=image,
+            runtime_name=args.runtime,
+            workspace=workspace,
+        )
     else:
         runtime = _build_runtime(
             args.runtime, args.sandbox, workspace, verbose=args.verbose
         )
+        gate_check = make_fixture_gate_check(FIXTURE_DIR)
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
     issue_source = GitHubIssueSource(repo)
-
-    # The quality gate is the project's own: it comes from the fixture's `gate`
-    # file (run in each issue worktree after implement), not hardcoded here. With
-    # no gate file the check falls back to always-pass, so a project without a
-    # gate keeps the single-attempt behaviour. Wiring it here is what makes the
-    # retry-with-handoff path reachable through the real `pycastle run` (#14).
-    gate_check = make_fixture_gate_check(FIXTURE_DIR)
 
     outcome = run_loop(
         runtime=runtime,

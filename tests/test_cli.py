@@ -295,6 +295,106 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     assert "pycastle-codex-auth:/home/node/.codex" in wrapped
 
 
+def test_run_host_builds_host_gate_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --sandbox host`` builds a host gate-check and hands it to run_loop.
+
+    The host branch builds the gate from ``FIXTURE_DIR`` with no docker kwargs,
+    and the same object reaches ``run_loop`` — proving the single ``--sandbox``
+    flag drives the gate onto the host side (#28).
+    """
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    sentinel = object()
+    factory_calls: list[dict[str, object]] = []
+
+    def fake_factory(fixture_dir: Path, **kwargs: object) -> object:
+        factory_calls.append({"fixture_dir": fixture_dir, **kwargs})
+        return sentinel
+
+    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_loop(*, gate_check: object, **_kwargs: object) -> MagicMock:
+        captured["gate_check"] = gate_check
+        outcome = MagicMock()
+        outcome.issues = []
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+
+    assert len(factory_calls) == 1
+    call = factory_calls[0]
+    assert call["fixture_dir"] == cli.FIXTURE_DIR
+    # No docker kwargs on the host path.
+    assert "sandbox" not in call
+    assert captured["gate_check"] is sentinel
+
+
+def test_run_docker_builds_docker_gate_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run --sandbox docker`` builds a docker gate-check on the resolved image.
+
+    The single ``--sandbox`` flag drives the gate inside the SAME image as the
+    phases: ``make_fixture_gate_check`` is called with ``sandbox="docker"``, the
+    runtime name, the resolved image, and the workspace (#28).
+    """
+    # No Dockerfile here, so image resolution falls back to the default tag and
+    # never touches docker -- hermetic.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
+
+    factory_calls: list[dict[str, object]] = []
+
+    def fake_factory(fixture_dir: Path, **kwargs: object) -> object:
+        factory_calls.append({"fixture_dir": fixture_dir, **kwargs})
+        return object()
+
+    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
+
+    captured: dict[str, object] = {}
+
+    def fake_build_runtime(
+        runtime_name: str, sandbox: str, workspace: Path, **kwargs: object
+    ) -> MagicMock:
+        captured["runtime_image"] = kwargs.get("image")
+        return MagicMock()
+
+    monkeypatch.setattr(cli, "_build_runtime", fake_build_runtime)
+
+    def fake_run_loop(**_kwargs: object) -> MagicMock:
+        outcome = MagicMock()
+        outcome.issues = []
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
+
+    assert len(factory_calls) == 1
+    call = factory_calls[0]
+    assert call["fixture_dir"] == cli.FIXTURE_DIR
+    assert call["sandbox"] == "docker"
+    assert call["runtime_name"] == "claude"
+    assert call["workspace"] == tmp_path
+    assert call["image"] == cli._resolve_agent_image(None, cli.FIXTURE_DIR)
+    # The gate runs in the SAME image the phases run in.
+    assert call["image"] == captured["runtime_image"]
+
+
 def _write_marker(tmp_path: Path, value: str) -> None:
     """Write ``value`` into a ``.pycastle/sandbox`` marker under ``tmp_path``."""
     fixture = tmp_path / ".pycastle"

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import sandbox as sandbox_mod
 from .commands import run_cmd
 from .graph import HUMAN, GraphExecutor, Phase, PhaseResult, WalkResult, load_graph
 from .issues import IssueSource, select_batch
@@ -48,11 +49,13 @@ logger = logging.getLogger(__name__)
 Runner = Callable[..., Any]
 
 #: A gate check decides whether an implement attempt's quality gates passed.
-#: It takes the issue worktree and returns ``True`` when the gates are green. It
-#: is injectable so a "gates red" outcome can drive a retry without hardcoding a
-#: specific project gate command here; the default treats every attempt as
-#: passing (the real gate is the project's own and is wired by the caller).
-GateCheck = Callable[[Path], bool]
+#: It takes the issue worktree and returns a :class:`GateOutcome` whose
+#: ``passed`` is the green/red verdict and whose ``output`` is the captured gate
+#: text. It is injectable so a "gates red" outcome can drive a retry without
+#: hardcoding a specific project gate command here; the default treats every
+#: attempt as passing (the real gate is the project's own and is wired by the
+#: caller).
+GateCheck = Callable[[Path], "GateOutcome"]
 
 #: Where a handoff document is written inside the issue worktree (ignored path).
 HANDOFF_DOC = ".pycastle/handoff.md"
@@ -61,14 +64,29 @@ HANDOFF_DOC = ".pycastle/handoff.md"
 HANDOFF_PHASE = "handoff"
 
 
-def _gates_always_pass(_worktree: Path) -> bool:
-    """Default gate check: treat every attempt as passing.
+@dataclass
+class GateOutcome:
+    """What running an attempt's quality gate produced.
+
+    ``passed`` is the green/red verdict (the gate exited 0); ``output`` is the
+    captured stdout+stderr the orchestrator surfaces (logged on failure, and
+    persisted into the per-issue transcript so a run is auditable). Replaces the
+    bare bool the gate check used to return so the gate's reasoning is no longer
+    discarded (#28).
+    """
+
+    passed: bool
+    output: str
+
+
+def _gates_always_pass(_worktree: Path) -> GateOutcome:
+    """Default gate check: treat every attempt as passing, with no output.
 
     The real gate is the project's own quality-gate command; it is injected by
     the caller. With no gate wired, a single implement attempt is made and no
     retry/handoff is triggered.
     """
-    return True
+    return GateOutcome(passed=True, output="")
 
 
 #: The optional project-owned quality gate, relative to the Project fixture.
@@ -81,17 +99,54 @@ def _gates_always_pass(_worktree: Path) -> bool:
 FIXTURE_GATE = "gate"
 
 
+def _gate_outcome_from_result(result: Any) -> GateOutcome:
+    """Build a :class:`GateOutcome` from a runner's completed-process result.
+
+    Captures the gate's combined stdout+stderr (so the orchestrator can surface
+    the actual failing checks) and reads the verdict off the exit code: 0 is a
+    pass, anything else (including a missing/odd returncode) is a failure.
+    """
+    output = (getattr(result, "stdout", "") or "") + (
+        getattr(result, "stderr", "") or ""
+    )
+    return GateOutcome(passed=getattr(result, "returncode", 1) == 0, output=output)
+
+
 def make_fixture_gate_check(
-    fixture_dir: Path, *, runner: Runner = run_cmd
+    fixture_dir: Path,
+    *,
+    runner: Runner = run_cmd,
+    sandbox: str = "host",
+    image: str | None = None,
+    runtime_name: str = "claude",
+    workspace: Path | None = None,
 ) -> GateCheck:
     """Build a :data:`GateCheck` from the Project fixture's gate file.
 
     The gate definition is project-owned: if ``<fixture_dir>/gate`` exists it is
-    run as an executable inside the issue worktree (so it sees the attempt's
-    code, not the fixture), and the returned check passes only when that command
-    exits 0. With no gate file the fixture opts out of gating and the check
-    falls back to :func:`_gates_always_pass`, so a project without a gate keeps
-    the single-attempt, no-retry behaviour (back-compat).
+    run (so it sees the attempt's code, not the fixture), and the returned check
+    passes only when that command exits 0, carrying the captured output back in
+    the :class:`GateOutcome`. With no gate file the fixture opts out of gating
+    and the check falls back to :func:`_gates_always_pass`, so a project without
+    a gate keeps the single-attempt, no-retry behaviour (back-compat).
+
+    The gate runs where the phases run, driven by the single ``--sandbox`` flag
+    (#28) so gate and runtime are always on the same side:
+
+    * ``sandbox="host"`` (the default) runs the gate as a host subprocess inside
+      the issue worktree, exactly as before — byte-for-byte unchanged behaviour
+      for existing callers.
+    * ``sandbox="docker"`` runs the gate INSIDE the same resolved agent image as
+      the phases, wrapped through :func:`pycastle.sandbox.build_run_command` (the
+      same wrapper the runtime uses, #50 workdir fix included). The repo root
+      (``workspace``) is bind-mounted at its own path and the issue ``worktree``
+      becomes the container ``-w``, so the gate sees the same cwd it does on the
+      host. The inner argv runs ``bash`` on the *canonical* repo-root gate
+      (``fixture_dir/gate``), NOT the worktree's copy, so an attempt cannot
+      weaken its own gate; the canonical absolute path is valid in the container
+      because the repo root is mounted at the same path. The runtime's auth mount
+      is inert for the gate, so ``build_run_command`` is reused as-is rather than
+      building a leaner gate-only wrapper.
 
     The gate is resolved once here, but read freshly per call so a fixture that
     grows or drops its gate between runs is honoured. ``runner`` is injectable so
@@ -100,25 +155,43 @@ def make_fixture_gate_check(
 
     A gate that exists but cannot be launched — it lost its executable bit on
     checkout (``PermissionError``), or has a bad interpreter line
-    (``FileNotFoundError``/``ENOEXEC``) — is treated as a *failing* gate, not a
-    crash: the :class:`OSError` is logged and the check returns ``False`` so the
-    attempt is retried and the issue ultimately handed to a human, rather than
-    one bad file mode sinking the whole run.
+    (``FileNotFoundError``/``ENOEXEC``), or the ``docker run`` itself cannot be
+    spawned — is treated as a *failing* gate, not a crash: the :class:`OSError`
+    is logged and the check returns a failing :class:`GateOutcome` so the attempt
+    is retried and the issue ultimately handed to a human, rather than one bad
+    file mode sinking the whole run.
     """
     gate_path = fixture_dir / FIXTURE_GATE
 
-    def _check(worktree: Path) -> bool:
+    def _check(worktree: Path) -> GateOutcome:
         if not gate_path.is_file():
-            return True
+            return GateOutcome(passed=True, output="")
         try:
-            result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
-        except OSError:
+            if sandbox == "docker":
+                # Wrap the canonical gate through the same docker wrapper the
+                # runtime uses: repo root mounted at its own path, worktree as the
+                # container cwd (-w). ``docker run`` is launched from the host with
+                # no cwd dependence, so no ``cwd=`` is passed here.
+                argv = sandbox_mod.build_run_command(
+                    runtime_name,
+                    inner_argv=["bash", str(gate_path.resolve())],
+                    workspace=workspace or Path.cwd(),
+                    workdir=worktree,
+                    image=image or sandbox_mod.DEFAULT_IMAGE,
+                )
+                result = runner(argv, capture=True)
+            else:
+                result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
+        except OSError as exc:
             # The gate file is there but cannot be executed (lost +x on checkout,
-            # bad shebang, ...). Count it as a gate failure so the run retries and
-            # hands the issue to a human instead of aborting the whole batch.
+            # bad shebang, docker not spawnable, ...). Count it as a gate failure
+            # so the run retries and hands the issue to a human instead of
+            # aborting the whole batch.
             logger.exception("Could not run quality gate %s", gate_path)
-            return False
-        return getattr(result, "returncode", 1) == 0
+            return GateOutcome(
+                passed=False, output=f"gate could not be launched: {exc}"
+            )
+        return _gate_outcome_from_result(result)
 
     return _check
 
@@ -208,6 +281,21 @@ def _transcript_sink(
             handle.write(f"[{phase}] [{tag}] {text}\n")
 
     return _sink
+
+
+def _surface_gate(sink: Callable[[str, str, str], None], outcome: GateOutcome) -> None:
+    """Persist the gate's captured output into the per-issue transcript.
+
+    Tagged ``GATE`` under phase ``gate`` so lines read ``[gate] [GATE] <text>``,
+    matching the runtime's transcript format. The caller decides *when* to call
+    this — always on failure, only under ``--verbose`` on success (#28). Output
+    is split per line so each line keeps the ``[gate] [GATE] `` prefix, and a
+    gate that produced no output writes nothing (no empty tagged line).
+    """
+    if not outcome.output:
+        return
+    for line in outcome.output.splitlines():
+        sink("gate", "GATE", line)
 
 
 def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
@@ -392,6 +480,8 @@ def _run_implement_phase(
     issue_worktree: Path,
     impl_retries: int,
     gate_check: GateCheck,
+    gate_sink: Callable[[str, str, str], None],
+    verbose: bool,
 ) -> tuple[bool, list[PhaseResult]]:
     """Run the ``implement`` phase under #8's retry-with-handoff budget.
 
@@ -438,10 +528,22 @@ def _run_implement_phase(
             return False, phase_results
 
         phase_results = [PhaseResult(phase=implement.name, result=result)]
-        gate_output = "quality gates reported a failure"
-        if gate_check(issue_worktree):
+        outcome = gate_check(issue_worktree)
+        # The handoff/next-attempt context gets the gate's real captured output
+        # rather than a static string, so the agent sees the actual failing checks.
+        gate_output = outcome.output or "quality gates reported a failure"
+        if outcome.passed:
+            # Surface a passing gate only under --verbose: persist its output and
+            # note the pass in the run log.
+            if verbose:
+                _surface_gate(gate_sink, outcome)
+                _append_log(fixture_dir, run_id, f"Gate passed for #{issue.number}.")
             return True, phase_results
 
+        # A failing gate is surfaced ALWAYS (regardless of verbose): persist its
+        # output into the transcript and warn-log it so a red run is auditable.
+        _surface_gate(gate_sink, outcome)
+        logger.warning("Gate failed for #%s:\n%s", issue.number, outcome.output)
         _append_log(
             fixture_dir,
             run_id,
@@ -484,6 +586,8 @@ def _walk_issue(
     issue_worktree: Path,
     impl_retries: int,
     gate_check: GateCheck,
+    gate_sink: Callable[[str, str, str], None],
+    verbose: bool,
 ) -> WalkResult:
     """Walk the issue's phase graph, with the implement node under #8's retry.
 
@@ -513,6 +617,8 @@ def _walk_issue(
                 issue_worktree=issue_worktree,
                 impl_retries=impl_retries,
                 gate_check=gate_check,
+                gate_sink=gate_sink,
+                verbose=verbose,
             )
         return default_runner(phase, extra)
 
@@ -574,6 +680,11 @@ def _work_issue(
     issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
+    # The gate sink is built unconditionally — a failing gate surfaces its output
+    # regardless of --verbose (#28), so unlike the runtime sink below (verbose-only
+    # live transcript persistence) the gate needs its persistence target always.
+    gate_sink = _transcript_sink(fixture_dir, run_id, issue.number)
+
     if verbose:
         # The runtime is shared across issues (built once so a Docker image builds
         # once), so its transcript sink is rebound per issue to point at this
@@ -602,6 +713,8 @@ def _work_issue(
         issue_worktree=issue_worktree,
         impl_retries=impl_retries,
         gate_check=gate_check,
+        gate_sink=gate_sink,
+        verbose=verbose,
     )
     if walk.results:
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
