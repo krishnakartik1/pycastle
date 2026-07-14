@@ -69,6 +69,74 @@ class BranchError(RuntimeError):
     """
 
 
+class PruneError(RuntimeError):
+    """Run-branch discovery or deletion failed, making pruning unsafe."""
+
+
+def prune_run_branches(
+    *,
+    repo: str,
+    cwd: Path,
+    runner: Runner = run_cmd,
+) -> list[str]:
+    """Delete remote run branches whose pull requests are no longer open.
+
+    The open PR heads are resolved before any remote branches are considered.
+    If either discovery call fails, pruning stops without deleting anything so
+    an unavailable GitHub API can never make an open PR branch look stale.
+    """
+    open_prs = runner(
+        [
+            "gh",
+            "pr",
+            "list",
+            "-R",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "10000",
+            "--json",
+            "headRefName",
+            "--jq",
+            ".[].headRefName",
+        ],
+        capture=True,
+    )
+    if getattr(open_prs, "returncode", 1) != 0:
+        raise PruneError("Could not list open pull requests; no branches were deleted.")
+    open_heads = set((getattr(open_prs, "stdout", "") or "").splitlines())
+
+    refs = runner(
+        ["git", "ls-remote", "--heads", "origin", "refs/heads/pycastle/run-*"],
+        capture=True,
+        cwd=cwd,
+    )
+    if getattr(refs, "returncode", 1) != 0:
+        raise PruneError(
+            "Could not list remote run branches; no branches were deleted."
+        )
+
+    prefix = "refs/heads/"
+    remote_branches = [
+        line.split("\t", 1)[1].removeprefix(prefix)
+        for line in (getattr(refs, "stdout", "") or "").splitlines()
+        if "\trefs/heads/pycastle/run-" in line
+    ]
+    stale = [branch for branch in remote_branches if branch not in open_heads]
+    deleted: list[str] = []
+    for branch in stale:
+        result = runner(
+            ["git", "push", "origin", "--delete", branch],
+            capture=True,
+            cwd=cwd,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise PruneError(f"Could not delete remote run branch {branch}.")
+        deleted.append(branch)
+    return deleted
+
+
 #: A gate check decides whether an implement attempt's quality gates passed.
 #: It takes the issue worktree and returns a :class:`GateOutcome` whose
 #: ``passed`` is the green/red verdict and whose ``output`` is the captured gate

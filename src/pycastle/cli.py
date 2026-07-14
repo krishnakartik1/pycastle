@@ -11,7 +11,7 @@ from pathlib import Path
 from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
-from .orchestrator import make_fixture_gate_check
+from .orchestrator import PruneError, make_fixture_gate_check, prune_run_branches
 from .orchestrator import run_batch as run_loop
 from .preflight import PreflightError, check_required_commands
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
+    sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
     sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
@@ -317,6 +318,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome.pr_opened else 1
 
 
+def _cmd_prune() -> int:
+    """Delete remote Run branches after their pull requests close or merge."""
+    deleted = prune_run_branches(repo=_resolve_repo(), cwd=Path.cwd())
+    if deleted:
+        logger.info(
+            "Deleted %d stale run branch(es): %s", len(deleted), ", ".join(deleted)
+        )
+    else:
+        logger.info("No stale run branches found.")
+    return 0
+
+
 def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle sandbox setup``: onboard a runtime's Docker auth.
 
@@ -495,11 +508,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_run(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "prune":
+            return _cmd_prune()
         if args.command == "sandbox":
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)
             return _cmd_sandbox_setup(args)
-    except PreflightError as exc:
+    except (PreflightError, PruneError) as exc:
         # Covers both preflight (missing commands) and a failed on-demand image
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)

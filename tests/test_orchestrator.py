@@ -27,6 +27,51 @@ def _calls_containing(runner: MagicMock, *needles: str) -> bool:
     return False
 
 
+def test_prune_run_branches_deletes_only_branches_without_open_prs(
+    tmp_path: Path,
+) -> None:
+    """Closed/merged PR heads are pruned while open PR heads stay intact (#69)."""
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(returncode=0, stdout="pycastle/run-open\n"),
+            MagicMock(
+                returncode=0,
+                stdout=(
+                    "aaa\trefs/heads/pycastle/run-open\n"
+                    "bbb\trefs/heads/pycastle/run-merged\n"
+                    "ccc\trefs/heads/pycastle/run-closed\n"
+                ),
+            ),
+            MagicMock(returncode=0),
+            MagicMock(returncode=0),
+        ]
+    )
+
+    deleted = orchestrator.prune_run_branches(
+        repo="owner/repo", runner=runner, cwd=tmp_path
+    )
+
+    assert deleted == ["pycastle/run-merged", "pycastle/run-closed"]
+    assert _calls_containing(runner, "--state", "open", "--limit", "10000")
+    assert not _calls_containing(runner, "--delete", "pycastle/run-open")
+    assert _calls_containing(runner, "--delete", "pycastle/run-merged")
+    assert _calls_containing(runner, "--delete", "pycastle/run-closed")
+
+
+def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    """An unknown open-PR set must never permit a destructive prune (#69)."""
+    runner = MagicMock(
+        return_value=MagicMock(returncode=1, stdout="", stderr="gh failed")
+    )
+
+    with pytest.raises(orchestrator.PruneError, match="open pull requests"):
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
+
+    assert not _calls_containing(runner, "git", "push", "origin", "--delete")
+
+
 def _git_aware_runner(
     merge_fails_for: set[int] | None = None,
     empty_diff_for: set[int] | None = None,

@@ -72,6 +72,16 @@ def test_parses_sandbox_build() -> None:
     assert args.sandbox_command == "build"
 
 
+def test_main_dispatches_prune(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    prune = MagicMock(return_value=[])
+    monkeypatch.setattr(cli, "prune_run_branches", prune)
+
+    assert main(["prune"]) == 0
+    prune.assert_called_once_with(repo="owner/repo", cwd=Path.cwd())
+
+
 def test_make_run_id_is_a_timestamp_shape() -> None:
     # The CLI is where a run id is minted (the orchestrator never reads a clock,
     # so it stays deterministic in tests). The id is a YYYYMMDD-HHMMSS stamp.

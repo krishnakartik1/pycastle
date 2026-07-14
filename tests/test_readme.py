@@ -16,6 +16,7 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
         "pycastle init",
         "pycastle sandbox setup --runtime claude",
         "pycastle run --runtime claude",
+        "pycastle prune",
     ):
         assert command in readme
 
