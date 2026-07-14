@@ -19,3 +19,8 @@ venv/
 .pycastle/logs/
 .pycastle/runs/
 .pycastle/worktrees/
+
+# Historical Runtime scratch paths observed in self-hosting runs. The fixed
+# .pycastle/{handoff,plan,issue}.md paths are covered by .pycastle/.gitignore.
+PLAN.md
+.pycastle/plan-issue-*.md

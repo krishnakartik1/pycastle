@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from pycastle import orchestrator
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
@@ -226,6 +228,16 @@ def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
     # The issue is branched off the *run* branch into its own worktree.
     assert _calls_containing(runner, "git", "branch", issue_branch, run_branch)
     assert _calls_containing(runner, "git", "worktree", "add", issue_branch)
+
+    # Staging excludes both historical planning paths from #68 even if a Runtime
+    # ignores the canonical .pycastle/plan.md destination in the plan prompt.
+    add_argv = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "add", "-A"]
+    )
+    assert ":(exclude,top)PLAN.md" in add_argv
+    assert ":(exclude,top,glob).pycastle/plan-issue-*.md" in add_argv
 
     # The main checkout is never switched: no `git checkout` in the workspace.
     for call in runner.call_args_list:
@@ -463,6 +475,293 @@ def test_empty_diff_on_only_issue_opens_no_pull_request(
     source.mark_for_human.assert_called_once_with(2)
     # No pull request is even attempted.
     assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def _worktree_failing_runner(
+    *, fail_run: bool = False, fail_issues: set[int] | None = None
+) -> MagicMock:
+    """A git-aware runner whose ``git worktree add`` fails selectively (#64).
+
+    The run worktree add fails when ``fail_run`` is set; an issue worktree add
+    fails when its issue number is in ``fail_issues``. A failing add returns
+    git's real shape — a non-zero exit with stderr — and creates no directory;
+    every other add creates its directory like :func:`_git_aware_runner`.
+    """
+    fail_issues = fail_issues or set()
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "worktree", "add"]:
+            name = Path(argv[3]).name
+            failing = (name.startswith("run-") and fail_run) or (
+                name.startswith("issue-") and int(name.split("-")[1]) in fail_issues
+            )
+            if failing:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=128, stdout="", stderr="fatal: boom"
+                )
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def test_run_worktree_add_failure_raises_and_works_no_issue(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A failed run-worktree add is fatal: no issue can be worked without it, so
+    # the run raises instead of silently driving the batch against a directory
+    # that was never created (#64). Nothing is claimed and no PR is attempted.
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _worktree_failing_runner(fail_run=True)
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_run_branch_failure_aborts_before_worktree_add(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A stale run branch cannot be silently reused as the worktree base (#64)."""
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    def fail_run_branch(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "branch", "pycastle/run-20260613-101500"]:
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="fatal: a branch named 'pycastle/run-20260613-101500' exists",
+            )
+        return _ok()
+
+    runner = MagicMock(side_effect=fail_run_branch)
+
+    with pytest.raises(orchestrator.BranchError, match="branch named"):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    assert not _calls_containing(runner, "git", "worktree", "add")
+    source.claim.assert_not_called()
+
+
+def test_issue_branch_failure_releases_issue_before_worktree_add(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A stale issue branch cannot be checked out from the wrong base (#64)."""
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    def fail_issue_branch(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "branch", "pycastle/issue-2-slice"]:
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="fatal: a branch named 'pycastle/issue-2-slice' exists",
+            )
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+        return _ok()
+
+    runner = MagicMock(side_effect=fail_issue_branch)
+
+    with pytest.raises(orchestrator.BranchError, match="branch named"):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    issue_add = str(tmp_path / "wt" / "issue-2")
+    assert not _calls_containing(runner, "git", "worktree", "add", issue_add)
+    source.release.assert_called_once_with(2)
+
+
+def test_create_branch_success_issues_captured_git_command(tmp_path: Path) -> None:
+    runner = MagicMock(return_value=_ok())
+
+    orchestrator.create_branch("topic", "main", runner=runner, cwd=tmp_path)
+
+    runner.assert_called_once_with(
+        ["git", "branch", "topic", "main"], capture=True, cwd=tmp_path
+    )
+
+
+def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A failed issue-worktree add is an infra fault, not an issue-content fault:
+    # rather than drive the Runtime against a directory that was never created (or
+    # mislabel the issue ready-for-human), it is raised so run_batch's interrupt
+    # teardown releases the claimed issue back to ready-for-agent and aborts (#64).
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _worktree_failing_runner(fail_issues={2})
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    # The claimed issue is released back to ready-for-agent, never mislabelled
+    # ready-for-human, and no PR is attempted for the aborted run.
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
+    source.mark_for_human.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_add_worktree_success_issues_the_add_and_does_not_raise(
+    tmp_path: Path,
+) -> None:
+    # The happy path: a zero exit means git created the worktree, so the helper
+    # returns quietly having issued exactly the captured add at the given cwd (#64).
+    runner = MagicMock(return_value=_ok())
+    worktree = tmp_path / "wt" / "issue-7"
+
+    orchestrator.add_worktree(worktree, "br", runner=runner, cwd=tmp_path)
+
+    runner.assert_called_once_with(
+        ["git", "worktree", "add", str(worktree), "br"],
+        capture=True,
+        cwd=tmp_path,
+    )
+
+
+def test_add_worktree_failure_surfaces_git_stderr(tmp_path: Path) -> None:
+    # A non-zero exit means no worktree was created; the helper raises and carries
+    # git's stderr so the operator sees why the add failed rather than a downstream
+    # ghost error (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="fatal: '/x' already exists"
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert "fatal: '/x' already exists" in str(excinfo.value)
+    assert "br" in str(excinfo.value)
+
+
+def test_add_worktree_failure_falls_back_to_stdout_when_stderr_empty(
+    tmp_path: Path,
+) -> None:
+    # git usually reports on stderr, but a failure that only wrote stdout must not
+    # be dropped: the helper falls back to stdout for the raised detail (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="could not create work tree dir", stderr=""
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert "could not create work tree dir" in str(excinfo.value)
+
+
+def test_add_worktree_failure_with_no_output_has_no_dangling_detail(
+    tmp_path: Path,
+) -> None:
+    # A silent failure (no stderr/stdout, only a non-zero exit) still raises, and
+    # the message stays clean — no trailing ": " with nothing after it (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(
+            tmp_path / "issue-9", "br", runner=runner, cwd=tmp_path
+        )
+
+    message = str(excinfo.value)
+    assert message == f"git worktree add failed for br at {tmp_path / 'issue-9'}"
+
+
+def test_add_worktree_failure_tolerates_none_captured_streams(tmp_path: Path) -> None:
+    # A runner that leaves stderr/stdout as ``None`` (an uncaptured CompletedProcess
+    # shape) must not blow up on ``.strip()``; the helper still raises cleanly (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=None, stderr=None
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert str(excinfo.value) == f"git worktree add failed for br at {tmp_path / 'x'}"
+
+
+def test_add_worktree_missing_returncode_is_treated_as_failure(
+    tmp_path: Path,
+) -> None:
+    # Defensive default: a runner result without a ``returncode`` (an odd/mocked
+    # shape) is treated as a failure rather than a silent success, so a worktree is
+    # never assumed created on ambiguous output (#64).
+    runner = MagicMock(return_value=object())
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
 
 
 def test_telemetry_and_run_log_are_written_into_the_fixture(
@@ -1083,3 +1382,131 @@ def test_sigint_handler_off_main_thread_value_error_is_swallowed() -> None:
     # restore call, since there is no previous handler to put back.
     assert entered
     assert sig.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# render_issue_context: the preamble handed to the runtime each phase.        #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_issue_context_header_carries_number_and_title_verbatim() -> None:
+    # The header names the issue by number and keeps the title's punctuation and
+    # markdown intact (unlike slugify), so the runtime sees the real title.
+    issue = IssueRef(number=65, title="Hand the agent its `issue` context!")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered.startswith("# Issue #65: Hand the agent its `issue` context!")
+
+
+def test_render_issue_context_includes_the_body_after_the_header() -> None:
+    issue = IssueRef(number=7, title="Do the thing", body="## What to build\nA gizmo.")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #7: Do the thing\n\n## What to build\nA gizmo."
+
+
+def test_render_issue_context_preserves_a_multiline_body_verbatim() -> None:
+    body = "Line one\n\n- bullet\n- bullet two\n"
+    issue = IssueRef(number=3, title="Multi", body=body)
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == f"# Issue #3: Multi\n\n{body.strip()}"
+
+
+def test_render_issue_context_with_no_body_is_header_only() -> None:
+    # An empty body yields the header alone, with no dangling blank block.
+    issue = IssueRef(number=9, title="No body")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #9: No body"
+
+
+def test_render_issue_context_treats_a_whitespace_only_body_as_empty() -> None:
+    issue = IssueRef(number=9, title="Blank body", body="   \n\t \n")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #9: Blank body"
+
+
+def test_render_issue_context_empty_title_leaves_no_dangling_colon_space() -> None:
+    # An issue source defaults an absent title to "" (``item.get("title", "")``),
+    # so an empty title is reachable. The header ``rstrip`` keeps it clean: a bare
+    # ``# Issue #5:`` with no trailing space, not ``# Issue #5: ``.
+    issue = IssueRef(number=5, title="")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #5:"
+
+
+def test_render_issue_context_empty_title_with_body_still_carries_the_body() -> None:
+    issue = IssueRef(number=5, title="", body="## What to build\nA thing.")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #5:\n\n## What to build\nA thing."
+
+
+class _PromptRecordingRuntime:
+    """A fake Runtime that records the prompt handed to each phase.
+
+    Like the graph's stub it writes ``STUB_MARKER`` into the worktree so the
+    git-aware runner reports a non-empty diff, but it also stores the exact
+    prompt string per phase so a test can assert the issue-context preamble
+    reached each phase.
+    """
+
+    name = "stub"
+
+    def __init__(self) -> None:
+        self.prompts: dict[str, str] = {}
+
+    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+        self.prompts[phase] = prompt
+        (cwd / STUB_MARKER).write_text(f"phase {phase}\n")
+        return RuntimeResult(
+            output=f"ran {phase}",
+            telemetry=Telemetry(runtime=self.name, phase=phase, num_turns=1),
+        )
+
+
+def test_issue_context_reaches_every_phase_prompt(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    # The whole point of the issue: each phase's prompt must carry the issue's
+    # number, title, and body so the runtime is not working the issue blind.
+    issue = IssueRef(
+        number=65,
+        title="Hand the agent its issue context",
+        body="MARKER-BODY: build the preamble.",
+        assignees=["krishna"],
+    )
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _PromptRecordingRuntime()
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+    )
+
+    assert set(runtime.prompts) == {"plan", "implement", "review"}
+    for phase_name, prompt in runtime.prompts.items():
+        assert prompt.startswith(
+            "# Issue #65: Hand the agent its issue context"
+        ), phase_name
+        assert "MARKER-BODY: build the preamble." in prompt

@@ -21,11 +21,20 @@ The comparison treats two kinds of file differently:
 Both trees are compared by *shape* (the set of relative paths) ignoring any
 ``__pycache__``/``.pyc`` build droppings, so a stray compiled ``main.py`` does not
 fail the guard.
+
+The repo's own ``.pycastle/`` also doubles as the live working directory for the
+self-hosting loop, so a run drops transient artifacts into it (a ``handoff.md``
+from a retried implement attempt, a phase's ``plan.md``). Those are untracked run
+output, not part of the committed fixture, so the committed side is taken from
+what git *tracks* (:func:`_committed_tree`) rather than from a raw filesystem
+walk -- which is what "committed fixture" means and keeps the guard immune to
+whatever the running loop leaves behind.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 from pycastle.scaffold import (
@@ -63,6 +72,30 @@ def _tree(fixture_dir: Path) -> set[str]:
     }
 
 
+def _committed_tree(fixture_dir: Path) -> set[str]:
+    """Return the git-*tracked* fixture-relative paths under ``fixture_dir``.
+
+    Unlike :func:`_tree`, this ignores untracked run output the self-hosting loop
+    drops into its own ``.pycastle/`` (a retried attempt's ``handoff.md``, a
+    phase's ``plan.md``), so the shape guard compares the *committed* fixture --
+    what a scaffold reproduces -- rather than a working tree littered with a live
+    run's artifacts. ``git ls-files`` run inside ``fixture_dir`` emits paths
+    relative to it; caches are filtered to match :func:`_tree`.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", "."],
+        cwd=fixture_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {
+        path
+        for path in result.stdout.split("\0")
+        if path and "__pycache__" not in Path(path).parts and not path.endswith(".pyc")
+    }
+
+
 def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     """The committed ``.pycastle/`` equals a fresh scaffold of its own choice."""
     committed = _repo_root() / FIXTURE_DIRNAME
@@ -78,7 +111,9 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     scaffolded = tmp_path / FIXTURE_DIRNAME
 
     # Same shape: the committed tree carries exactly the files init scaffolds.
-    committed_tree, scaffolded_tree = _tree(committed), _tree(scaffolded)
+    # The committed side is taken from git tracking, not a filesystem walk, so a
+    # live self-hosting run's untracked artifacts in .pycastle/ do not count.
+    committed_tree, scaffolded_tree = _committed_tree(committed), _tree(scaffolded)
     missing = scaffolded_tree - committed_tree
     extra = committed_tree - scaffolded_tree
     assert committed_tree == scaffolded_tree, (
@@ -151,6 +186,42 @@ def test_guard_catches_shape_drift(tmp_path: Path) -> None:
     assert _tree(pristine) == _tree(drifted)
     (drifted / "main.py").unlink()
     assert _tree(pristine) != _tree(drifted)
+
+
+def test_committed_tree_ignores_untracked_run_artifacts(tmp_path: Path) -> None:
+    """The committed tree omits untracked run output the self-hosting loop drops.
+
+    The repo's own ``.pycastle/`` is the live working directory for the loop that
+    runs here, so a retried attempt leaves a ``handoff.md`` and a phase leaves a
+    ``plan.md`` inside it -- untracked artifacts, not committed fixture files. The
+    shape guard must ignore them, so this scaffolds a fixture into a throwaway git
+    repo, commits it, then drops those exact stray files and confirms
+    :func:`_committed_tree` still reports only the committed shape (while the raw
+    :func:`_tree` walk does see the strays -- proving the distinction is real).
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture = tmp_path / FIXTURE_DIRNAME
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    for command in (["git", "init", "-q"], ["git", "add", "-A"]):
+        subprocess.run(command, cwd=tmp_path, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-qm", "scaffold"], cwd=tmp_path, check=True, env=env
+    )
+
+    committed = _committed_tree(fixture)
+    (fixture / "handoff.md").write_text("stray handoff\n")
+    (fixture / "plan.md").write_text("stray plan\n")
+
+    assert (
+        _committed_tree(fixture) == committed
+    ), "untracked strays leaked into the tree"
+    assert {"handoff.md", "plan.md"} <= _tree(fixture), "strays should be on disk"
 
 
 def test_scaffolder_gate_is_executable(tmp_path: Path) -> None:

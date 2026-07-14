@@ -14,5 +14,6 @@ implementation yet -- work out the approach so the implement phase can move fast
    cases the review phase should later probe.
 5. Call out anything that looks out of scope for this one issue, and stop there.
 
-Write the plan where the implement phase can pick it up. Stay within the scope
-of this one issue. Do not modify unrelated code, and do not commit in this phase.
+Write the plan to `.pycastle/plan.md` -- an ignored scratch path the implement
+phase can pick up but that is never committed. Stay within the scope of this one
+issue. Do not modify unrelated code, and do not commit in this phase.
