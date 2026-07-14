@@ -611,6 +611,77 @@ def test_scaffolded_gate_passes_when_at_least_one_tool_present(
     assert "skipping gate step" in proc.stdout
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not on PATH")
+def test_scaffolded_gate_check_tools_fails_fast_without_any_tool(
+    tmp_path: Path,
+) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    gate = tmp_path / ".pycastle" / "gate"
+    env = dict(os.environ, PATH="/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "ruff" in proc.stderr
+    assert "black" in proc.stderr
+    assert "pytest" in proc.stderr
+
+
+def test_scaffolded_gate_check_tools_only_looks_up_tools(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    gate = tmp_path / ".pycastle" / "gate"
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    fake_ruff = bindir / "ruff"
+    fake_ruff.write_text("#!/usr/bin/env bash\nexit 99\n")
+    fake_ruff.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    # The generic gate's existing policy is non-vacuousness: one available
+    # configured tool is enough. Exit 99 would prove ruff was actually run.
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_repository_gate_check_tools_requires_every_unconditional_tool(
+    tmp_path: Path,
+) -> None:
+    repo_gate = Path(__file__).resolve().parents[1] / ".pycastle" / "gate"
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    for name in ("ruff", "pytest"):
+        tool = bindir / name
+        tool.write_text("#!/usr/bin/env bash\nexit 99\n")
+        tool.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(repo_gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "black" in proc.stderr
+    assert "ruff" not in proc.stderr
+    assert "pytest" not in proc.stderr
+
+
 def test_scaffolded_gate_text_has_counter_and_fail_branch(tmp_path: Path) -> None:
     """The gate template carries the fail-if-zero counter and exit branch (#28).
 

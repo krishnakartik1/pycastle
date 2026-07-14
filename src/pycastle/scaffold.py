@@ -198,6 +198,21 @@ run_if_available() {
   fi
 }
 
+if [ "${1:-}" = "--check-tools" ]; then
+  for tool in ruff black pytest; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ran=$((ran + 1))
+    else
+      missing+=("$tool")
+    fi
+  done
+  if [ "$ran" -eq 0 ]; then
+    echo "Missing gate tools: ${missing[*]}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 run_if_available ruff check . --exit-non-zero-on-fix
 run_if_available black --check .
 run_if_available pytest -q

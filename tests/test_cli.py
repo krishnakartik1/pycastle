@@ -405,6 +405,95 @@ def test_run_docker_builds_docker_gate_check(
     assert call["image"] == captured["runtime_image"]
 
 
+def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:resolved")
+    events: list[str] = []
+
+    def fake_gate_preflight(fixture_dir: Path, **kwargs: object) -> None:
+        events.append("gate-preflight")
+        assert fixture_dir == cli.FIXTURE_DIR
+        assert kwargs == {
+            "image": "agent:resolved",
+            "runtime_name": "claude",
+            "workspace": tmp_path,
+        }
+
+    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fake_gate_preflight)
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
+    )
+
+    def resolve_repo() -> str:
+        events.append("resolve-repo")
+        return "owner/repo"
+
+    monkeypatch.setattr(cli, "_resolve_repo", resolve_repo)
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda _login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
+
+    def fake_run_loop(**_kwargs: object) -> MagicMock:
+        events.append("run-loop")
+        return MagicMock(issues=[])
+
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
+    assert events == ["gate-preflight", "resolve-repo", "run-loop"]
+
+
+def test_run_docker_gate_toolchain_failure_aborts_before_issue_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:bad")
+
+    def fail_preflight(*_args: object, **_kwargs: object) -> None:
+        raise PreflightError("gate toolchain missing")
+
+    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fail_preflight)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_repo",
+        lambda: pytest.fail("repo resolution must not start after failed preflight"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_loop",
+        lambda **_kwargs: pytest.fail("phase graph must not start after preflight"),
+    )
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
+
+
+def test_run_host_does_not_preflight_docker_gate_toolchain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(
+        cli,
+        "check_docker_gate_toolchain",
+        lambda *_args, **_kwargs: pytest.fail("host run must not launch docker"),
+    )
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
+    monkeypatch.setattr(cli, "_resolve_assignee", lambda _login: "krishna")
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(cli, "run_loop", lambda **_kwargs: MagicMock(issues=[]))
+
+    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+
+
 def _write_marker(tmp_path: Path, value: str) -> None:
     """Write ``value`` into a ``.pycastle/sandbox`` marker under ``tmp_path``."""
     fixture = tmp_path / ".pycastle"

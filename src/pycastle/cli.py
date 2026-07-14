@@ -13,7 +13,11 @@ from .commands import run_cmd
 from .issues import GitHubIssueSource
 from .orchestrator import PruneError, make_fixture_gate_check, prune_run_branches
 from .orchestrator import run_batch as run_loop
-from .preflight import PreflightError, check_required_commands
+from .preflight import (
+    PreflightError,
+    check_docker_gate_toolchain,
+    check_required_commands,
+)
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
 
@@ -272,6 +276,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # branch that already resolves the image, keeps them in lockstep.
     if args.sandbox == "docker":
         image = _resolve_agent_image(args.image, FIXTURE_DIR)
+        check_docker_gate_toolchain(
+            FIXTURE_DIR,
+            image=image,
+            runtime_name=args.runtime,
+            workspace=workspace,
+        )
         runtime = _build_runtime(
             args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
         )
