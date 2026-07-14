@@ -1330,6 +1330,25 @@ def test_render_issue_context_treats_a_whitespace_only_body_as_empty() -> None:
     assert rendered == "# Issue #9: Blank body"
 
 
+def test_render_issue_context_empty_title_leaves_no_dangling_colon_space() -> None:
+    # An issue source defaults an absent title to "" (``item.get("title", "")``),
+    # so an empty title is reachable. The header ``rstrip`` keeps it clean: a bare
+    # ``# Issue #5:`` with no trailing space, not ``# Issue #5: ``.
+    issue = IssueRef(number=5, title="")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #5:"
+
+
+def test_render_issue_context_empty_title_with_body_still_carries_the_body() -> None:
+    issue = IssueRef(number=5, title="", body="## What to build\nA thing.")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #5:\n\n## What to build\nA thing."
+
+
 class _PromptRecordingRuntime:
     """A fake Runtime that records the prompt handed to each phase.
 
