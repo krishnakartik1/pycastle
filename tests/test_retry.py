@@ -1414,3 +1414,27 @@ def test_fixture_setup_absent_is_a_noop(fixture_dir: Path, tmp_path: Path) -> No
     runner = MagicMock()
     orchestrator.make_fixture_setup(fixture_dir, runner=runner)(tmp_path)
     runner.assert_not_called()
+
+
+def test_fixture_setup_surfaces_nonzero_exit_and_combined_output(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    setup = fixture_dir / orchestrator.FIXTURE_SETUP
+    setup.write_text("#!/usr/bin/env bash\nexit 7\n")
+    setup.chmod(0o755)
+    runner = MagicMock(
+        return_value=MagicMock(returncode=7, stdout="install failed\n", stderr=None)
+    )
+
+    with pytest.raises(orchestrator.SetupError, match="install failed"):
+        orchestrator.make_fixture_setup(fixture_dir, runner=runner)(tmp_path)
+
+
+def test_fixture_setup_wraps_launch_errors(fixture_dir: Path, tmp_path: Path) -> None:
+    setup = fixture_dir / orchestrator.FIXTURE_SETUP
+    setup.write_text("#!/usr/bin/env bash\nexit 0\n")
+    setup.chmod(0o755)
+    runner = MagicMock(side_effect=OSError("interpreter unavailable"))
+
+    with pytest.raises(orchestrator.SetupError, match="interpreter unavailable"):
+        orchestrator.make_fixture_setup(fixture_dir, runner=runner)(tmp_path)

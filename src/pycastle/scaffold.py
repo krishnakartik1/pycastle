@@ -242,7 +242,10 @@ def _setup_script(target_dir: Path) -> str:
     if (target_dir / "uv.lock").exists():
         command = "export UV_PROJECT_ENVIRONMENT=.pycastle/venv\nuv sync --all-extras"
     elif (target_dir / "poetry.lock").exists():
-        command = "poetry install"
+        # Poetry otherwise creates its environment under the short-lived
+        # container's cache. Reuse the activated, bind-mounted environment so
+        # phases and the gate can import the installed dependencies later.
+        command = "POETRY_VIRTUALENVS_CREATE=false poetry install"
     elif (target_dir / "pyproject.toml").exists():
         command = 'pip install -e ".[dev]" || pip install -e .'
     elif (target_dir / "requirements.txt").exists():

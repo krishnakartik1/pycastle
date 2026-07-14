@@ -45,7 +45,10 @@ EXPECTED_TREE = {
     ("manifest", "expected"),
     [
         ("uv.lock", "uv sync --all-extras"),
-        ("poetry.lock", "poetry install"),
+        (
+            "poetry.lock",
+            "POETRY_VIRTUALENVS_CREATE=false poetry install",
+        ),
         ("requirements.txt", "pip install -r requirements.txt"),
     ],
 )
@@ -68,6 +71,18 @@ def test_scaffolded_pyproject_setup_falls_back_without_dev_extra(
 
     setup = (tmp_path / ".pycastle" / "setup").read_text()
     assert 'pip install -e ".[dev]" || pip install -e .' in setup
+
+
+def test_scaffold_setup_manifest_precedence_is_deterministic(tmp_path: Path) -> None:
+    for manifest in ("uv.lock", "poetry.lock", "pyproject.toml", "requirements.txt"):
+        (tmp_path / manifest).write_text("")
+
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert "uv sync --all-extras" in setup
+    assert "poetry install" not in setup
+    assert "pip install" not in setup
 
 
 def test_scaffolded_setup_is_a_documented_noop_without_manifest(tmp_path: Path) -> None:
