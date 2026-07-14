@@ -65,20 +65,26 @@ def _repo_root() -> Path:
 
 
 def _tree(fixture_dir: Path) -> set[str]:
-    """Return fixture-relative paths, excluding caches and ignored directories."""
+    """Return fixture-relative paths, pruning ignored transient directories."""
     ignored_directories = {
         line.removesuffix("/")
         for line in (fixture_dir / ".gitignore").read_text().splitlines()
         if line and not line.startswith(("#", "!")) and line.endswith("/")
     }
-    return {
-        path.relative_to(fixture_dir).as_posix()
-        for path in fixture_dir.rglob("*")
-        if path.is_file()
-        and "__pycache__" not in path.parts
-        and path.suffix != ".pyc"
-        and ignored_directories.isdisjoint(path.relative_to(fixture_dir).parts[:-1])
-    }
+    paths: set[str] = set()
+    for root, directories, filenames in os.walk(fixture_dir):
+        directories[:] = [
+            directory
+            for directory in directories
+            if directory != "__pycache__" and directory not in ignored_directories
+        ]
+        root_path = Path(root)
+        paths.update(
+            (root_path / filename).relative_to(fixture_dir).as_posix()
+            for filename in filenames
+            if Path(filename).suffix != ".pyc"
+        )
+    return paths
 
 
 def _committed_tree(fixture_dir: Path) -> set[str]:
@@ -209,6 +215,10 @@ def test_tree_ignores_transient_directories_from_fixture_gitignore(
         artifact = fixture / directory / "fake-run" / "artifact.log"
         artifact.parent.mkdir(parents=True)
         artifact.write_text("transient\n")
+
+        nested_artifact = fixture / "nested" / directory / "artifact.log"
+        nested_artifact.parent.mkdir(parents=True, exist_ok=True)
+        nested_artifact.write_text("transient\n")
 
     assert _tree(fixture) == pristine
 
