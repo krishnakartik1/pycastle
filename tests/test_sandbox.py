@@ -52,6 +52,14 @@ def test_build_run_command_wraps_inner_argv() -> None:
         "/home/krishna/work/repo:/home/krishna/work/repo",
         "-e",
         "CLAUDE_CONFIG_DIR=/home/node/.claude",
+        "-e",
+        "GIT_AUTHOR_NAME=PyCastle",
+        "-e",
+        "GIT_AUTHOR_EMAIL=pycastle@users.noreply.github.com",
+        "-e",
+        "GIT_COMMITTER_NAME=PyCastle",
+        "-e",
+        "GIT_COMMITTER_EMAIL=pycastle@users.noreply.github.com",
         sandbox.DEFAULT_IMAGE,
         "claude",
         "-p",
@@ -211,6 +219,55 @@ def test_build_run_command_does_not_leak_credentials() -> None:
         assert forbidden not in joined
 
 
+def _git_env(argv: list[str]) -> dict[str, str]:
+    """Collect ``NAME=VALUE`` from every ``-e`` splice that sets a ``GIT_*`` var."""
+    env: dict[str, str] = {}
+    for flag, value in zip(argv, argv[1:]):
+        if flag == "-e" and value.startswith("GIT_"):
+            name, _, val = value.partition("=")
+            env[name] = val
+    return env
+
+
+def test_build_run_command_sets_git_author_and_committer_identity() -> None:
+    # The implement/review prompts tell the runtime to commit its work, but the
+    # agent image gives the node user no git author. Pin the bot identity as
+    # both author AND committer -- git auto-detects (and can fail on) the
+    # committer separately, so setting only GIT_AUTHOR_* is not enough.
+    argv = sandbox.build_run_command(
+        "claude", inner_argv=["claude"], workspace=Path("/w")
+    )
+    assert _git_env(argv) == {
+        "GIT_AUTHOR_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+        "GIT_COMMITTER_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+    }
+
+
+def test_build_run_command_git_identity_is_runtime_agnostic() -> None:
+    # The identity is spliced by the wrapper, not the runtime, so codex commits
+    # get the same bot author as claude commits.
+    argv = sandbox.build_run_command(
+        "codex", inner_argv=["codex"], workspace=Path("/w")
+    )
+    assert _git_env(argv) == {
+        "GIT_AUTHOR_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+        "GIT_COMMITTER_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+    }
+
+
+def test_login_and_status_carry_no_git_identity() -> None:
+    # The auth-only builders never commit, so no git identity leaks into their
+    # argv -- keeping their exact-argv contract lean.
+    assert not _git_env(sandbox.build_login_command("claude"))
+    assert not _git_env(sandbox.build_status_command("claude"))
+    assert "GIT_AUTHOR_NAME" not in " ".join(sandbox.build_login_command("codex"))
+    assert "GIT_AUTHOR_NAME" not in " ".join(sandbox.build_status_command("codex"))
+
+
 def test_build_login_command_is_interactive_into_volume() -> None:
     argv = sandbox.build_login_command("claude")
 
@@ -335,6 +392,14 @@ def test_build_run_command_codex_pins_codex_home_and_volume() -> None:
         "/home/krishna/work/repo:/home/krishna/work/repo",
         "-e",
         "CODEX_HOME=/home/node/.codex",
+        "-e",
+        "GIT_AUTHOR_NAME=PyCastle",
+        "-e",
+        "GIT_AUTHOR_EMAIL=pycastle@users.noreply.github.com",
+        "-e",
+        "GIT_COMMITTER_NAME=PyCastle",
+        "-e",
+        "GIT_COMMITTER_EMAIL=pycastle@users.noreply.github.com",
         sandbox.DEFAULT_IMAGE,
         *inner,
     ]

@@ -84,6 +84,15 @@ CLAUDE_CONFIG_DIR = "/home/node/.claude"
 #: state. Pinned via ``CODEX_HOME`` rather than ``CLAUDE_CONFIG_DIR``.
 CODEX_HOME = "/home/node/.codex"
 
+#: The stable PyCastle bot git identity pinned for in-container commits. The
+#: ``implement`` and ``review`` prompts tell the runtime to commit its work, but
+#: the agent image gives the ``node`` user no git author. Without an identity
+#: ``git commit`` either aborts ("Author identity unknown") or synthesises a junk
+#: ``node@<container-id>.(none)`` author that rides into the run branch and PR.
+#: One identity serves as both author and committer.
+GIT_AUTHOR_NAME = "PyCastle"
+GIT_AUTHOR_EMAIL = "pycastle@users.noreply.github.com"
+
 
 @dataclass(frozen=True)
 class RuntimeSandboxConfig:
@@ -158,6 +167,27 @@ def _config_env_args(runtime_name: str) -> list[str]:
     return ["-e", f"{config.config_env}={config.config_dir}"]
 
 
+def _git_identity_args() -> list[str]:
+    """Pin the PyCastle bot git identity for in-container commits.
+
+    Returns the four ``-e GIT_*`` pairs setting both the author and the
+    committer to the same bot identity. Git honours these environment variables
+    above any ``git config`` and auto-detects the committer separately from the
+    author, so all four must be set for a config-less container to commit
+    deterministically — regardless of what the image did or didn't configure.
+    """
+    return [
+        "-e",
+        f"GIT_AUTHOR_NAME={GIT_AUTHOR_NAME}",
+        "-e",
+        f"GIT_AUTHOR_EMAIL={GIT_AUTHOR_EMAIL}",
+        "-e",
+        f"GIT_COMMITTER_NAME={GIT_AUTHOR_NAME}",
+        "-e",
+        f"GIT_COMMITTER_EMAIL={GIT_AUTHOR_EMAIL}",
+    ]
+
+
 def build_run_command(
     runtime_name: str,
     *,
@@ -177,6 +207,13 @@ def build_run_command(
     bind-mounts ``workspace`` at the same path so the agent reads and writes the
     real tree, and pins the runtime's config-dir env var
     (``CLAUDE_CONFIG_DIR`` for Claude, ``CODEX_HOME`` for Codex).
+
+    It also pins a stable PyCastle bot git identity (both author and committer,
+    via ``-e GIT_*``; see :func:`_git_identity_args`) so the in-container commits
+    the ``implement`` and ``review`` prompts ask for have a deterministic author
+    rather than aborting or synthesising a junk ``node@<container-id>`` one. The
+    auth-only ``login``/``status`` builders never commit and so carry no
+    identity.
 
     The bind-mount source stays ``workspace`` — the repo (or workspace) root —
     *not* the in-container working directory. ``workdir`` is the ``-w`` value,
@@ -210,6 +247,7 @@ def build_run_command(
         "-v",
         f"{workspace_path}:{workspace_path}",
         *_config_env_args(runtime_name),
+        *_git_identity_args(),
         image,
         *inner_argv,
     ]
