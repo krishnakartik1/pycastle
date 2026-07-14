@@ -19,9 +19,12 @@ pytest_cmd=$([ -x "$VENV_PYTEST" ] && echo "$VENV_PYTEST" || echo "pytest")
 
 if [ "${1:-}" = "--check-tools" ]; then
   missing=()
-  command -v "$ruff_cmd" >/dev/null 2>&1 || missing+=("ruff")
-  command -v "$black_cmd" >/dev/null 2>&1 || missing+=("black")
-  command -v "$pytest_cmd" >/dev/null 2>&1 || missing+=("pytest")
+  # Preflight validates the agent image contract, not a host checkout's
+  # bind-mounted virtualenv. Per-item worktrees do not contain the ignored
+  # .venv, so accepting it here would let preflight pass and the real gate fail.
+  command -v ruff >/dev/null 2>&1 || missing+=("ruff")
+  command -v black >/dev/null 2>&1 || missing+=("black")
+  command -v pytest >/dev/null 2>&1 || missing+=("pytest")
   if [ "${#missing[@]}" -ne 0 ]; then
     echo "Missing gate tools: ${missing[*]}" >&2
     exit 1

@@ -682,6 +682,31 @@ def test_repository_gate_check_tools_requires_every_unconditional_tool(
     assert "pytest" not in proc.stderr
 
 
+def test_repository_gate_check_tools_ignores_workspace_virtualenv(
+    tmp_path: Path,
+) -> None:
+    """A host .venv must not masquerade as toolchain installed in the image."""
+    repo_gate = Path(__file__).resolve().parents[1] / ".pycastle" / "gate"
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    for name in ("ruff", "black", "pytest"):
+        tool = venv_bin / name
+        tool.write_text("#!/usr/bin/env bash\nexit 0\n")
+        tool.chmod(0o755)
+    env = dict(os.environ, PATH="/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(repo_gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "Missing gate tools: ruff black pytest" in proc.stderr
+
+
 def test_scaffolded_gate_text_has_counter_and_fail_branch(tmp_path: Path) -> None:
     """The gate template carries the fail-if-zero counter and exit branch (#28).
 
