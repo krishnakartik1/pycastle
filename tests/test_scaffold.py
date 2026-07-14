@@ -91,6 +91,69 @@ def test_gitignore_is_in_the_written_list(tmp_path: Path) -> None:
     assert ".gitignore" in names
 
 
+@pytest.mark.parametrize("choice", ["host", "docker"])
+def test_scaffold_gitignore_excludes_agent_scratch_files(
+    tmp_path: Path, choice: str
+) -> None:
+    """The scaffolded .gitignore excludes the agent's transient scratch files (#68).
+
+    A phase's plan, a retried attempt's handoff, and any issue scratch land inside
+    .pycastle/ during a run. If they are not ignored, the orchestrator's
+    ``git add -A`` folds them into the issue branch and the run's PR (and drifts
+    the committed fixture). The patterns are anchored (leading ``/``) to .pycastle/
+    so they never shadow the tracked ``prompts/plan.md``.
+    """
+    scaffold_fixture(tmp_path, sandbox=choice)
+    gitignore = (tmp_path / ".pycastle" / ".gitignore").read_text()
+
+    assert "/handoff.md" in gitignore
+    assert "/plan.md" in gitignore
+    assert "/issue.md" in gitignore
+
+
+def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> None:
+    """``git add -A`` on a scaffolded repo never stages the agent's scratch (#68).
+
+    The orchestrator commits an issue's work with ``git add -A``. Without the
+    scratch-file ignores, the handoff/plan/issue documents a run drops into
+    .pycastle/ would be staged and committed into the issue branch (and merged
+    into the PR). This scaffolds into a fresh git repo, drops those exact strays,
+    stages everything, and confirms none of them are tracked -- while the real
+    tracked ``prompts/plan.md`` still is (proving the anchoring did not shadow a
+    same-basename file one directory down).
+    """
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture = tmp_path / ".pycastle"
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, env=env)
+
+    # The exact scratch files a run drops into .pycastle/ (a phase's plan, a
+    # retried attempt's handoff, an issue scratch).
+    for name in ("handoff.md", "plan.md", "issue.md"):
+        (fixture / name).write_text(f"stray {name}\n")
+
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+
+    # None of the scratch strays were staged...
+    for name in ("handoff.md", "plan.md", "issue.md"):
+        assert f".pycastle/{name}" not in tracked
+    # ...but the tracked prompt of the same basename still is (anchoring holds).
+    assert ".pycastle/prompts/plan.md" in tracked
+
+
 # --------------------------------------------------------------------------- #
 # Host-first vs Docker-first: an observable, tested difference                 #
 # --------------------------------------------------------------------------- #

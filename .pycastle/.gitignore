@@ -2,3 +2,11 @@
 logs/
 runs/
 worktrees/
+
+# PyCastle agent scratch files (transient): the plan a phase leaves for the next,
+# a retried attempt's handoff, and any issue scratch. They land in .pycastle/
+# during a run; excluding them keeps `git add -A` from committing them into an
+# issue branch. Anchored here so they never shadow the tracked prompts/plan.md.
+/handoff.md
+/plan.md
+/issue.md

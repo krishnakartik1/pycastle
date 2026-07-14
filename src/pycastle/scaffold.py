@@ -118,8 +118,9 @@ implementation yet -- work out the approach so the implement phase can move fast
    cases the review phase should later probe.
 5. Call out anything that looks out of scope for this one issue, and stop there.
 
-Write the plan where the implement phase can pick it up. Stay within the scope
-of this one issue. Do not modify unrelated code, and do not commit in this phase.
+Write the plan to `.pycastle/plan.md` -- an ignored scratch path the implement
+phase can pick up but that is never committed. Stay within the scope of this one
+issue. Do not modify unrelated code, and do not commit in this phase.
 """
 
 _IMPLEMENT_MD = """\
@@ -327,12 +328,25 @@ def _dockerfile(*, python: bool) -> str:
 
 
 # Excludes the transient run logs and generated run artifacts so they are never
-# committed. Mirrors the paths the repo's own root .gitignore excludes.
+# committed. Mirrors the paths the repo's own root .gitignore excludes. The
+# agent scratch files (the plan a phase leaves, a retried attempt's handoff, any
+# issue scratch) land directly in .pycastle/ during a run, so they are excluded
+# too -- otherwise the orchestrator's `git add -A` folds them into the issue
+# branch and the run's PR. They are anchored to this dir (leading `/`) so they
+# never shadow the tracked prompts/plan.md.
 _GITIGNORE = """\
 # PyCastle run output (transient): run logs and generated run artifacts.
 logs/
 runs/
 worktrees/
+
+# PyCastle agent scratch files (transient): the plan a phase leaves for the next,
+# a retried attempt's handoff, and any issue scratch. They land in .pycastle/
+# during a run; excluding them keeps `git add -A` from committing them into an
+# issue branch. Anchored here so they never shadow the tracked prompts/plan.md.
+/handoff.md
+/plan.md
+/issue.md
 """
 
 
