@@ -154,6 +154,36 @@ def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> No
     assert ".pycastle/prompts/plan.md" in tracked
 
 
+def test_scaffolded_gitignore_ignores_the_real_handoff_path(tmp_path: Path) -> None:
+    """The scaffolded ignore stays coupled to the path the orchestrator writes (#68).
+
+    The ignore patterns are hand-maintained string literals in the scaffolder,
+    while the retry handoff path is a constant in the orchestrator
+    (:data:`pycastle.orchestrator.HANDOFF_DOC`). If that constant is ever renamed
+    without updating the ignore, the handoff would silently start riding into the
+    issue branch again -- the exact regression #68 fixed. Asserting the *real*
+    path is ignored (via ``git check-ignore``, git's own matcher) keeps the two
+    from drifting apart. ``HANDOFF_DOC`` is repo-relative, so it is the path git
+    resolves against the scaffolded ``.pycastle/.gitignore``.
+    """
+    from pycastle.orchestrator import HANDOFF_DOC
+
+    scaffold_fixture(tmp_path, sandbox="host")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+
+    ignored = subprocess.run(
+        ["git", "check-ignore", HANDOFF_DOC],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    # git check-ignore exits 0 (and echoes the path) only when it is ignored.
+    assert ignored.returncode == 0, (
+        f"the orchestrator writes its handoff to {HANDOFF_DOC!r}, but the "
+        f"scaffolded .pycastle/.gitignore does not ignore it: {ignored.stderr}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Host-first vs Docker-first: an observable, tested difference                 #
 # --------------------------------------------------------------------------- #
