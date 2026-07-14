@@ -36,7 +36,7 @@ For development on PyCastle itself, clone the repository and run
 
 ## Quick start
 
-From the repository you want PyCastle to work on, scaffold its Project fixture:
+From the repository you want PyCastle to work on, scaffold its project fixture:
 
 ```bash
 pycastle init
@@ -52,6 +52,8 @@ fixture contains all of the project-owned behavior:
 - `.pycastle/Dockerfile` — the agent image recipe, including the project gate
   toolchain for detected Python projects.
 - `.pycastle/sandbox` — the default `host` or `docker` sandbox choice.
+- `.pycastle/.gitignore` — Run artifacts and runtime scratch files that should
+  stay out of version control.
 
 Review and commit this directory. In particular, make `.pycastle/gate` express
 what “passing” means for the project and extend `.pycastle/Dockerfile` with any
@@ -66,8 +68,9 @@ Docker volume and reused across projects:
 pycastle sandbox setup --runtime claude
 ```
 
-Use `--runtime codex` instead for Codex. Host runs use the runtime's existing
-host login and do not need `sandbox setup`.
+Use `--runtime codex` instead for Codex. Host runs do not need `sandbox setup`,
+but the selected runtime CLI must already be installed, authenticated, and
+available on `PATH`.
 
 PyCastle reads GitHub Issues carrying the `ready-for-agent` label. By default it
 only selects issues assigned to your authenticated `gh` user, so prepare an
@@ -90,7 +93,7 @@ request back to the branch from which the run started.
 
 ## Commands
 
-- `pycastle init` — scaffold the `.pycastle/` Project fixture described above.
+- `pycastle init` — scaffold the `.pycastle/` project fixture described above.
 - `pycastle run -i N --runtime claude` — work up to `N` ready issues; the
   default is one. Use `--include-unassigned` to include unassigned issues.
 - `pycastle run --sandbox docker --runtime codex` — override the recorded
@@ -102,7 +105,7 @@ request back to the branch from which the run started.
 - `pycastle sandbox build` — explicitly build the content-addressed image from
   `.pycastle/Dockerfile`; normal Docker runs build it on demand.
 
-## Customize the Project fixture
+## Customize the project fixture
 
 The fixture is regular project code, not hidden PyCastle configuration. Edit
 `.pycastle/prompts/` to change phase instructions, `.pycastle/gate` to run the
