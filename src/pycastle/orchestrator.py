@@ -98,14 +98,27 @@ def prune_run_branches(
             "10000",
             "--json",
             "headRefName",
-            "--jq",
-            ".[].headRefName",
         ],
         capture=True,
     )
     if getattr(open_prs, "returncode", 1) != 0:
         raise PruneError("Could not list open pull requests; no branches were deleted.")
-    open_heads = set((getattr(open_prs, "stdout", "") or "").splitlines())
+    try:
+        pr_data = json.loads(open_prs.stdout)
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        raise PruneError(
+            "Could not parse open pull requests; no branches were deleted."
+        ) from None
+    if not isinstance(pr_data, list) or any(
+        not isinstance(pr, dict)
+        or not isinstance(pr.get("headRefName"), str)
+        or not pr["headRefName"]
+        for pr in pr_data
+    ):
+        raise PruneError(
+            "Could not parse open pull requests; no branches were deleted."
+        )
+    open_heads = {pr["headRefName"] for pr in pr_data}
 
     refs = runner(
         ["git", "ls-remote", "--heads", "origin", "refs/heads/pycastle/run-*"],
@@ -117,12 +130,22 @@ def prune_run_branches(
             "Could not list remote run branches; no branches were deleted."
         )
 
-    prefix = "refs/heads/"
-    remote_branches = [
-        line.split("\t", 1)[1].removeprefix(prefix)
-        for line in (getattr(refs, "stdout", "") or "").splitlines()
-        if "\trefs/heads/pycastle/run-" in line
-    ]
+    refs_stdout = getattr(refs, "stdout", None)
+    if not isinstance(refs_stdout, str):
+        raise PruneError(
+            "Could not parse remote run branches; no branches were deleted."
+        )
+    ref_lines = refs_stdout.splitlines()
+
+    ref_prefix = "refs/heads/pycastle/run-"
+    remote_branches: list[str] = []
+    for line in ref_lines:
+        fields = line.split("\t")
+        if len(fields) != 2 or not fields[0] or not fields[1].startswith(ref_prefix):
+            raise PruneError(
+                "Could not parse remote run branches; no branches were deleted."
+            )
+        remote_branches.append(fields[1].removeprefix("refs/heads/"))
     stale = [branch for branch in remote_branches if branch not in open_heads]
     deleted: list[str] = []
     for branch in stale:

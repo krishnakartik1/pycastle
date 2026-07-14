@@ -33,7 +33,10 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
     """Closed/merged PR heads are pruned while open PR heads stay intact (#69)."""
     runner = MagicMock(
         side_effect=[
-            MagicMock(returncode=0, stdout="pycastle/run-open\n"),
+            MagicMock(
+                returncode=0,
+                stdout='[{"headRefName":"pycastle/run-open"}]',
+            ),
             MagicMock(
                 returncode=0,
                 stdout=(
@@ -70,6 +73,81 @@ def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
         orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
 
     assert not _calls_containing(runner, "git", "push", "origin", "--delete")
+
+
+@pytest.mark.parametrize("stdout", [None, "", "{}", '[{"headRefName":null}]'])
+def test_prune_run_branches_aborts_on_invalid_open_pr_output(
+    tmp_path: Path, stdout: str | None
+) -> None:
+    """Missing or malformed API fields cannot be mistaken for no open PRs."""
+    runner = MagicMock(return_value=MagicMock(returncode=0, stdout=stdout))
+
+    with pytest.raises(orchestrator.PruneError, match="parse open pull requests"):
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
+
+    runner.assert_called_once()
+
+
+def test_prune_run_branches_handles_empty_remote(tmp_path: Path) -> None:
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(returncode=0, stdout=""),
+        ]
+    )
+
+    assert (
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
+        == []
+    )
+    assert runner.call_count == 2
+
+
+def test_prune_run_branches_aborts_when_remote_branch_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(returncode=1, stdout="", stderr="git failed"),
+        ]
+    )
+
+    with pytest.raises(orchestrator.PruneError, match="list remote run branches"):
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
+
+    assert not _calls_containing(runner, "--delete")
+
+
+@pytest.mark.parametrize("stdout", [None, "malformed ref output"])
+def test_prune_run_branches_aborts_on_invalid_remote_branch_output(
+    tmp_path: Path, stdout: str | None
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(returncode=0, stdout=stdout),
+        ]
+    )
+
+    with pytest.raises(orchestrator.PruneError, match="parse remote run branches"):
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
+
+    assert not _calls_containing(runner, "--delete")
+
+
+def test_prune_run_branches_reports_deletion_failure(tmp_path: Path) -> None:
+    branch = "pycastle/run-closed"
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(returncode=0, stdout=f"abc\trefs/heads/{branch}\n"),
+            MagicMock(returncode=1, stderr="rejected"),
+        ]
+    )
+
+    with pytest.raises(orchestrator.PruneError, match=branch):
+        orchestrator.prune_run_branches(repo="owner/repo", runner=runner, cwd=tmp_path)
 
 
 def _git_aware_runner(
