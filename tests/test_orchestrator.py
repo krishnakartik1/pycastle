@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from pycastle import orchestrator
 from pycastle.models import IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
@@ -462,6 +464,102 @@ def test_empty_diff_on_only_issue_opens_no_pull_request(
     assert outcome.pr_opened is False
     source.mark_for_human.assert_called_once_with(2)
     # No pull request is even attempted.
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def _worktree_failing_runner(
+    *, fail_run: bool = False, fail_issues: set[int] | None = None
+) -> MagicMock:
+    """A git-aware runner whose ``git worktree add`` fails selectively (#64).
+
+    The run worktree add fails when ``fail_run`` is set; an issue worktree add
+    fails when its issue number is in ``fail_issues``. A failing add returns
+    git's real shape — a non-zero exit with stderr — and creates no directory;
+    every other add creates its directory like :func:`_git_aware_runner`.
+    """
+    fail_issues = fail_issues or set()
+
+    def side_effect(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "worktree", "add"]:
+            name = Path(argv[3]).name
+            failing = (name.startswith("run-") and fail_run) or (
+                name.startswith("issue-") and int(name.split("-")[1]) in fail_issues
+            )
+            if failing:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=128, stdout="", stderr="fatal: boom"
+                )
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+            return _ok()
+        return _ok()
+
+    return MagicMock(side_effect=side_effect)
+
+
+def test_run_worktree_add_failure_raises_and_works_no_issue(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A failed run-worktree add is fatal: no issue can be worked without it, so
+    # the run raises instead of silently driving the batch against a directory
+    # that was never created (#64). Nothing is claimed and no PR is attempted.
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _worktree_failing_runner(fail_run=True)
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    # A failed issue-worktree add is an infra fault, not an issue-content fault:
+    # rather than drive the agent against a directory that was never created (or
+    # mislabel the issue ready-for-human), it is raised so run_batch's interrupt
+    # teardown releases the claimed issue back to ready-for-agent and aborts (#64).
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _worktree_failing_runner(fail_issues={2})
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            iterations=1,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    # The claimed issue is released back to ready-for-agent, never mislabelled
+    # ready-for-human, and no PR is attempted for the aborted run.
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
+    source.mark_for_human.assert_not_called()
     assert not _calls_containing(runner, "gh", "pr", "create")
 
 

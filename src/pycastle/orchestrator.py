@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 
 Runner = Callable[..., Any]
 
+
+class WorktreeError(RuntimeError):
+    """A ``git worktree add`` exited non-zero and created no worktree.
+
+    Every git call here runs with ``check=False``, so a failing
+    ``git worktree add`` (a path collision, a checkout conflict, no disk) was
+    silently ignored and the run drove the agent against a worktree that never
+    existed — cascading into confusing downstream errors (#64). Raised instead so
+    the failure surfaces at its source, carrying git's captured output.
+    """
+
+
 #: A gate check decides whether an implement attempt's quality gates passed.
 #: It takes the issue worktree and returns a :class:`GateOutcome` whose
 #: ``passed`` is the green/red verdict and whose ``output`` is the captured gate
@@ -304,6 +316,30 @@ def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
     run_dir = _telemetry_dir(fixture_dir, run_id)
     with (run_dir / "run.log").open("a") as handle:
         handle.write(message + "\n")
+
+
+def add_worktree(worktree: Path, branch: str, *, runner: Runner, cwd: Path) -> None:
+    """Create ``worktree`` for ``branch`` or raise :class:`WorktreeError`.
+
+    ``git worktree add`` runs with ``check=False`` like every git call here, so
+    a non-zero exit is otherwise swallowed and the run proceeds to drive the
+    agent against a directory that was never created (#64). This reads the exit
+    code and raises with git's captured stderr/stdout so the failure surfaces at
+    its source instead of cascading into confusing downstream errors.
+    """
+    result = runner(
+        ["git", "worktree", "add", str(worktree), branch],
+        capture=True,
+        cwd=cwd,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        output = (
+            getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+        ).strip()
+        detail = f": {output}" if output else ""
+        raise WorktreeError(
+            f"git worktree add failed for {branch} at {worktree}{detail}"
+        )
 
 
 def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
@@ -699,11 +735,12 @@ def _work_issue(
 
     issue_worktree = worktree_root / f"issue-{issue.number}"
     runner(["git", "branch", branch, run_branch], capture=True, cwd=workspace)
-    runner(
-        ["git", "worktree", "add", str(issue_worktree), branch],
-        capture=True,
-        cwd=workspace,
-    )
+    # A failed worktree add is an infra fault, not an issue-content fault, so it
+    # is raised (not routed to ready-for-human): run_batch's interrupt teardown
+    # removes the absent worktree and releases the claimed issue back to
+    # ready-for-agent, then the run aborts rather than driving the agent against a
+    # directory that was never created (#64).
+    add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
 
     walk: WalkResult = _walk_issue(
         issue,
@@ -904,11 +941,9 @@ def run_batch(
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
     runner(["git", "branch", run_branch, base_branch], capture=True, cwd=workspace)
-    runner(
-        ["git", "worktree", "add", str(run_worktree), run_branch],
-        capture=True,
-        cwd=workspace,
-    )
+    # A failed run-worktree add is fatal: no issue can be worked without it, so
+    # raise rather than silently drive the batch against a missing directory (#64).
+    add_worktree(run_worktree, run_branch, runner=runner, cwd=workspace)
     _append_log(
         fixture_dir,
         run_id,
