@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# PyCastle project dependency setup. This file is project-owned; edit it freely.
+set -euo pipefail
+python3 -m venv --system-site-packages .pycastle/venv
+source .pycastle/venv/bin/activate
+pip install -e ".[dev]" || pip install -e .

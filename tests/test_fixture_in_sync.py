@@ -11,7 +11,7 @@ The comparison treats two kinds of file differently:
 * The non-customizable files (``sandbox``, ``.gitignore``, ``main.py``) must be
   **byte-identical** -- a drift there is exactly the staleness this guard exists
   to catch.
-* The ``gate``, the ``prompts/*.md``, and the ``Dockerfile`` are **project-owned
+* The ``gate``, ``setup``, the ``prompts/*.md``, and the ``Dockerfile`` are **project-owned
   customizations** (a repo edits its gate for its own stack, tunes its prompts,
   and extends the Dockerfile's PROJECT EXTENSION POINT with its own toolchain --
   the docker sandbox runs the gate inside that image, see #79), so the guard only
@@ -49,6 +49,7 @@ from pycastle.scaffold import (
 #: scaffolder, so the guard only checks they exist rather than matching bytes.
 _EXEMPT_FROM_BYTES = {
     "gate",
+    "setup",
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
@@ -136,7 +137,7 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
         f"missing {sorted(missing)}, unexpected {sorted(extra)}"
     )
 
-    # Byte-identical for everything except the project's own gate/prompts.
+    # Byte-identical for everything except the project's own setup/gate/prompts.
     for relative in scaffolded_tree - _EXEMPT_FROM_BYTES:
         assert (committed / relative).read_bytes() == (
             scaffolded / relative

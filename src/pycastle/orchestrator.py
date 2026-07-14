@@ -168,6 +168,7 @@ def prune_run_branches(
 #: attempt as passing (the real gate is the project's own and is wired by the
 #: caller).
 GateCheck = Callable[[Path], "GateOutcome"]
+Setup = Callable[[Path], None]
 
 #: Where a handoff document is written inside the issue worktree (ignored path).
 HANDOFF_DOC = ".pycastle/handoff.md"
@@ -209,6 +210,56 @@ def _gates_always_pass(_worktree: Path) -> GateOutcome:
 #: decides its own gate without the runner hardcoding a command. ``pycastle
 #: init`` (#11) will scaffold a default ``gate`` file matching this convention.
 FIXTURE_GATE = "gate"
+FIXTURE_SETUP = "setup"
+
+
+class SetupError(RuntimeError):
+    """The project-owned setup hook could not prepare an issue worktree."""
+
+
+def make_fixture_setup(
+    fixture_dir: Path,
+    *,
+    runner: Runner = run_cmd,
+    sandbox: str = "host",
+    image: str | None = None,
+    runtime_name: str = "claude",
+    workspace: Path | None = None,
+) -> Setup:
+    """Build the optional project-owned setup hook for the selected sandbox.
+
+    The canonical fixture executable runs with the issue worktree as its cwd,
+    immediately before that issue's phase graph is walked. Missing hooks are a
+    backward-compatible no-op. Launch errors and non-zero exits raise
+    :class:`SetupError`, because an unprepared sandbox is a run infrastructure
+    failure rather than a phase outcome that should follow a graph edge.
+    """
+    setup_path = fixture_dir / FIXTURE_SETUP
+
+    def _setup(worktree: Path) -> None:
+        if not setup_path.is_file():
+            return
+        try:
+            if sandbox == "docker":
+                argv = sandbox_mod.build_run_command(
+                    runtime_name,
+                    inner_argv=["bash", str(setup_path.resolve())],
+                    workspace=workspace or Path.cwd(),
+                    workdir=worktree,
+                    image=image or sandbox_mod.DEFAULT_IMAGE,
+                )
+                result = runner(argv, capture=True)
+            else:
+                result = runner([str(setup_path.resolve())], cwd=worktree, capture=True)
+        except OSError as exc:
+            raise SetupError(f"Project setup could not be launched: {exc}") from exc
+        if getattr(result, "returncode", 1) != 0:
+            output = (getattr(result, "stdout", "") or "") + (
+                getattr(result, "stderr", "") or ""
+            )
+            raise SetupError(f"Project setup failed:\n{output}".rstrip())
+
+    return _setup
 
 
 def _gate_outcome_from_result(result: Any) -> GateOutcome:
@@ -835,6 +886,7 @@ def _work_issue(
     runner: Runner,
     impl_retries: int,
     gate_check: GateCheck,
+    setup: Setup,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
@@ -887,6 +939,8 @@ def _work_issue(
     # ready-for-agent, then the run aborts rather than driving the Runtime against a
     # directory that was never created (#64).
     add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
+
+    setup(issue_worktree)
 
     walk: WalkResult = _walk_issue(
         issue,
@@ -1051,6 +1105,7 @@ def run_batch(
     iterations: int = 1,
     impl_retries: int = 2,
     gate_check: GateCheck | None = None,
+    setup: Setup | None = None,
     workspace: Path | None = None,
     worktree_root: Path | None = None,
     include_unassigned: bool = False,
@@ -1074,6 +1129,9 @@ def run_batch(
     that exhausts its retries is labelled ``ready-for-human`` and the run
     continues to the next issue.
 
+    ``setup`` prepares each newly-created issue worktree before its phase graph
+    is walked. It defaults to a no-op for callers and older Project fixtures.
+
     ``verbose`` (#48, #52) turns on transcript persistence: before each issue is
     worked the runtime's transcript sink is bound to that issue's transcript log
     under ``.pycastle/runs/<run_id>/`` (live ``[THINKING:<phase>]`` and
@@ -1082,6 +1140,7 @@ def run_batch(
     before.
     """
     gate_check = gate_check or _gates_always_pass
+    setup = setup or (lambda _worktree: None)
     workspace = workspace or Path.cwd()
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
@@ -1134,6 +1193,7 @@ def run_batch(
                         runner=runner,
                         impl_retries=impl_retries,
                         gate_check=gate_check,
+                        setup=setup,
                         verbose=verbose,
                     )
                 )

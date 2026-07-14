@@ -1353,3 +1353,64 @@ def test_gate_output_surfaced_on_success_under_verbose(
     transcript = _transcript_path(fixture_dir, "20260613-101500", 8)
     assert transcript.is_file()
     assert "[gate] [GATE] all green" in transcript.read_text()
+
+
+# Project setup runs before the phase walk (#82).                               #
+
+
+def test_fixture_setup_runs_in_worktree_before_any_phase(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    setup = fixture_dir / orchestrator.FIXTURE_SETUP
+    setup.write_text("#!/usr/bin/env bash\nexit 0\n")
+    setup.chmod(0o755)
+    events: list[str] = []
+
+    def runner(argv: list[str], **kwargs: object) -> MagicMock:
+        if argv == [str(setup.resolve())]:
+            events.append("setup")
+            assert kwargs["cwd"] == tmp_path
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    run_setup = orchestrator.make_fixture_setup(fixture_dir, runner=runner)
+    run_setup(tmp_path)
+    events.append("phase")
+    assert events == ["setup", "phase"]
+
+
+def test_docker_setup_uses_the_same_sandbox_wrapper(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    setup = fixture_dir / orchestrator.FIXTURE_SETUP
+    setup.write_text("#!/usr/bin/env bash\nexit 0\n")
+    setup.chmod(0o755)
+    captured: dict[str, object] = {}
+
+    def runner(argv: list[str], **kwargs: object) -> MagicMock:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    worktree = tmp_path / "issue-82"
+    run_setup = orchestrator.make_fixture_setup(
+        fixture_dir,
+        runner=runner,
+        sandbox="docker",
+        image="agent:test",
+        runtime_name="codex",
+        workspace=tmp_path,
+    )
+    run_setup(worktree)
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[-2:] == ["bash", str(setup.resolve())]
+    assert "agent:test" in argv
+    assert str(worktree) in argv
+    assert "cwd" not in captured
+
+
+def test_fixture_setup_absent_is_a_noop(fixture_dir: Path, tmp_path: Path) -> None:
+    runner = MagicMock()
+    orchestrator.make_fixture_setup(fixture_dir, runner=runner)(tmp_path)
+    runner.assert_not_called()

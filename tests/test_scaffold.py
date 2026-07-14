@@ -31,6 +31,7 @@ from pycastle.scaffold import (
 EXPECTED_TREE = {
     "main.py",
     "gate",
+    "setup",
     "sandbox",
     "Dockerfile",
     ".gitignore",
@@ -38,6 +39,43 @@ EXPECTED_TREE = {
     "prompts/implement.md",
     "prompts/review.md",
 }
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        ("uv.lock", "uv sync --all-extras"),
+        ("poetry.lock", "poetry install"),
+        ("requirements.txt", "pip install -r requirements.txt"),
+    ],
+)
+def test_scaffold_detects_project_setup_command(
+    tmp_path: Path, manifest: str, expected: str
+) -> None:
+    (tmp_path / manifest).write_text("")
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = tmp_path / ".pycastle" / "setup"
+    assert expected in setup.read_text()
+    assert stat.S_IMODE(setup.stat().st_mode) == 0o755
+
+
+def test_scaffolded_pyproject_setup_falls_back_without_dev_extra(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert 'pip install -e ".[dev]" || pip install -e .' in setup
+
+
+def test_scaffolded_setup_is_a_documented_noop_without_manifest(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert "No supported dependency manifest was found" in setup
+    assert "exit 0" in setup
 
 
 def _written_relative(written: list[Path], fixture_dir: Path) -> set[str]:

@@ -3,7 +3,7 @@
 This is the deep module behind ``pycastle init`` (#11): it takes the host-first
 vs Docker-first choice and writes the Project fixture — a Builder-style
 ``main.py``, a ``Dockerfile`` for the agent image, the plan/implement/review
-prompts, a default ``gate``, a ``sandbox`` marker recording the choice, and a
+prompts, default ``setup`` and ``gate`` executables, a ``sandbox`` marker, and a
 ``.gitignore`` that excludes run logs and generated run artifacts. The output is
 a file tree, which is what the tests assert.
 
@@ -227,6 +227,37 @@ if [ "$ran" -eq 0 ]; then
 fi
 """
 
+_SETUP_NOOP = """\
+#!/usr/bin/env bash
+# PyCastle project dependency setup.
+# No supported dependency manifest was found when `pycastle init` ran.
+# Replace this no-op with the command that prepares your project for its phases
+# and gate. PyCastle executes this project-owned hook at the start of each issue.
+exit 0
+"""
+
+
+def _setup_script(target_dir: Path) -> str:
+    """Choose the initial project-owned setup hook from present manifests."""
+    if (target_dir / "uv.lock").exists():
+        command = "export UV_PROJECT_ENVIRONMENT=.pycastle/venv\nuv sync --all-extras"
+    elif (target_dir / "poetry.lock").exists():
+        command = "poetry install"
+    elif (target_dir / "pyproject.toml").exists():
+        command = 'pip install -e ".[dev]" || pip install -e .'
+    elif (target_dir / "requirements.txt").exists():
+        command = "pip install -r requirements.txt"
+    else:
+        return _SETUP_NOOP
+    return f"""#!/usr/bin/env bash
+# PyCastle project dependency setup. This file is project-owned; edit it freely.
+set -euo pipefail
+python3 -m venv --system-site-packages .pycastle/venv
+source .pycastle/venv/bin/activate
+{command}
+"""
+
+
 # The agent image the project extends with its own language dependencies (#4).
 # Based on node:22-slim so the bundled Claude/Codex CLIs are present; the project
 # adds its toolchains at the marked extension point.
@@ -309,15 +340,21 @@ _EXTENSION_PYTHON = """\
 # Docker sandbox runs the quality gate INSIDE this image, and a toolchain-less
 # image makes that gate fail loud, so these must be baked in.
 RUN apt-get update \\
-    && apt-get install -y --no-install-recommends python3 python3-pip \\
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \\
     && rm -rf /var/lib/apt/lists/*
 
 # node:22-slim (Debian 12) marks the system interpreter externally-managed, so
 # --break-system-packages is required to pip-install into it.
-RUN pip install --break-system-packages --no-cache-dir ruff black pytest
+RUN pip install --break-system-packages --no-cache-dir ruff black pytest uv poetry
 
-# ALSO add your project's own runtime and test dependencies here (e.g. install
-# from pyproject.toml) so pytest can import your package when the gate runs.
+# Dependency setup runs in a short-lived container before the phases. Keep its
+# project environment in the bind-mounted worktree so later phase/gate
+# containers see the installed dependencies too.
+ENV PATH=".pycastle/venv/bin:${PATH}"
+
+# Project runtime and test dependencies are installed by `.pycastle/setup` from
+# the bind-mounted worktree at container start, keeping them aligned with the
+# checked-out manifest without changing this image's content-addressed tag.
 # NOTE: only the Python gate toolchain is handled automatically today; carrying
 # the toolchain for non-Python stacks (Go/JS/Rust) is a follow-up.
 # ---------------------------------------------------------------------------"""
@@ -363,10 +400,13 @@ worktrees/
 /plan.md
 /issue.md
 /plan-issue-*.md
+/venv/
 """
 
 
-def _fixture_files(sandbox: SandboxChoice, *, python: bool) -> dict[str, str]:
+def _fixture_files(
+    sandbox: SandboxChoice, *, python: bool, setup: str
+) -> dict[str, str]:
     """Return the fixture's relative paths mapped to their text content.
 
     The mapping is identical for both choices except the ``sandbox`` marker,
@@ -381,6 +421,7 @@ def _fixture_files(sandbox: SandboxChoice, *, python: bool) -> dict[str, str]:
     return {
         "main.py": _MAIN_PY,
         "gate": _GATE,
+        "setup": setup,
         SANDBOX_MARKER: f"{sandbox}\n",
         "Dockerfile": _dockerfile(python=python),
         ".gitignore": _GITIGNORE,
@@ -401,7 +442,7 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
     ``plan`` -> ``implement`` -> ``review`` -> ``DONE``, which loads and walks
     end to end before any customization.
 
-    Returns the written files (the ``gate`` is left executable). Raises
+    Returns the written files (``setup`` and ``gate`` are left executable). Raises
     :class:`FixtureExistsError` if ``target_dir`` already has a ``.pycastle/``
     fixture (init never clobbers one), and :class:`ValueError` for a ``sandbox``
     value outside ``host``/``docker`` -- validated before anything is written.
@@ -420,10 +461,15 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
     # (#19): the Docker sandbox runs the gate inside the image, and a
     # toolchain-less image makes a Python project's in-container gate fail loud
     # (#28). Presence-check only -- an empty/malformed pyproject.toml still counts.
-    python = (target_dir / "pyproject.toml").exists()
+    python = any(
+        (target_dir / manifest).exists()
+        for manifest in ("pyproject.toml", "requirements.txt")
+    )
 
     written: list[Path] = []
-    for relative, content in _fixture_files(sandbox, python=python).items():
+    for relative, content in _fixture_files(
+        sandbox, python=python, setup=_setup_script(target_dir)
+    ).items():
         path = fixture_dir / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
@@ -435,6 +481,8 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
     # (an OR could leave it group/other-writable under a permissive umask).
     gate = fixture_dir / "gate"
     gate.chmod(0o755)
+    setup = fixture_dir / "setup"
+    setup.chmod(0o755)
 
     logger.info(
         "Scaffolded the PyCastle fixture into %s (%d files, sandbox=%s).",

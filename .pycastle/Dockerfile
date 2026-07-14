@@ -31,16 +31,15 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --
 # Docker sandbox runs the quality gate INSIDE this image, and a toolchain-less
 # image makes that gate fail loud, so these must be baked in.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # node:22-slim (Debian 12) marks the system interpreter externally-managed, so
 # --break-system-packages is required to pip-install into it.
-RUN pip install --break-system-packages --no-cache-dir ruff black pytest
+RUN pip install --break-system-packages --no-cache-dir ruff black pytest uv poetry
 
-# This repo's own runtime dependency, so pytest can import pycastle when the
-# gate runs in the per-item worktree (which carries no .venv).
-RUN pip install --break-system-packages --no-cache-dir "pydantic>=2"
+# Project dependencies are installed from the checked-out manifest by setup.
+ENV PATH=".pycastle/venv/bin:${PATH}"
 # ---------------------------------------------------------------------------
 
 # Pre-create the auth-volume mount dirs owned by `node`. A fresh Docker named

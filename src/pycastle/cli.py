@@ -11,7 +11,12 @@ from pathlib import Path
 from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
-from .orchestrator import PruneError, make_fixture_gate_check, prune_run_branches
+from .orchestrator import (
+    PruneError,
+    make_fixture_gate_check,
+    make_fixture_setup,
+    prune_run_branches,
+)
 from .orchestrator import run_batch as run_loop
 from .preflight import (
     PreflightError,
@@ -292,11 +297,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
             runtime_name=args.runtime,
             workspace=workspace,
         )
+        setup = make_fixture_setup(
+            FIXTURE_DIR,
+            sandbox="docker",
+            image=image,
+            runtime_name=args.runtime,
+            workspace=workspace,
+        )
     else:
         runtime = _build_runtime(
             args.runtime, args.sandbox, workspace, verbose=args.verbose
         )
         gate_check = make_fixture_gate_check(FIXTURE_DIR)
+        setup = make_fixture_setup(FIXTURE_DIR)
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
@@ -313,6 +326,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         iterations=args.iterations,
         include_unassigned=args.include_unassigned,
         gate_check=gate_check,
+        setup=setup,
         verbose=args.verbose,
     )
     if not outcome.issues:
