@@ -259,6 +259,24 @@ def test_build_run_command_git_identity_is_runtime_agnostic() -> None:
     }
 
 
+def test_build_run_command_git_identity_survives_custom_image() -> None:
+    # Pinning the identity in the harness (not the Dockerfile) is what lets a
+    # bring-your-own --image -- which never ran the scaffolded Dockerfile -- still
+    # commit with the bot author. Lock that: a custom image keeps the identity.
+    argv = sandbox.build_run_command(
+        "claude",
+        inner_argv=["claude"],
+        workspace=Path("/w"),
+        image="my/agent:dev",
+    )
+    assert _git_env(argv) == {
+        "GIT_AUTHOR_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+        "GIT_COMMITTER_NAME": sandbox.GIT_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": sandbox.GIT_AUTHOR_EMAIL,
+    }
+
+
 def test_login_and_status_carry_no_git_identity() -> None:
     # The auth-only builders never commit, so no git identity leaks into their
     # argv -- keeping their exact-argv contract lean.
