@@ -8,11 +8,13 @@ recorded sandbox choice and compares against the committed fixture.
 
 The comparison treats two kinds of file differently:
 
-* The non-customizable files (``sandbox``, ``Dockerfile``, ``.gitignore``,
-  ``main.py``) must be **byte-identical** -- a drift there is exactly the staleness
-  this guard exists to catch.
-* The ``gate`` and the ``prompts/*.md`` are **project-owned customizations** (a
-  repo edits its gate for its own stack and tunes its prompts), so the guard only
+* The non-customizable files (``sandbox``, ``.gitignore``, ``main.py``) must be
+  **byte-identical** -- a drift there is exactly the staleness this guard exists
+  to catch.
+* The ``gate``, the ``prompts/*.md``, and the ``Dockerfile`` are **project-owned
+  customizations** (a repo edits its gate for its own stack, tunes its prompts,
+  and extends the Dockerfile's PROJECT EXTENSION POINT with its own toolchain --
+  the docker sandbox runs the gate inside that image, see #79), so the guard only
   requires they are *present*, not byte-equal. This matches issue #26's "modulo
   the project's own gate/prompt customizations".
 
@@ -40,6 +42,7 @@ _EXEMPT_FROM_BYTES = {
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
+    "Dockerfile",
 }
 
 
@@ -127,7 +130,7 @@ def test_guard_catches_byte_drift(tmp_path: Path) -> None:
     drifted = tmp_path / "drifted" / FIXTURE_DIRNAME
 
     # Pick a non-exempt file and confirm a fresh scaffold matches byte for byte.
-    target = "Dockerfile"
+    target = "main.py"
     assert target not in _EXEMPT_FROM_BYTES
     assert (pristine / target).read_bytes() == (drifted / target).read_bytes()
 

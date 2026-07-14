@@ -26,13 +26,21 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 
 # --- PROJECT EXTENSION POINT ------------------------------------------------
-# Add your project's own language toolchains and system packages here, e.g.:
-#
-#   RUN apt-get update && apt-get install -y --no-install-recommends \
-#         python3 python3-pip \
-#     && rm -rf /var/lib/apt/lists/*
-#
-# Leave this block empty if a plain Node toolchain is all your repo needs.
+# This is a Python project (a pyproject.toml was present at scaffold time), so
+# the image carries python3 plus the gate toolchain (ruff/black/pytest). The
+# Docker sandbox runs the quality gate INSIDE this image, and a toolchain-less
+# image makes that gate fail loud, so these must be baked in.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# node:22-slim (Debian 12) marks the system interpreter externally-managed, so
+# --break-system-packages is required to pip-install into it.
+RUN pip install --break-system-packages --no-cache-dir ruff black pytest
+
+# This repo's own runtime dependency, so pytest can import pycastle when the
+# gate runs in the per-item worktree (which carries no .venv).
+RUN pip install --break-system-packages --no-cache-dir "pydantic>=2"
 # ---------------------------------------------------------------------------
 
 # Pre-create the auth-volume mount dirs owned by `node`. A fresh Docker named
