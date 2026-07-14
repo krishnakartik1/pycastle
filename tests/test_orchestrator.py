@@ -563,6 +563,104 @@ def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
     assert not _calls_containing(runner, "gh", "pr", "create")
 
 
+def test_add_worktree_success_issues_the_add_and_does_not_raise(
+    tmp_path: Path,
+) -> None:
+    # The happy path: a zero exit means git created the worktree, so the helper
+    # returns quietly having issued exactly the captured add at the given cwd (#64).
+    runner = MagicMock(return_value=_ok())
+    worktree = tmp_path / "wt" / "issue-7"
+
+    orchestrator.add_worktree(worktree, "br", runner=runner, cwd=tmp_path)
+
+    runner.assert_called_once_with(
+        ["git", "worktree", "add", str(worktree), "br"],
+        capture=True,
+        cwd=tmp_path,
+    )
+
+
+def test_add_worktree_failure_surfaces_git_stderr(tmp_path: Path) -> None:
+    # A non-zero exit means no worktree was created; the helper raises and carries
+    # git's stderr so the operator sees why the add failed rather than a downstream
+    # ghost error (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="fatal: '/x' already exists"
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert "fatal: '/x' already exists" in str(excinfo.value)
+    assert "br" in str(excinfo.value)
+
+
+def test_add_worktree_failure_falls_back_to_stdout_when_stderr_empty(
+    tmp_path: Path,
+) -> None:
+    # git usually reports on stderr, but a failure that only wrote stdout must not
+    # be dropped: the helper falls back to stdout for the raised detail (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="could not create work tree dir", stderr=""
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert "could not create work tree dir" in str(excinfo.value)
+
+
+def test_add_worktree_failure_with_no_output_has_no_dangling_detail(
+    tmp_path: Path,
+) -> None:
+    # A silent failure (no stderr/stdout, only a non-zero exit) still raises, and
+    # the message stays clean — no trailing ": " with nothing after it (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(
+            tmp_path / "issue-9", "br", runner=runner, cwd=tmp_path
+        )
+
+    message = str(excinfo.value)
+    assert message == f"git worktree add failed for br at {tmp_path / 'issue-9'}"
+
+
+def test_add_worktree_failure_tolerates_none_captured_streams(tmp_path: Path) -> None:
+    # A runner that leaves stderr/stdout as ``None`` (an uncaptured CompletedProcess
+    # shape) must not blow up on ``.strip()``; the helper still raises cleanly (#64).
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=None, stderr=None
+        )
+    )
+
+    with pytest.raises(orchestrator.WorktreeError) as excinfo:
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+    assert str(excinfo.value) == f"git worktree add failed for br at {tmp_path / 'x'}"
+
+
+def test_add_worktree_missing_returncode_is_treated_as_failure(
+    tmp_path: Path,
+) -> None:
+    # Defensive default: a runner result without a ``returncode`` (an odd/mocked
+    # shape) is treated as a failure rather than a silent success, so a worktree is
+    # never assumed created on ambiguous output (#64).
+    runner = MagicMock(return_value=object())
+
+    with pytest.raises(orchestrator.WorktreeError):
+        orchestrator.add_worktree(tmp_path / "x", "br", runner=runner, cwd=tmp_path)
+
+
 def test_telemetry_and_run_log_are_written_into_the_fixture(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
