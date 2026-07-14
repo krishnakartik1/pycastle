@@ -31,6 +31,7 @@ from pycastle.scaffold import (
 EXPECTED_TREE = {
     "main.py",
     "gate",
+    "setup",
     "sandbox",
     "Dockerfile",
     ".gitignore",
@@ -38,6 +39,58 @@ EXPECTED_TREE = {
     "prompts/implement.md",
     "prompts/review.md",
 }
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        ("uv.lock", "uv sync --all-extras"),
+        (
+            "poetry.lock",
+            "POETRY_VIRTUALENVS_CREATE=false poetry install",
+        ),
+        ("requirements.txt", "pip install -r requirements.txt"),
+    ],
+)
+def test_scaffold_detects_project_setup_command(
+    tmp_path: Path, manifest: str, expected: str
+) -> None:
+    (tmp_path / manifest).write_text("")
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = tmp_path / ".pycastle" / "setup"
+    assert expected in setup.read_text()
+    assert stat.S_IMODE(setup.stat().st_mode) == 0o755
+
+
+def test_scaffolded_pyproject_setup_falls_back_without_dev_extra(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert 'pip install -e ".[dev]" || pip install -e .' in setup
+
+
+def test_scaffold_setup_manifest_precedence_is_deterministic(tmp_path: Path) -> None:
+    for manifest in ("uv.lock", "poetry.lock", "pyproject.toml", "requirements.txt"):
+        (tmp_path / manifest).write_text("")
+
+    scaffold_fixture(tmp_path, sandbox="docker")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert "uv sync --all-extras" in setup
+    assert "poetry install" not in setup
+    assert "pip install" not in setup
+
+
+def test_scaffolded_setup_is_a_documented_noop_without_manifest(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+
+    setup = (tmp_path / ".pycastle" / "setup").read_text()
+    assert "No supported dependency manifest was found" in setup
+    assert "exit 0" in setup
 
 
 def _written_relative(written: list[Path], fixture_dir: Path) -> set[str]:
@@ -609,6 +662,102 @@ def test_scaffolded_gate_passes_when_at_least_one_tool_present(
     assert proc.returncode == 0, proc.stderr
     # black/pytest were skipped, but ruff ran, so the gate is non-vacuous.
     assert "skipping gate step" in proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not on PATH")
+def test_scaffolded_gate_check_tools_fails_fast_without_any_tool(
+    tmp_path: Path,
+) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    gate = tmp_path / ".pycastle" / "gate"
+    env = dict(os.environ, PATH="/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "ruff" in proc.stderr
+    assert "black" in proc.stderr
+    assert "pytest" in proc.stderr
+
+
+def test_scaffolded_gate_check_tools_only_looks_up_tools(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    gate = tmp_path / ".pycastle" / "gate"
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    fake_ruff = bindir / "ruff"
+    fake_ruff.write_text("#!/usr/bin/env bash\nexit 99\n")
+    fake_ruff.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    # The generic gate's existing policy is non-vacuousness: one available
+    # configured tool is enough. Exit 99 would prove ruff was actually run.
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_repository_gate_check_tools_requires_every_unconditional_tool(
+    tmp_path: Path,
+) -> None:
+    repo_gate = Path(__file__).resolve().parents[1] / ".pycastle" / "gate"
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    for name in ("ruff", "pytest"):
+        tool = bindir / name
+        tool.write_text("#!/usr/bin/env bash\nexit 99\n")
+        tool.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(repo_gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "black" in proc.stderr
+    assert "ruff" not in proc.stderr
+    assert "pytest" not in proc.stderr
+
+
+def test_repository_gate_check_tools_ignores_workspace_virtualenv(
+    tmp_path: Path,
+) -> None:
+    """A host .venv must not masquerade as toolchain installed in the image."""
+    repo_gate = Path(__file__).resolve().parents[1] / ".pycastle" / "gate"
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    for name in ("ruff", "black", "pytest"):
+        tool = venv_bin / name
+        tool.write_text("#!/usr/bin/env bash\nexit 0\n")
+        tool.chmod(0o755)
+    env = dict(os.environ, PATH="/usr/bin:/bin")
+
+    proc = subprocess.run(
+        [str(repo_gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "Missing gate tools: ruff black pytest" in proc.stderr
 
 
 def test_scaffolded_gate_text_has_counter_and_fail_branch(tmp_path: Path) -> None:

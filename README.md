@@ -89,7 +89,10 @@ pycastle run --runtime claude
 The sandbox recorded by `init` is used automatically. Override it for one run
 with `--sandbox host` or `--sandbox docker`; choose Codex with `--runtime codex`.
 Successful issues are folded into a per-run branch and PyCastle opens a pull
-request back to the branch from which the run started.
+request back to the branch from which the run started. After run PRs are merged
+or closed, run `pycastle prune` to remove their remote `pycastle/run-*` branches.
+The command discovers all open PR heads before deleting anything and always
+keeps their branches intact.
 
 ## Commands
 
@@ -100,6 +103,8 @@ request back to the branch from which the run started.
   sandbox and runtime for this run.
 - `pycastle run --verbose` — stream reasoning/output and persist per-issue
   transcripts and telemetry under `.pycastle/runs/`.
+- `pycastle prune` — delete remote `pycastle/run-*` branches whose PRs are
+  merged or closed, while preserving every branch attached to an open PR.
 - `pycastle sandbox setup --runtime claude` — authenticate a runtime in its
   shared Docker auth volume.
 - `pycastle sandbox build` — explicitly build the content-addressed image from

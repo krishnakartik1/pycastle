@@ -29,6 +29,10 @@ The project-owned quality check run after the implement phase; a non-zero exit
 means the attempt failed and is retried with a handoff.
 _Avoid_: check, CI, test step (the gate may *run* tests, but it is not "the tests").
 
+**Setup**:
+The optional project-owned `.pycastle/setup` executable that prepares runtime
+and test dependencies in an issue worktree before its phase graph is walked.
+
 **Handoff**:
 The document a failed attempt leaves for the next attempt, summarizing what was
 tried and what to fix.
@@ -69,7 +73,8 @@ _Avoid_: container, box, sandbox image.
 
 **Image contract**:
 What any agent image must satisfy to be runnable: the runtime CLI on PATH, the
-project's gate toolchain on PATH (the gate runs in this image, not on the host),
+project's gate toolchain and any tools named by its setup executable on PATH
+(the gate and setup run in this image, not on the host),
 a `node` user with home `/home/node`, write access to the mounted auth volume and
 the bind-mounted workspace, and honoring the runtime's config-dir env var. The
 scaffolded Dockerfile is one adapter that satisfies it.

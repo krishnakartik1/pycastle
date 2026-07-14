@@ -11,9 +11,18 @@ from pathlib import Path
 from . import sandbox
 from .commands import run_cmd
 from .issues import GitHubIssueSource
-from .orchestrator import make_fixture_gate_check
+from .orchestrator import (
+    PruneError,
+    make_fixture_gate_check,
+    make_fixture_setup,
+    prune_run_branches,
+)
 from .orchestrator import run_batch as run_loop
-from .preflight import PreflightError, check_required_commands
+from .preflight import (
+    PreflightError,
+    check_docker_gate_toolchain,
+    check_required_commands,
+)
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
 
@@ -33,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
+    sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
     sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
@@ -271,10 +281,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # branch that already resolves the image, keeps them in lockstep.
     if args.sandbox == "docker":
         image = _resolve_agent_image(args.image, FIXTURE_DIR)
+        check_docker_gate_toolchain(
+            FIXTURE_DIR,
+            image=image,
+            runtime_name=args.runtime,
+            workspace=workspace,
+        )
         runtime = _build_runtime(
             args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
         )
         gate_check = make_fixture_gate_check(
+            FIXTURE_DIR,
+            sandbox="docker",
+            image=image,
+            runtime_name=args.runtime,
+            workspace=workspace,
+        )
+        setup = make_fixture_setup(
             FIXTURE_DIR,
             sandbox="docker",
             image=image,
@@ -286,6 +309,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             args.runtime, args.sandbox, workspace, verbose=args.verbose
         )
         gate_check = make_fixture_gate_check(FIXTURE_DIR)
+        setup = make_fixture_setup(FIXTURE_DIR)
     repo = _resolve_repo()
     base_branch = _resolve_base_branch()
     assignee = _resolve_assignee(args.assignee)
@@ -302,6 +326,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         iterations=args.iterations,
         include_unassigned=args.include_unassigned,
         gate_check=gate_check,
+        setup=setup,
         verbose=args.verbose,
     )
     if not outcome.issues:
@@ -315,6 +340,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
         outcome.pr_opened,
     )
     return 0 if outcome.pr_opened else 1
+
+
+def _cmd_prune() -> int:
+    """Delete remote Run branches after their pull requests close or merge."""
+    deleted = prune_run_branches(repo=_resolve_repo(), cwd=Path.cwd())
+    if deleted:
+        logger.info(
+            "Deleted %d stale run branch(es): %s", len(deleted), ", ".join(deleted)
+        )
+    else:
+        logger.info("No stale run branches found.")
+    return 0
 
 
 def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
@@ -495,11 +532,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_run(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "prune":
+            return _cmd_prune()
         if args.command == "sandbox":
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)
             return _cmd_sandbox_setup(args)
-    except PreflightError as exc:
+    except (PreflightError, PruneError) as exc:
         # Covers both preflight (missing commands) and a failed on-demand image
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)

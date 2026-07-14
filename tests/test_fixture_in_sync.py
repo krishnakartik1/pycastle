@@ -11,16 +11,17 @@ The comparison treats two kinds of file differently:
 * The non-customizable files (``sandbox``, ``.gitignore``, ``main.py``) must be
   **byte-identical** -- a drift there is exactly the staleness this guard exists
   to catch.
-* The ``gate``, the ``prompts/*.md``, and the ``Dockerfile`` are **project-owned
+* The ``gate``, ``setup``, the ``prompts/*.md``, and the ``Dockerfile`` are **project-owned
   customizations** (a repo edits its gate for its own stack, tunes its prompts,
   and extends the Dockerfile's PROJECT EXTENSION POINT with its own toolchain --
   the docker sandbox runs the gate inside that image, see #79), so the guard only
   requires they are *present*, not byte-equal. This matches issue #26's "modulo
   the project's own gate/prompt customizations".
 
-Both trees are compared by *shape* (the set of relative paths) ignoring any
-``__pycache__``/``.pyc`` build droppings, so a stray compiled ``main.py`` does not
-fail the guard.
+Both trees are compared by *shape* (the set of relative paths), ignoring any
+``__pycache__``/``.pyc`` build droppings and directories excluded by the
+fixture's own ``.gitignore``. Thus compiled files and transient run directories
+do not fail the guard.
 
 The repo's own ``.pycastle/`` also doubles as the live working directory for the
 self-hosting loop, so a run drops transient artifacts into it (a ``handoff.md``
@@ -48,6 +49,7 @@ from pycastle.scaffold import (
 #: scaffolder, so the guard only checks they exist rather than matching bytes.
 _EXEMPT_FROM_BYTES = {
     "gate",
+    "setup",
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
@@ -64,12 +66,26 @@ def _repo_root() -> Path:
 
 
 def _tree(fixture_dir: Path) -> set[str]:
-    """Return fixture-relative posix paths under ``fixture_dir``, ignoring caches."""
-    return {
-        path.relative_to(fixture_dir).as_posix()
-        for path in fixture_dir.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    """Return fixture-relative paths, pruning ignored transient directories."""
+    ignored_directories = {
+        line.removesuffix("/")
+        for line in (fixture_dir / ".gitignore").read_text().splitlines()
+        if line and not line.startswith(("#", "!")) and line.endswith("/")
     }
+    paths: set[str] = set()
+    for root, directories, filenames in os.walk(fixture_dir):
+        directories[:] = [
+            directory
+            for directory in directories
+            if directory != "__pycache__" and directory not in ignored_directories
+        ]
+        root_path = Path(root)
+        paths.update(
+            (root_path / filename).relative_to(fixture_dir).as_posix()
+            for filename in filenames
+            if Path(filename).suffix != ".pyc"
+        )
+    return paths
 
 
 def _committed_tree(fixture_dir: Path) -> set[str]:
@@ -121,7 +137,7 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
         f"missing {sorted(missing)}, unexpected {sorted(extra)}"
     )
 
-    # Byte-identical for everything except the project's own gate/prompts.
+    # Byte-identical for everything except the project's own setup/gate/prompts.
     for relative in scaffolded_tree - _EXEMPT_FROM_BYTES:
         assert (committed / relative).read_bytes() == (
             scaffolded / relative
@@ -186,6 +202,31 @@ def test_guard_catches_shape_drift(tmp_path: Path) -> None:
     assert _tree(pristine) == _tree(drifted)
     (drifted / "main.py").unlink()
     assert _tree(pristine) != _tree(drifted)
+
+
+def test_tree_ignores_transient_directories_from_fixture_gitignore(
+    tmp_path: Path,
+) -> None:
+    """Run artifacts ignored by the fixture do not look like shape drift."""
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture = tmp_path / FIXTURE_DIRNAME
+    pristine = _tree(fixture)
+
+    for directory in ("logs", "runs", "worktrees"):
+        artifact = fixture / directory / "fake-run" / "artifact.log"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("transient\n")
+
+        nested_artifact = fixture / "nested" / directory / "artifact.log"
+        nested_artifact.parent.mkdir(parents=True, exist_ok=True)
+        nested_artifact.write_text("transient\n")
+
+    assert _tree(fixture) == pristine
+
+    unexpected = fixture / "unexpected" / "artifact.log"
+    unexpected.parent.mkdir()
+    unexpected.write_text("drift\n")
+    assert "unexpected/artifact.log" in _tree(fixture)
 
 
 def test_committed_tree_ignores_untracked_run_artifacts(tmp_path: Path) -> None:
