@@ -1279,3 +1279,112 @@ def test_sigint_handler_off_main_thread_value_error_is_swallowed() -> None:
     # restore call, since there is no previous handler to put back.
     assert entered
     assert sig.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# render_issue_context: the preamble handed to the runtime each phase.        #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_issue_context_header_carries_number_and_title_verbatim() -> None:
+    # The header names the issue by number and keeps the title's punctuation and
+    # markdown intact (unlike slugify), so the runtime sees the real title.
+    issue = IssueRef(number=65, title="Hand the agent its `issue` context!")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered.startswith("# Issue #65: Hand the agent its `issue` context!")
+
+
+def test_render_issue_context_includes_the_body_after_the_header() -> None:
+    issue = IssueRef(number=7, title="Do the thing", body="## What to build\nA gizmo.")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #7: Do the thing\n\n## What to build\nA gizmo."
+
+
+def test_render_issue_context_preserves_a_multiline_body_verbatim() -> None:
+    body = "Line one\n\n- bullet\n- bullet two\n"
+    issue = IssueRef(number=3, title="Multi", body=body)
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == f"# Issue #3: Multi\n\n{body.strip()}"
+
+
+def test_render_issue_context_with_no_body_is_header_only() -> None:
+    # An empty body yields the header alone, with no dangling blank block.
+    issue = IssueRef(number=9, title="No body")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #9: No body"
+
+
+def test_render_issue_context_treats_a_whitespace_only_body_as_empty() -> None:
+    issue = IssueRef(number=9, title="Blank body", body="   \n\t \n")
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == "# Issue #9: Blank body"
+
+
+class _PromptRecordingRuntime:
+    """A fake Runtime that records the prompt handed to each phase.
+
+    Like the graph's stub it writes ``STUB_MARKER`` into the worktree so the
+    git-aware runner reports a non-empty diff, but it also stores the exact
+    prompt string per phase so a test can assert the issue-context preamble
+    reached each phase.
+    """
+
+    name = "stub"
+
+    def __init__(self) -> None:
+        self.prompts: dict[str, str] = {}
+
+    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+        self.prompts[phase] = prompt
+        (cwd / STUB_MARKER).write_text(f"phase {phase}\n")
+        return RuntimeResult(
+            output=f"ran {phase}",
+            telemetry=Telemetry(runtime=self.name, phase=phase, num_turns=1),
+        )
+
+
+def test_issue_context_reaches_every_phase_prompt(
+    three_phase_fixture_dir: Path, tmp_path: Path
+) -> None:
+    # The whole point of the issue: each phase's prompt must carry the issue's
+    # number, title, and body so the runtime is not working the issue blind.
+    issue = IssueRef(
+        number=65,
+        title="Hand the agent its issue context",
+        body="MARKER-BODY: build the preamble.",
+        assignees=["krishna"],
+    )
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runtime = _PromptRecordingRuntime()
+
+    orchestrator.run_batch(
+        runtime=runtime,
+        issue_source=source,
+        fixture_dir=three_phase_fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=1,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+    )
+
+    assert set(runtime.prompts) == {"plan", "implement", "review"}
+    for phase_name, prompt in runtime.prompts.items():
+        assert prompt.startswith(
+            "# Issue #65: Hand the agent its issue context"
+        ), phase_name
+        assert "MARKER-BODY: build the preamble." in prompt

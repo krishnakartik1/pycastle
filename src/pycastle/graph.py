@@ -188,19 +188,37 @@ class GraphExecutor:
     """
 
     def __init__(
-        self, runtime: Runtime, *, fixture_dir: Path, visit_cap: int = DEFAULT_VISIT_CAP
+        self,
+        runtime: Runtime,
+        *,
+        fixture_dir: Path,
+        visit_cap: int = DEFAULT_VISIT_CAP,
+        preamble: str = "",
     ) -> None:
-        """Bind the runtime and fixture dir, and set the per-phase visit cap."""
+        """Bind the runtime and fixture dir, and set the per-phase visit cap.
+
+        ``preamble`` is text prepended to every phase's rendered prompt — the
+        orchestrator uses it to hand the runtime its issue context (number,
+        title, body) so each phase knows *which* issue it is working. It defaults
+        to ``""``, which leaves the rendered prompt byte-identical to the phase
+        file (plus any ``extra``).
+        """
         self.runtime = runtime
         self.fixture_dir = fixture_dir
         self.visit_cap = visit_cap
+        self.preamble = preamble
 
     def render_prompt(self, phase: Phase, extra: str | None = None) -> str:
-        """Read a phase's prompt file, appending ``extra`` context if given."""
+        """Render a phase prompt: preamble, then the phase file, then ``extra``.
+
+        The optional constructor ``preamble`` (issue context) leads, the phase's
+        own prompt file follows, and any per-run ``extra`` (e.g. prior-attempt
+        retry context) trails. Absent parts are dropped, so with no preamble and
+        no ``extra`` the result is exactly the phase file's text.
+        """
         prompt = (self.fixture_dir / "prompts" / phase.prompt).read_text()
-        if extra:
-            prompt = f"{prompt}\n\n{extra}"
-        return prompt
+        parts = [part for part in (self.preamble, prompt, extra) if part]
+        return "\n\n".join(parts)
 
     def _default_runner(self, cwd: Path) -> PhaseRunner:
         """A phase runner that runs each phase once; a crash is a failure."""

@@ -243,6 +243,21 @@ def issue_branch_name(issue: IssueRef) -> str:
     return f"pycastle/issue-{issue.number}-{slugify(issue.title)}"
 
 
+def render_issue_context(issue: IssueRef) -> str:
+    """Format an issue as the preamble handed to the runtime each phase.
+
+    The phase prompts tell the runtime to read the issue's "What to build" and
+    "Acceptance criteria", so it must actually be handed the issue. This renders
+    a ``# Issue #<n>: <title>`` header followed by the body verbatim when the
+    body is non-empty — the title keeps its punctuation and markdown (unlike
+    :func:`slugify`). A missing or whitespace-only body yields the header alone,
+    with no dangling blank block.
+    """
+    header = f"# Issue #{issue.number}: {issue.title}".rstrip()
+    body = issue.body.strip()
+    return f"{header}\n\n{body}" if body else header
+
+
 def _telemetry_dir(fixture_dir: Path, run_id: str) -> Path:
     """Return (and create) the ignored per-run telemetry/log directory."""
     run_dir = fixture_dir / "runs" / run_id
@@ -637,7 +652,9 @@ def _walk_issue(
     :data:`~pycastle.graph.HUMAN` (hand the issue to a person).
     """
     graph = load_graph(fixture_dir)
-    executor = GraphExecutor(runtime, fixture_dir=fixture_dir)
+    executor = GraphExecutor(
+        runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
+    )
     default_runner = executor._default_runner(issue_worktree)
 
     def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:

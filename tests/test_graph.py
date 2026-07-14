@@ -378,3 +378,46 @@ def test_empty_phase_context_entry_is_not_appended(
         three_phase_fixture_dir / "prompts" / "implement.md"
     ).read_text()
     assert runtime.prompts["implement"] == implement_prompt
+
+
+# --------------------------------------------------------------------------- #
+# render_prompt: an optional preamble leads, then the phase file, then extra.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_prompt_prepends_the_preamble_before_the_phase_file(
+    three_phase_fixture_dir: Path,
+) -> None:
+    """A constructor preamble leads the rendered prompt, then the phase file."""
+    executor = GraphExecutor(
+        StubRuntime(), fixture_dir=three_phase_fixture_dir, preamble="ISSUE-CONTEXT"
+    )
+    phase_file = (three_phase_fixture_dir / "prompts" / "plan.md").read_text()
+
+    rendered = executor.render_prompt(phase("plan", "plan.md"))
+
+    assert rendered == f"ISSUE-CONTEXT\n\n{phase_file}"
+
+
+def test_render_prompt_orders_preamble_then_phase_then_extra(
+    three_phase_fixture_dir: Path,
+) -> None:
+    """With both a preamble and ``extra``, order is preamble → prompt → extra."""
+    executor = GraphExecutor(
+        StubRuntime(), fixture_dir=three_phase_fixture_dir, preamble="ISSUE-CONTEXT"
+    )
+    phase_file = (three_phase_fixture_dir / "prompts" / "implement.md").read_text()
+
+    rendered = executor.render_prompt(phase("implement", "implement.md"), "RETRY-EXTRA")
+
+    assert rendered == f"ISSUE-CONTEXT\n\n{phase_file}\n\nRETRY-EXTRA"
+
+
+def test_render_prompt_without_a_preamble_is_byte_identical_to_the_phase_file(
+    three_phase_fixture_dir: Path,
+) -> None:
+    """No preamble (the default) leaves the rendered prompt exactly the phase file."""
+    executor = GraphExecutor(StubRuntime(), fixture_dir=three_phase_fixture_dir)
+    phase_file = (three_phase_fixture_dir / "prompts" / "review.md").read_text()
+
+    assert executor.render_prompt(phase("review", "review.md")) == phase_file
