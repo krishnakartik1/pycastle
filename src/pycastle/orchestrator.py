@@ -257,14 +257,24 @@ def render_issue_context(issue: IssueRef) -> str:
 
     The phase prompts tell the runtime to read the issue's "What to build" and
     "Acceptance criteria", so it must actually be handed the issue. This renders
-    a ``# Issue #<n>: <title>`` header followed by the body verbatim when the
-    body is non-empty — the title keeps its punctuation and markdown (unlike
-    :func:`slugify`). A missing or whitespace-only body yields the header alone,
-    with no dangling blank block.
+    a ``# Issue #<n>: <title>`` header followed by the body when non-empty, then
+    every author-attributed issue comment in source order. The title keeps its
+    punctuation and markdown (unlike :func:`slugify`). Missing parts are omitted,
+    so an issue with no comments renders byte-for-byte as it did before comments
+    were added to :class:`~pycastle.models.IssueRef`.
     """
     header = f"# Issue #{issue.number}: {issue.title}".rstrip()
     body = issue.body.strip()
-    return f"{header}\n\n{body}" if body else header
+    parts = [header]
+    if body:
+        parts.append(body)
+    if issue.comments:
+        comments = "\n\n".join(
+            f"### @{comment.author}\n\n{comment.body.strip()}"
+            for comment in issue.comments
+        )
+        parts.append(f"## Issue Comments\n\n{comments}")
+    return "\n\n".join(parts)
 
 
 def _telemetry_dir(fixture_dir: Path, run_id: str) -> Path:

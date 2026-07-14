@@ -122,6 +122,94 @@ def test_github_source_parses_list_output() -> None:
     assert issues[0].assignees == ["krishna"]
 
 
+def test_github_source_surfaces_all_comments_in_chronological_order() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 87,
+                "title": "include comments",
+                "body": "details",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "krishna"}],
+                "comments": [
+                    {
+                        "author": {"login": "alice"},
+                        "body": "first clarification",
+                        "createdAt": "2026-07-14T10:00:00Z",
+                    },
+                    {
+                        "author": {"login": "bob"},
+                        "body": "second clarification",
+                        "createdAt": "2026-07-14T11:00:00Z",
+                    },
+                ],
+            }
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+
+    issues = GitHubIssueSource("owner/repo", runner=runner).list_ready()
+
+    assert [comment.model_dump() for comment in issues[0].comments] == [
+        {"author": "alice", "body": "first clarification"},
+        {"author": "bob", "body": "second clarification"},
+    ]
+    argv = runner.call_args.args[0]
+    assert "comments" in argv[argv.index("--json") + 1].split(",")
+
+
+def test_github_source_uses_unknown_for_a_missing_comment_author() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 87,
+                "title": "include comments",
+                "comments": [{"author": None, "body": "account was deleted"}],
+            }
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+
+    issue = GitHubIssueSource("owner/repo", runner=runner).list_ready()[0]
+
+    assert issue.comments[0].author == "unknown"
+    assert issue.comments[0].body == "account was deleted"
+
+
+def test_github_source_orders_comments_by_creation_time() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 87,
+                "title": "include comments",
+                "comments": [
+                    {
+                        "author": {"login": "later"},
+                        "body": "second",
+                        "createdAt": "2026-07-14T11:00:00Z",
+                    },
+                    {
+                        "author": {"login": "earlier"},
+                        "body": "first",
+                        "createdAt": "2026-07-14T10:00:00Z",
+                    },
+                ],
+            }
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+
+    issue = GitHubIssueSource("owner/repo", runner=runner).list_ready()[0]
+
+    assert [comment.body for comment in issue.comments] == ["first", "second"]
+
+
 def test_github_source_handles_empty_output() -> None:
     runner = MagicMock(
         return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="")

@@ -51,6 +51,13 @@ class RuntimeResult(BaseModel):
     telemetry: Telemetry
 
 
+class IssueComment(BaseModel):
+    """One author-attributed comment attached to an Issue source work item."""
+
+    author: str
+    body: str
+
+
 class IssueRef(BaseModel):
     """A single work item surfaced by an Issue source."""
 
@@ -59,3 +66,4 @@ class IssueRef(BaseModel):
     body: str = ""
     labels: list[str] = Field(default_factory=list)
     assignees: list[str] = Field(default_factory=list)
+    comments: list[IssueComment] = Field(default_factory=list)
