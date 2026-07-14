@@ -18,9 +18,10 @@ The comparison treats two kinds of file differently:
   requires they are *present*, not byte-equal. This matches issue #26's "modulo
   the project's own gate/prompt customizations".
 
-Both trees are compared by *shape* (the set of relative paths) ignoring any
-``__pycache__``/``.pyc`` build droppings, so a stray compiled ``main.py`` does not
-fail the guard.
+Both trees are compared by *shape* (the set of relative paths), ignoring any
+``__pycache__``/``.pyc`` build droppings and directories excluded by the
+fixture's own ``.gitignore``. Thus compiled files and transient run directories
+do not fail the guard.
 
 The repo's own ``.pycastle/`` also doubles as the live working directory for the
 self-hosting loop, so a run drops transient artifacts into it (a ``handoff.md``
@@ -64,11 +65,19 @@ def _repo_root() -> Path:
 
 
 def _tree(fixture_dir: Path) -> set[str]:
-    """Return fixture-relative posix paths under ``fixture_dir``, ignoring caches."""
+    """Return fixture-relative paths, excluding caches and ignored directories."""
+    ignored_directories = {
+        line.removesuffix("/")
+        for line in (fixture_dir / ".gitignore").read_text().splitlines()
+        if line and not line.startswith(("#", "!")) and line.endswith("/")
+    }
     return {
         path.relative_to(fixture_dir).as_posix()
         for path in fixture_dir.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+        and ignored_directories.isdisjoint(path.relative_to(fixture_dir).parts[:-1])
     }
 
 
@@ -186,6 +195,27 @@ def test_guard_catches_shape_drift(tmp_path: Path) -> None:
     assert _tree(pristine) == _tree(drifted)
     (drifted / "main.py").unlink()
     assert _tree(pristine) != _tree(drifted)
+
+
+def test_tree_ignores_transient_directories_from_fixture_gitignore(
+    tmp_path: Path,
+) -> None:
+    """Run artifacts ignored by the fixture do not look like shape drift."""
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture = tmp_path / FIXTURE_DIRNAME
+    pristine = _tree(fixture)
+
+    for directory in ("logs", "runs", "worktrees"):
+        artifact = fixture / directory / "fake-run" / "artifact.log"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("transient\n")
+
+    assert _tree(fixture) == pristine
+
+    unexpected = fixture / "unexpected" / "artifact.log"
+    unexpected.parent.mkdir()
+    unexpected.write_text("drift\n")
+    assert "unexpected/artifact.log" in _tree(fixture)
 
 
 def test_committed_tree_ignores_untracked_run_artifacts(tmp_path: Path) -> None:
