@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .commands import run_cmd
-from .models import IssueRef
+from .models import IssueComment, IssueRef
 
 Runner = Callable[..., Any]
 
@@ -27,6 +27,16 @@ def assignee_logins(issue: dict[str, Any]) -> list[str]:
         elif isinstance(assignee, dict) and assignee.get("login"):
             logins.append(str(assignee["login"]))
     return logins
+
+
+def comment_author(comment: dict[str, Any]) -> str:
+    """Return a comment author's login, or a stable deleted-user fallback."""
+    author = comment.get("author")
+    if isinstance(author, str) and author:
+        return author
+    if isinstance(author, dict) and author.get("login"):
+        return str(author["login"])
+    return "unknown"
 
 
 def filter_for_assignee(
@@ -130,7 +140,7 @@ class GitHubIssueSource(IssueSource):
                 "--limit",
                 "100",
                 "--json",
-                "number,title,body,labels,assignees",
+                "number,title,body,labels,assignees,comments",
             ],
             capture=True,
         )
@@ -150,6 +160,16 @@ class GitHubIssueSource(IssueSource):
                     body=item.get("body", ""),
                     labels=labels,
                     assignees=assignee_logins(item),
+                    comments=[
+                        IssueComment(
+                            author=comment_author(comment),
+                            body=comment.get("body", ""),
+                        )
+                        for comment in sorted(
+                            item.get("comments") or [],
+                            key=lambda value: value.get("createdAt", ""),
+                        )
+                    ],
                 )
             )
         return issues

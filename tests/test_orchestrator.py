@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pycastle import orchestrator
-from pycastle.models import IssueRef, RuntimeResult, Telemetry
+from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
 
 
@@ -1416,6 +1416,28 @@ def test_render_issue_context_preserves_a_multiline_body_verbatim() -> None:
     assert rendered == f"# Issue #3: Multi\n\n{body.strip()}"
 
 
+def test_render_issue_context_appends_author_attributed_comments() -> None:
+    issue = IssueRef(
+        number=87,
+        title="Include comments",
+        body="## What to build\nUse the discussion.",
+        comments=[
+            IssueComment(author="alice", body="First line\n\n- detail"),
+            IssueComment(author="bob", body="Second clarification"),
+        ],
+    )
+
+    rendered = orchestrator.render_issue_context(issue)
+
+    assert rendered == (
+        "# Issue #87: Include comments\n\n"
+        "## What to build\nUse the discussion.\n\n"
+        "## Issue Comments\n\n"
+        "### @alice\n\nFirst line\n\n- detail\n\n"
+        "### @bob\n\nSecond clarification"
+    )
+
+
 def test_render_issue_context_with_no_body_is_header_only() -> None:
     # An empty body yields the header alone, with no dangling blank block.
     issue = IssueRef(number=9, title="No body")
@@ -1484,6 +1506,9 @@ def test_issue_context_reaches_every_phase_prompt(
         number=65,
         title="Hand the agent its issue context",
         body="MARKER-BODY: build the preamble.",
+        comments=[
+            IssueComment(author="maintainer", body="MARKER-COMMENT: use the brief.")
+        ],
         assignees=["krishna"],
     )
     source = MagicMock()
@@ -1510,3 +1535,4 @@ def test_issue_context_reaches_every_phase_prompt(
             "# Issue #65: Hand the agent its issue context"
         ), phase_name
         assert "MARKER-BODY: build the preamble." in prompt
+        assert "### @maintainer\n\nMARKER-COMMENT: use the brief." in prompt

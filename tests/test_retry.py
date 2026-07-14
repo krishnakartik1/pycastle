@@ -19,7 +19,7 @@ import pytest
 
 from pycastle import cli, orchestrator, sandbox
 from pycastle.cli import main
-from pycastle.models import IssueRef, RuntimeResult, Telemetry
+from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import AgentCrashError
 
 HANDOFF_REL = orchestrator.HANDOFF_DOC
@@ -655,7 +655,12 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     proves the isolation end to end: every plan and review prompt is free of the
     "Previous Attempt" block, while only the retried implement prompt carries it.
     """
-    issue = IssueRef(number=2, title="Three phase retry", assignees=["krishna"])
+    issue = IssueRef(
+        number=2,
+        title="Three phase retry",
+        assignees=["krishna"],
+        comments=[IssueComment(author="maintainer", body="COMMENT-MARKER")],
+    )
     source = MagicMock()
     source.list_ready.return_value = [issue]
     runtime = _RecordingRuntime()
@@ -694,6 +699,10 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     # The retried implement prompt is the only one that carried it.
     assert "Previous Attempt" not in impl_calls[0]["prompt"]
     assert "Previous Attempt" in impl_calls[1]["prompt"]
+    assert all(
+        "COMMENT-MARKER" in c["prompt"]
+        for c in [*plan_calls, *impl_calls, *review_calls]
+    )
     assert outcome.completed == [2]
 
 
