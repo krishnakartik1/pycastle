@@ -329,7 +329,7 @@ def _dockerfile(*, python: bool) -> str:
 
 # Excludes the transient run logs and generated run artifacts so they are never
 # committed. Mirrors the paths the repo's own root .gitignore excludes. The
-# agent scratch files (the plan a phase leaves, a retried attempt's handoff, any
+# Runtime scratch files (the plan a phase leaves, a retried attempt's handoff, any
 # issue scratch) land directly in .pycastle/ during a run, so they are excluded
 # too -- otherwise the orchestrator's `git add -A` folds them into the issue
 # branch and the run's PR. They are anchored to this dir (leading `/`) so they
@@ -340,13 +340,14 @@ logs/
 runs/
 worktrees/
 
-# PyCastle agent scratch files (transient): the plan a phase leaves for the next,
+# PyCastle Runtime scratch files (transient): the plan a phase leaves for the next,
 # a retried attempt's handoff, and any issue scratch. They land in .pycastle/
 # during a run; excluding them keeps `git add -A` from committing them into an
 # issue branch. Anchored here so they never shadow the tracked prompts/plan.md.
 /handoff.md
 /plan.md
 /issue.md
+/plan-issue-*.md
 """
 
 

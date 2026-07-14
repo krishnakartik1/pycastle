@@ -20,9 +20,7 @@ venv/
 .pycastle/runs/
 .pycastle/worktrees/
 
-# PyCastle agent scratch files (transient): a phase's plan, a retried attempt's
-# handoff, and any issue scratch land in .pycastle/ during a self-hosting run.
-# Excluded so `git add -A` never folds them into an issue branch or the run's PR.
-.pycastle/handoff.md
-.pycastle/plan.md
-.pycastle/issue.md
+# Historical Runtime scratch paths observed in self-hosting runs. The fixed
+# .pycastle/{handoff,plan,issue}.md paths are covered by .pycastle/.gitignore.
+PLAN.md
+.pycastle/plan-issue-*.md

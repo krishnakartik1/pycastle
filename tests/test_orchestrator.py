@@ -229,6 +229,16 @@ def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
     assert _calls_containing(runner, "git", "branch", issue_branch, run_branch)
     assert _calls_containing(runner, "git", "worktree", "add", issue_branch)
 
+    # Staging excludes both historical planning paths from #68 even if a Runtime
+    # ignores the canonical .pycastle/plan.md destination in the plan prompt.
+    add_argv = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "add", "-A"]
+    )
+    assert ":(exclude,top)PLAN.md" in add_argv
+    assert ":(exclude,top,glob).pycastle/plan-issue-*.md" in add_argv
+
     # The main checkout is never switched: no `git checkout` in the workspace.
     for call in runner.call_args_list:
         assert call.args[0][:2] != ["git", "checkout"]
@@ -528,11 +538,104 @@ def test_run_worktree_add_failure_raises_and_works_no_issue(
     assert not _calls_containing(runner, "gh", "pr", "create")
 
 
+def test_run_branch_failure_aborts_before_worktree_add(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A stale run branch cannot be silently reused as the worktree base (#64)."""
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    def fail_run_branch(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "branch", "pycastle/run-20260613-101500"]:
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="fatal: a branch named 'pycastle/run-20260613-101500' exists",
+            )
+        return _ok()
+
+    runner = MagicMock(side_effect=fail_run_branch)
+
+    with pytest.raises(orchestrator.BranchError, match="branch named"):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    assert not _calls_containing(runner, "git", "worktree", "add")
+    source.claim.assert_not_called()
+
+
+def test_issue_branch_failure_releases_issue_before_worktree_add(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A stale issue branch cannot be checked out from the wrong base (#64)."""
+    issue = IssueRef(number=2, title="Slice", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    def fail_issue_branch(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "branch", "pycastle/issue-2-slice"]:
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="fatal: a branch named 'pycastle/issue-2-slice' exists",
+            )
+        if argv[:3] == ["git", "worktree", "add"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+        return _ok()
+
+    runner = MagicMock(side_effect=fail_issue_branch)
+
+    with pytest.raises(orchestrator.BranchError, match="branch named"):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture_dir,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="20260613-101500",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    issue_add = str(tmp_path / "wt" / "issue-2")
+    assert not _calls_containing(runner, "git", "worktree", "add", issue_add)
+    source.release.assert_called_once_with(2)
+
+
+def test_create_branch_success_issues_captured_git_command(tmp_path: Path) -> None:
+    runner = MagicMock(return_value=_ok())
+
+    orchestrator.create_branch("topic", "main", runner=runner, cwd=tmp_path)
+
+    runner.assert_called_once_with(
+        ["git", "branch", "topic", "main"], capture=True, cwd=tmp_path
+    )
+
+
 def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
     # A failed issue-worktree add is an infra fault, not an issue-content fault:
-    # rather than drive the agent against a directory that was never created (or
+    # rather than drive the Runtime against a directory that was never created (or
     # mislabel the issue ready-for-human), it is raised so run_batch's interrupt
     # teardown releases the claimed issue back to ready-for-agent and aborts (#64).
     issue = IssueRef(number=2, title="Slice", assignees=["krishna"])

@@ -54,9 +54,18 @@ class WorktreeError(RuntimeError):
 
     Every git call here runs with ``check=False``, so a failing
     ``git worktree add`` (a path collision, a checkout conflict, no disk) was
-    silently ignored and the run drove the agent against a worktree that never
+    silently ignored and the run drove the Runtime against a worktree that never
     existed — cascading into confusing downstream errors (#64). Raised instead so
     the failure surfaces at its source, carrying git's captured output.
+    """
+
+
+class BranchError(RuntimeError):
+    """A prerequisite ``git branch`` exited non-zero.
+
+    Branch creation must succeed before its worktree is added. Otherwise a stale
+    branch with the requested name can be checked out successfully from the wrong
+    base, recreating the wrong-tree failure that worktree validation prevents.
     """
 
 
@@ -333,12 +342,34 @@ def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
         handle.write(message + "\n")
 
 
+def _git_failure_detail(result: Any) -> str:
+    """Return captured git output formatted for an exception message."""
+    output = (
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+    ).strip()
+    return f": {output}" if output else ""
+
+
+def create_branch(branch: str, start_point: str, *, runner: Runner, cwd: Path) -> None:
+    """Create ``branch`` at ``start_point`` or raise :class:`BranchError`."""
+    result = runner(
+        ["git", "branch", branch, start_point],
+        capture=True,
+        cwd=cwd,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        raise BranchError(
+            f"git branch failed for {branch} at {start_point}"
+            f"{_git_failure_detail(result)}"
+        )
+
+
 def add_worktree(worktree: Path, branch: str, *, runner: Runner, cwd: Path) -> None:
     """Create ``worktree`` for ``branch`` or raise :class:`WorktreeError`.
 
     ``git worktree add`` runs with ``check=False`` like every git call here, so
     a non-zero exit is otherwise swallowed and the run proceeds to drive the
-    agent against a directory that was never created (#64). This reads the exit
+    Runtime against a directory that was never created (#64). This reads the exit
     code and raises with git's captured stderr/stdout so the failure surfaces at
     its source instead of cascading into confusing downstream errors.
     """
@@ -348,12 +379,9 @@ def add_worktree(worktree: Path, branch: str, *, runner: Runner, cwd: Path) -> N
         cwd=cwd,
     )
     if getattr(result, "returncode", 1) != 0:
-        output = (
-            getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
-        ).strip()
-        detail = f": {output}" if output else ""
         raise WorktreeError(
-            f"git worktree add failed for {branch} at {worktree}{detail}"
+            f"git worktree add failed for {branch} at {worktree}"
+            f"{_git_failure_detail(result)}"
         )
 
 
@@ -751,11 +779,11 @@ def _work_issue(
         )
 
     issue_worktree = worktree_root / f"issue-{issue.number}"
-    runner(["git", "branch", branch, run_branch], capture=True, cwd=workspace)
+    create_branch(branch, run_branch, runner=runner, cwd=workspace)
     # A failed worktree add is an infra fault, not an issue-content fault, so it
     # is raised (not routed to ready-for-human): run_batch's interrupt teardown
     # removes the absent worktree and releases the claimed issue back to
-    # ready-for-agent, then the run aborts rather than driving the agent against a
+    # ready-for-agent, then the run aborts rather than driving the Runtime against a
     # directory that was never created (#64).
     add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
 
@@ -787,7 +815,22 @@ def _work_issue(
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
         return IssueOutcome(issue=issue, branch=branch, merged=False)
 
-    runner(["git", "add", "-A"], capture=True, cwd=issue_worktree)
+    # Fixed scratch paths are gitignored. These exclusions also cover the two
+    # historical planning paths from #68 if a Runtime writes them despite the
+    # plan prompt's canonical .pycastle/plan.md destination.
+    runner(
+        [
+            "git",
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude,top)PLAN.md",
+            ":(exclude,top,glob).pycastle/plan-issue-*.md",
+        ],
+        capture=True,
+        cwd=issue_worktree,
+    )
     runner(
         ["git", "commit", "-m", f"feat: address #{issue.number} ({runtime.name})"],
         capture=True,
@@ -957,7 +1000,7 @@ def run_batch(
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
-    runner(["git", "branch", run_branch, base_branch], capture=True, cwd=workspace)
+    create_branch(run_branch, base_branch, runner=runner, cwd=workspace)
     # A failed run-worktree add is fatal: no issue can be worked without it, so
     # raise rather than silently drive the batch against a missing directory (#64).
     add_worktree(run_worktree, run_branch, runner=runner, cwd=workspace)

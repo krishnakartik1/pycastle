@@ -92,10 +92,10 @@ def test_gitignore_is_in_the_written_list(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("choice", ["host", "docker"])
-def test_scaffold_gitignore_excludes_agent_scratch_files(
+def test_scaffold_gitignore_excludes_runtime_scratch_files(
     tmp_path: Path, choice: str
 ) -> None:
-    """The scaffolded .gitignore excludes the agent's transient scratch files (#68).
+    """The scaffolded .gitignore excludes the Runtime's scratch files (#68).
 
     A phase's plan, a retried attempt's handoff, and any issue scratch land inside
     .pycastle/ during a run. If they are not ignored, the orchestrator's
@@ -109,10 +109,11 @@ def test_scaffold_gitignore_excludes_agent_scratch_files(
     assert "/handoff.md" in gitignore
     assert "/plan.md" in gitignore
     assert "/issue.md" in gitignore
+    assert "/plan-issue-*.md" in gitignore
 
 
 def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> None:
-    """``git add -A`` on a scaffolded repo never stages the agent's scratch (#68).
+    """``git add -A`` on a scaffolded repo never stages Runtime scratch (#68).
 
     The orchestrator commits an issue's work with ``git add -A``. Without the
     scratch-file ignores, the handoff/plan/issue documents a run drops into
@@ -135,7 +136,7 @@ def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> No
 
     # The exact scratch files a run drops into .pycastle/ (a phase's plan, a
     # retried attempt's handoff, an issue scratch).
-    for name in ("handoff.md", "plan.md", "issue.md"):
+    for name in ("handoff.md", "plan.md", "issue.md", "plan-issue-19.md"):
         (fixture / name).write_text(f"stray {name}\n")
 
     subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
@@ -148,7 +149,7 @@ def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> No
     ).stdout.splitlines()
 
     # None of the scratch strays were staged...
-    for name in ("handoff.md", "plan.md", "issue.md"):
+    for name in ("handoff.md", "plan.md", "issue.md", "plan-issue-19.md"):
         assert f".pycastle/{name}" not in tracked
     # ...but the tracked prompt of the same basename still is (anchoring holds).
     assert ".pycastle/prompts/plan.md" in tracked
