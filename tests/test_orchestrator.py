@@ -27,7 +27,7 @@ def _calls_containing(runner: MagicMock, *needles: str) -> bool:
     return False
 
 
-def test_prune_run_branches_deletes_only_branches_without_open_prs(
+def test_prune_run_branches_deletes_only_branches_with_closed_or_merged_prs(
     tmp_path: Path,
 ) -> None:
     """Closed/merged PR heads are pruned while open PR heads stay intact (#69)."""
@@ -35,7 +35,11 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
         side_effect=[
             MagicMock(
                 returncode=0,
-                stdout='[{"headRefName":"pycastle/run-open"}]',
+                stdout=(
+                    '[{"headRefName":"pycastle/run-open","state":"OPEN"},'
+                    '{"headRefName":"pycastle/run-merged","state":"MERGED"},'
+                    '{"headRefName":"pycastle/run-closed","state":"CLOSED"}]'
+                ),
             ),
             MagicMock(
                 returncode=0,
@@ -43,6 +47,7 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
                     "aaa\trefs/heads/pycastle/run-open\n"
                     "bbb\trefs/heads/pycastle/run-merged\n"
                     "ccc\trefs/heads/pycastle/run-closed\n"
+                    "ddd\trefs/heads/pycastle/run-recovery\n"
                 ),
             ),
             MagicMock(returncode=0),
@@ -55,10 +60,39 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
     )
 
     assert deleted == ["pycastle/run-merged", "pycastle/run-closed"]
-    assert _calls_containing(runner, "--state", "open", "--limit", "10000")
+    assert _calls_containing(runner, "--state", "all", "--limit", "10000")
     assert not _calls_containing(runner, "--delete", "pycastle/run-open")
     assert _calls_containing(runner, "--delete", "pycastle/run-merged")
     assert _calls_containing(runner, "--delete", "pycastle/run-closed")
+    assert not _calls_containing(runner, "--delete", "pycastle/run-recovery")
+
+
+def test_prune_run_branches_include_no_pr_deletes_recovery_branches(
+    tmp_path: Path,
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(
+                returncode=0,
+                stdout='[{"headRefName":"pycastle/run-open","state":"OPEN"}]',
+            ),
+            MagicMock(
+                returncode=0,
+                stdout=(
+                    "aaa\trefs/heads/pycastle/run-open\n"
+                    "bbb\trefs/heads/pycastle/run-recovery\n"
+                ),
+            ),
+            MagicMock(returncode=0),
+        ]
+    )
+
+    deleted = orchestrator.prune_run_branches(
+        repo="owner/repo", runner=runner, cwd=tmp_path, include_no_pr=True
+    )
+
+    assert deleted == ["pycastle/run-recovery"]
+    assert not _calls_containing(runner, "--delete", "pycastle/run-open")
 
 
 def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
@@ -75,7 +109,10 @@ def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
     assert not _calls_containing(runner, "git", "push", "origin", "--delete")
 
 
-@pytest.mark.parametrize("stdout", [None, "", "{}", '[{"headRefName":null}]'])
+@pytest.mark.parametrize(
+    "stdout",
+    [None, "", "{}", '[{"headRefName":null,"state":"OPEN"}]'],
+)
 def test_prune_run_branches_aborts_on_invalid_open_pr_output(
     tmp_path: Path, stdout: str | None
 ) -> None:
@@ -140,7 +177,10 @@ def test_prune_run_branches_reports_deletion_failure(tmp_path: Path) -> None:
     branch = "pycastle/run-closed"
     runner = MagicMock(
         side_effect=[
-            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(
+                returncode=0,
+                stdout=('[{"headRefName":"pycastle/run-closed",' '"state":"CLOSED"}]'),
+            ),
             MagicMock(returncode=0, stdout=f"abc\trefs/heads/{branch}\n"),
             MagicMock(returncode=1, stderr="rejected"),
         ]
@@ -414,6 +454,121 @@ def test_successful_branches_merge_and_one_pr_is_opened(
     assert "- Closes #2" in body
     assert "- Closes #4" in body
     assert outcome.pr_opened is True
+
+
+def test_each_successful_issue_merge_checkpoints_the_run_branch(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    events = [call.args[0] for call in runner.call_args_list]
+    merges = [i for i, argv in enumerate(events) if argv[:2] == ["git", "merge"]]
+    pushes = [i for i, argv in enumerate(events) if argv[:2] == ["git", "push"]]
+    assert len(pushes) == 3  # two durability checkpoints plus finalization
+    assert merges[0] < pushes[0] < merges[1] < pushes[1] < pushes[2]
+
+
+def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 1:
+                return subprocess.CompletedProcess(argv, 1, stdout="offline")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == [2, 4]
+    assert outcome.pr_opened is True
+    assert push_count == 3
+    assert (
+        "Durability push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
+
+
+def test_failed_final_push_prevents_pull_request_creation(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="First", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 2:
+                return subprocess.CompletedProcess(argv, 1, stdout="offline")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.pr_opened is False
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    assert (
+        "Final push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
 
 
 def test_merge_conflict_marks_for_human_and_run_continues(

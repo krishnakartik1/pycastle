@@ -77,11 +77,15 @@ def prune_run_branches(
     *,
     repo: str,
     cwd: Path,
+    include_no_pr: bool = False,
     runner: Runner = run_cmd,
 ) -> list[str]:
-    """Delete remote run branches whose pull requests are no longer open.
+    """Delete remote Run branches whose pull requests are no longer open.
 
-    The open PR heads are resolved before any remote branches are considered.
+    Pull-request history is resolved before any remote branches are considered.
+    Branches with no associated pull request are recovery artifacts and are
+    retained unless ``include_no_pr`` is true. Branches with an open pull
+    request are always retained.
     If either discovery call fails, pruning stops without deleting anything so
     an unavailable GitHub API can never make an open PR branch look stale.
     """
@@ -93,11 +97,11 @@ def prune_run_branches(
             "-R",
             repo,
             "--state",
-            "open",
+            "all",
             "--limit",
             "10000",
             "--json",
-            "headRefName",
+            "headRefName,state",
         ],
         capture=True,
     )
@@ -113,12 +117,14 @@ def prune_run_branches(
         not isinstance(pr, dict)
         or not isinstance(pr.get("headRefName"), str)
         or not pr["headRefName"]
+        or pr.get("state") not in {"OPEN", "CLOSED", "MERGED"}
         for pr in pr_data
     ):
         raise PruneError(
             "Could not parse open pull requests; no branches were deleted."
         )
-    open_heads = {pr["headRefName"] for pr in pr_data}
+    associated_heads = {pr["headRefName"] for pr in pr_data}
+    open_heads = {pr["headRefName"] for pr in pr_data if pr.get("state") == "OPEN"}
 
     refs = runner(
         ["git", "ls-remote", "--heads", "origin", "refs/heads/pycastle/run-*"],
@@ -146,7 +152,11 @@ def prune_run_branches(
                 "Could not parse remote run branches; no branches were deleted."
             )
         remote_branches.append(fields[1].removeprefix("refs/heads/"))
-    stale = [branch for branch in remote_branches if branch not in open_heads]
+    stale = [
+        branch
+        for branch in remote_branches
+        if branch not in open_heads and (branch in associated_heads or include_no_pr)
+    ]
     deleted: list[str] = []
     for branch in stale:
         result = runner(
@@ -1026,6 +1036,17 @@ def _work_issue(
             run_id,
             f"#{issue.number} did not merge cleanly; marked ready-for-human.",
         )
+    else:
+        # The merge is the durability boundary: push it before cleaning up the
+        # item worktree so the remote checkpoint follows the fold immediately.
+        _push_run_branch(
+            run_branch=run_branch,
+            run_worktree=run_worktree,
+            fixture_dir=fixture_dir,
+            run_id=run_id,
+            runner=runner,
+            final=False,
+        )
 
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
@@ -1250,11 +1271,15 @@ def _open_pull_request(
     The body carries a ``- Closes #N`` line per completed issue so merging the
     single run PR closes the whole batch.
     """
-    runner(
-        ["git", "push", "-u", "origin", run_branch],
-        capture=True,
-        cwd=run_worktree,
-    )
+    if not _push_run_branch(
+        run_branch=run_branch,
+        run_worktree=run_worktree,
+        fixture_dir=fixture_dir,
+        run_id=run_id,
+        runner=runner,
+        final=True,
+    ):
+        return False
     closes = "\n".join(f"- Closes #{number}" for number in completed)
     body = (
         f"Automated PyCastle run {run_id} completing {len(completed)} issue(s).\n\n"
@@ -1285,3 +1310,38 @@ def _open_pull_request(
         f"Pull request {'opened' if opened else 'failed'} for {run_branch}",
     )
     return opened
+
+
+def _push_run_branch(
+    *,
+    run_branch: str,
+    run_worktree: Path,
+    fixture_dir: Path,
+    run_id: str,
+    runner: Runner,
+    final: bool,
+) -> bool:
+    """Push the current Run checkpoint, logging failures without raising."""
+    try:
+        result = runner(
+            ["git", "push", "-u", "origin", run_branch],
+            capture=True,
+            cwd=run_worktree,
+        )
+        succeeded = getattr(result, "returncode", 1) == 0
+    except OSError as exc:
+        succeeded = False
+        logger.warning("Could not push Run branch %s: %s", run_branch, exc)
+
+    if succeeded:
+        _append_log(fixture_dir, run_id, f"Pushed Run checkpoint {run_branch}")
+        return True
+
+    kind = "Final" if final else "Durability"
+    _append_log(
+        fixture_dir,
+        run_id,
+        f"{kind} push failed for {run_branch}; remote checkpoint was not updated.",
+    )
+    logger.warning("%s push failed for Run branch %s", kind, run_branch)
+    return False

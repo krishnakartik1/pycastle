@@ -65,7 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
-    sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
+    prune_parser = sub.add_parser(
+        "prune", help="Delete run branches whose PRs are no longer open"
+    )
+    prune_parser.add_argument(
+        "--include-no-pr",
+        action="store_true",
+        help="Also delete Run branches with no associated pull request",
+    )
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
     sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
@@ -368,9 +375,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome.pr_opened else 1
 
 
-def _cmd_prune() -> int:
+def _cmd_prune(args: argparse.Namespace) -> int:
     """Delete remote Run branches after their pull requests close or merge."""
-    deleted = prune_run_branches(repo=_resolve_repo(), cwd=Path.cwd())
+    deleted = prune_run_branches(
+        repo=_resolve_repo(), cwd=Path.cwd(), include_no_pr=args.include_no_pr
+    )
     if deleted:
         logger.info(
             "Deleted %d stale run branch(es): %s", len(deleted), ", ".join(deleted)
@@ -591,7 +600,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "upgrade":
             return _cmd_upgrade()
         if args.command == "prune":
-            return _cmd_prune()
+            return _cmd_prune(args)
         if args.command == "sandbox":
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)

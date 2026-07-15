@@ -154,7 +154,19 @@ def test_main_dispatches_prune(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "prune_run_branches", prune)
 
     assert main(["prune"]) == 0
-    prune.assert_called_once_with(repo="owner/repo", cwd=Path.cwd())
+    prune.assert_called_once_with(
+        repo="owner/repo", cwd=Path.cwd(), include_no_pr=False
+    )
+
+
+def test_main_dispatches_prune_include_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    prune = MagicMock(return_value=[])
+    monkeypatch.setattr(cli, "prune_run_branches", prune)
+
+    assert main(["prune", "--include-no-pr"]) == 0
+    prune.assert_called_once_with(repo="owner/repo", cwd=Path.cwd(), include_no_pr=True)
 
 
 def test_make_run_id_is_a_timestamp_shape() -> None:

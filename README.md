@@ -94,10 +94,34 @@ pycastle run --runtime claude
 The sandbox recorded by `init` is used automatically. Override it for one run
 with `--sandbox host` or `--sandbox docker`; choose Codex with `--runtime codex`.
 Successful issues are folded into a per-run branch and PyCastle opens a pull
-request back to the branch from which the run started. After run PRs are merged
-or closed, run `pycastle prune` to remove their remote `pycastle/run-*` branches.
-The command discovers all open PR heads before deleting anything and always
-keeps their branches intact.
+request back to the branch from which the run started. After each successful
+item fold, PyCastle pushes the current `pycastle/run-<run-id>` branch to
+`origin`. A failed durability push is logged without stopping the Run; the next
+completed item and finalization retry the latest Run state. The final push must
+succeed before PyCastle creates a pull request.
+
+If a Run is interrupted, list its durable recovery branches with:
+
+```bash
+git ls-remote --heads origin 'refs/heads/pycastle/run-*'
+```
+
+Recover a branch locally by fetching and checking it out (replace the example
+Run ID with the remote branch you found):
+
+```bash
+git fetch origin pycastle/run-20260715-120000
+git switch --create recover-run-20260715-120000 FETCH_HEAD
+```
+
+This recovers every item whose merge was successfully pushed; incomplete item
+work is intentionally not pushed. An interrupted Run branch with no pull
+request remains on `origin` as the recovery artifact. `pycastle prune` preserves
+these no-PR branches and every branch attached to an open PR, deleting only Run
+branches whose PR is closed or merged. Once no-PR recovery branches are no
+longer needed, remove them explicitly with `pycastle prune --include-no-pr`.
+Discovery failures are fail-safe: prune deletes nothing unless it can classify
+the remote branches from pull-request history.
 
 ## Commands
 
@@ -112,8 +136,10 @@ keeps their branches intact.
   sandbox and runtime for this run.
 - `pycastle run --verbose` — stream reasoning/output and persist per-issue
   transcripts and telemetry under `.pycastle/runs/`.
-- `pycastle prune` — delete remote `pycastle/run-*` branches whose PRs are
-  merged or closed, while preserving every branch attached to an open PR.
+- `pycastle prune [--include-no-pr]` — delete remote `pycastle/run-*` branches
+  whose PRs are merged or closed. By default no-PR recovery branches are kept;
+  opt in to deleting them with `--include-no-pr`. Open-PR branches are always
+  preserved.
 - `pycastle sandbox setup --runtime claude` — authenticate a runtime in its
   shared Docker auth volume.
 - `pycastle sandbox build` — explicitly build the content-addressed image from
