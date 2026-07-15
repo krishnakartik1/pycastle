@@ -259,6 +259,7 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     source.list_ready.return_value = [issue]
     timeline: list[tuple[str, Path | None]] = []
     run_worktree = tmp_path / "wt" / "run-run-101"
+    authored_report = "# Integrated report\n\nRepaired and verified.\n"
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
@@ -266,6 +267,9 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
             result = super().run(prompt, cwd=cwd, phase=phase)
             if phase == "integrated-review":
                 (cwd / "integrated-review.txt").write_text("reviewed\n")
+                report_path = cwd / orchestrator.RUN_REPORT
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(authored_report)
             return result
 
     def setup(cwd: Path) -> None:
@@ -364,6 +368,10 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     assert "<!-- pycastle-run-report:run-101 -->" in comment
     assert "`.pycastle/gate --all` — PASS (exit 0, 1.25s)" in comment
     assert "secret raw output" not in comment
+    assert comment.endswith("\n---\n\n" + authored_report)
+    assert (fixture / "runs" / "run-101" / "run-report.md").read_text() == (
+        authored_report
+    )
 
     calls = [call.args[0] for call in runner.call_args_list]
     draft_index = next(
