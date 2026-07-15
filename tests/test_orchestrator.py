@@ -849,15 +849,31 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
 def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
     tmp_path: Path,
 ) -> None:
-    fixture = _scoped_fixture(tmp_path, after=True)
+    fixture = _scoped_fixture(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, build_run, phase\n"
+        "run = build_run("
+        "item=build(start='implement', phases=[phase('implement', 'item.md')]), "
+        "after=build(start='checkpoint', phases=["
+        "phase('checkpoint', 'after.md', on_success='failing'), "
+        "phase('failing', 'after.md')]))\n"
+    )
     source = MagicMock()
     source.list_ready.return_value = [
         IssueRef(number=1, title="First", assignees=["krishna"])
     ]
 
+    visits: list[str] = []
+
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
-            if phase == "after":
+            if phase == "checkpoint":
+                visits.append(phase)
+                (cwd / "durable.txt").write_text("checkpoint")
+            if phase == "failing":
+                visits.append(phase)
+                (cwd / "durable.txt").write_text("failing edit")
+                (cwd / "untracked.txt").write_text("discard me")
                 raise AgentCrashError("human", phase=phase, exit_code=1)
             return super().run(prompt, cwd=cwd, phase=phase)
 
@@ -865,9 +881,22 @@ def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
 
     def gate(cwd: Path) -> orchestrator.GateOutcome:
         gate_paths.append(cwd)
+        if cwd.name.startswith("run-"):
+            assert (cwd / "durable.txt").read_text() == "checkpoint"
+            assert not (cwd / "untracked.txt").exists()
         return orchestrator.GateOutcome(True, "green")
 
-    runner = _git_aware_runner()
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "reset", "--hard"]:
+            run_worktree = Path(str(kwargs["cwd"]))
+            (run_worktree / "durable.txt").write_text("checkpoint")
+        if argv[:3] == ["git", "clean", "-fd"]:
+            (Path(str(kwargs["cwd"])) / "untracked.txt").unlink(missing_ok=True)
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
@@ -883,39 +912,84 @@ def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
     )
 
     assert outcome.completed == [1]
+    assert outcome.skipped == []
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "after-Run HUMAN"
     assert gate_paths[-1].name == "run-after-human"
+    assert visits == ["checkpoint", "failing"]
 
 
-def test_red_run_gate_keeps_pull_request_draft(
-    fixture_dir: Path, tmp_path: Path
-) -> None:
+def test_red_run_gate_keeps_pull_request_draft(tmp_path: Path) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, after=True)
     source = MagicMock()
     source.list_ready.return_value = [
-        IssueRef(number=1, title="First", assignees=["krishna"])
+        IssueRef(number=1, title="First", assignees=["krishna"]),
+        IssueRef(number=2, title="Second", assignees=["krishna"]),
     ]
 
+    visits: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if cwd.name == "issue-2" and phase == "implement":
+                raise AgentCrashError("skip", phase=phase, exit_code=1)
+            if cwd.name.startswith("run-"):
+                visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    gate_calls: list[Path] = []
+
     def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_calls.append(cwd)
         is_run = cwd.name.startswith("run-")
-        return orchestrator.GateOutcome(not is_run, "red" if is_run else "green")
+        return orchestrator.GateOutcome(
+            not is_run,
+            "raw stdout secret\nraw stderr secret" if is_run else "green",
+            exit_code=23 if is_run else 0,
+            duration_seconds=1.25 if is_run else 0,
+            command="project-safe-gate",
+        )
+
+    bodies: list[str] = []
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "comment"]:
+            bodies.append(argv[argv.index("--body") + 1])
+        return base_runner(argv, **kwargs)
 
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
         run_id="red-gate",
+        iterations=2,
+        impl_retries=0,
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=MagicMock(side_effect=side_effect),
         gate_check=gate,
     )
 
+    assert outcome.completed == [1]
+    assert outcome.skipped == [2]
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "Run Gate"
+    assert visits == ["after"]
+    assert sum(path.name.startswith("run-") for path in gate_calls) == 1
+    source.mark_for_human.assert_called_once_with(2)
+    source.release.assert_not_called()
+    assert "Completed Items: #1" in bodies[0]
+    assert "Skipped Items: #2" in bodies[0]
+    assert "`project-safe-gate` — FAIL (exit 23, 1.25s)" in bodies[0]
+    assert "raw stdout secret" not in bodies[0]
+    assert "raw stderr secret" not in bodies[0]
+    assert (fixture_dir / "runs" / "red-gate" / "run-gate.log").read_text() == (
+        "raw stdout secret\nraw stderr secret"
+    )
 
 
 def test_second_run_setup_failure_skips_gate_and_keeps_draft(
@@ -994,8 +1068,18 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
     assert outcome.pr_opened and not outcome.pr_ready
 
 
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (b"\xff", "Run report is not valid UTF-8."),
+        (
+            b"x" * (orchestrator.RUN_REPORT_LIMIT + 1),
+            f"Run report exceeds the {orchestrator.RUN_REPORT_LIMIT}-byte publication limit.",
+        ),
+    ],
+)
 def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
-    tmp_path: Path,
+    tmp_path: Path, raw: bytes, message: str
 ) -> None:
     fixture = _scoped_fixture(tmp_path, after=True)
     source = MagicMock()
@@ -1008,7 +1092,7 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
             if phase == "after":
                 report = cwd / orchestrator.RUN_REPORT
                 report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_bytes(b"\xff")
+                report.write_bytes(raw)
             return super().run(prompt, cwd=cwd, phase=phase)
 
     bodies: list[str] = []
@@ -1033,8 +1117,13 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
     )
 
     assert outcome.stopping_point == "Run report validation"
+    assert outcome.completed == [1]
+    assert outcome.skipped == []
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
-    assert "Run report is not valid UTF-8" in bodies[0]
+    assert message in bodies[0]
+    assert "Completed Items: #1" in bodies[0]
+    assert "Skipped Items: none" in bodies[0]
+    assert (fixture / "runs" / "invalid-report" / "run-report.md").read_bytes() == raw
 
 
 def test_interrupt_during_after_run_opens_no_pull_request(tmp_path: Path) -> None:

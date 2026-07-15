@@ -428,6 +428,11 @@ class RunOutcome:
         """Issue numbers that merged cleanly into the run branch."""
         return [o.issue.number for o in self.issues if o.merged]
 
+    @property
+    def skipped(self) -> list[int]:
+        """Issue numbers worked by this Run but not folded into its branch."""
+        return [o.issue.number for o in self.issues if not o.merged]
+
 
 @dataclass
 class RunContext:
@@ -1582,7 +1587,7 @@ def run_batch(
             run=run,
             completed=completed,
             selected=selected,
-            skipped=[o.issue.number for o in outcome.issues if not o.merged],
+            skipped=outcome.skipped,
             gate=run_gate,
             report=report,
             publication_error=publication_error,
