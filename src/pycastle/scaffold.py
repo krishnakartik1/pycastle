@@ -93,15 +93,26 @@ change the workflow -- add phases, repoint edges, or model handoff as its own
 node.
 """
 
-from pycastle.graph import DONE, HUMAN, build, phase
+from pycastle.graph import DONE, HUMAN, build, build_run, phase
 
-graph = build(
-    start="plan",
-    phases=[
-        phase("plan", "plan.md", on_success="implement", on_failure=HUMAN),
-        phase("implement", "implement.md", on_success="review", on_failure=HUMAN),
-        phase("review", "review.md", on_success=DONE, on_failure=HUMAN),
-    ],
+run = build_run(
+    before=None,
+    item=build(
+        start="plan",
+        phases=[
+            phase("plan", "plan.md", on_success="implement", on_failure=HUMAN),
+            phase("implement", "implement.md", on_success="review", on_failure=HUMAN),
+            phase("review", "review.md", on_success=DONE, on_failure=HUMAN),
+        ],
+    ),
+    after=build(
+        start="run-review",
+        phases=[
+            phase("run-review", "run-review.md", on_success="run-repair"),
+            phase("run-repair", "run-repair.md", on_success="run-report"),
+            phase("run-report", "run-report.md"),
+        ],
+    ),
 )
 '''
 
@@ -132,7 +143,8 @@ _IMPLEMENT_MD = """\
 
 You are working a single GitHub issue to completion.
 
-1. Read the issue's "What to build" and "Acceptance criteria".
+1. Read `.pycastle/plan.md`, then re-read the issue's "What to build" and
+   "Acceptance criteria".
 2. Implement the change test-first: write failing tests for the criteria, then
    the code to make them pass.
 3. Run the project's quality gates and fix anything they flag.
@@ -164,6 +176,31 @@ gate: fix what you find, do not hand work back.
 
 Commit any review improvements in this phase so they are part of the issue
 branch before it is merged. Stay within the scope of this one issue.
+"""
+
+_RUN_REVIEW_MD = """\
+# Integrated Run Review
+
+Review the integrated Run branch and its complete diff. Run focused checks and
+write actionable findings to `.pycastle/run-review.md`. Do not mutate GitHub.
+Write an explicit "No findings" when no repair is needed.
+"""
+
+_RUN_REPAIR_MD = """\
+# Integrated Run Repair
+
+Read `.pycastle/run-review.md`. Repair every actionable finding and add tests
+for integration defects. When there are no findings, make no changes. Do not
+mutate GitHub.
+"""
+
+_RUN_REPORT_MD = """\
+# Run Report
+
+Inspect the repaired integrated diff and the checks you can verify. Write a
+concise Markdown report to `.pycastle/run-report.md`, curating relevant test,
+lint, and coverage evidence. Do not mutate GitHub and do not include secrets or
+raw unbounded logs.
 """
 
 # A default, runnable gate so the retry-with-handoff path is reachable from the
@@ -407,6 +444,8 @@ worktrees/
 /plan.md
 /issue.md
 /plan-issue-*.md
+/run-review.md
+/run-report.md
 /venv/
 """
 
@@ -436,6 +475,9 @@ def _fixture_files(
         "prompts/plan.md": _PLAN_MD,
         "prompts/implement.md": _IMPLEMENT_MD,
         "prompts/review.md": _REVIEW_MD,
+        "prompts/run-review.md": _RUN_REVIEW_MD,
+        "prompts/run-repair.md": _RUN_REPAIR_MD,
+        "prompts/run-report.md": _RUN_REPORT_MD,
     }
 
 

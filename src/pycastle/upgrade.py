@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import __version__
 from .compatibility import FixtureCompatibilityStatus, check_fixture_compatibility
-from .graph import load_graph
+from .graph import load_run
 from .migrations import MIGRATIONS, FixtureMigration
 
 FixtureWriter = Callable[[Path, Path], None]
@@ -74,14 +74,16 @@ def validate_fixture(fixture_dir: Path) -> None:
     previous_bytecode = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
-        graph = load_graph(fixture_dir)
+        definition = load_run(fixture_dir)
     except Exception as exc:
         raise FixtureUpgradeError(
             f"Could not load the fixture Phase graph: {exc}"
         ) from exc
     finally:
         sys.dont_write_bytecode = previous_bytecode
-    for phase in graph.phases.values():
+    graphs = [definition.item]
+    graphs.extend(graph for graph in (definition.before, definition.after) if graph)
+    for phase in (phase for graph in graphs for phase in graph.phases.values()):
         prompts_dir = (fixture_dir / "prompts").resolve()
         prompt = (prompts_dir / phase.prompt).resolve()
         try:

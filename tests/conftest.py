@@ -18,9 +18,9 @@ def fixture_dir(tmp_path: Path) -> Path:
     fixture = tmp_path / ".pycastle"
     (fixture / "prompts").mkdir(parents=True)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build, phase\n"
-        "graph = build(start='implement', "
-        "phases=[phase('implement', 'implement.md')])\n"
+        "from pycastle.graph import build, build_run, phase\n"
+        "run = build_run(item=build(start='implement', "
+        "phases=[phase('implement', 'implement.md')]))\n"
     )
     (fixture / "prompts" / "implement.md").write_text("# Implement\nDo the work.\n")
     return fixture
@@ -38,8 +38,8 @@ def three_phase_fixture_dir(tmp_path: Path) -> Path:
     fixture = tmp_path / ".pycastle"
     (fixture / "prompts").mkdir(parents=True)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import DONE, HUMAN, build, phase\n"
-        "graph = build(\n"
+        "from pycastle.graph import DONE, HUMAN, build, build_run, phase\n"
+        "run = build_run(item=build(\n"
         "    start='plan',\n"
         "    phases=[\n"
         "        phase('plan', 'plan.md', on_success='implement', on_failure=HUMAN),\n"
@@ -47,7 +47,7 @@ def three_phase_fixture_dir(tmp_path: Path) -> Path:
         "on_failure=HUMAN),\n"
         "        phase('review', 'review.md', on_success=DONE, on_failure=HUMAN),\n"
         "    ],\n"
-        ")\n"
+        "))\n"
     )
     (fixture / "prompts" / "plan.md").write_text("# Plan\nWork out the approach.\n")
     (fixture / "prompts" / "implement.md").write_text("# Implement\nDo the work.\n")

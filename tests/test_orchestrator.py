@@ -242,6 +242,59 @@ def _git_aware_runner(
     return MagicMock(side_effect=side_effect)
 
 
+def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    (fixture / "prompts").mkdir(parents=True)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, build_run, phase\n"
+        "run = build_run(item=build(start='implement', phases=[phase('implement', 'item.md')]), "
+        "after=build(start='review', phases=[phase('review', 'review.md', on_success='report'), phase('report', 'report.md')]))\n"
+    )
+    for name in ("item.md", "review.md", "report.md"):
+        (fixture / "prompts" / name).write_text(name)
+    issue = IssueRef(number=86, title="Integrated review", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    timeline: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            timeline.append(phase)
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "report":
+                (cwd / ".pycastle").mkdir(exist_ok=True)
+                (cwd / orchestrator.RUN_REPORT).write_text(
+                    "Verified integrated evidence.\n"
+                )
+            return result
+
+    def gate(_cwd: Path) -> orchestrator.GateOutcome:
+        timeline.append("run-gate")
+        return orchestrator.GateOutcome(True, "secret raw output", exit_code=0)
+
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="run-86",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        gate_check=gate,
+    )
+
+    assert timeline == ["implement", "run-gate", "review", "report", "run-gate"]
+    assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
+    assert (
+        fixture / "runs" / "run-86" / "run-report.md"
+    ).read_text() == "Verified integrated evidence.\n"
+
+
 def test_transcript_sink_interleaves_tagged_lines(
     fixture_dir: Path,
 ) -> None:

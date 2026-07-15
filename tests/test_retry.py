@@ -834,10 +834,11 @@ def test_fixture_gate_runs_in_the_issue_worktree(
 
     gate_path = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
     gate_calls = [call for call in runner.call_args_list if call.args[0] == [gate_path]]
-    assert len(gate_calls) == 1
-    # The gate ran in the issue worktree (issue-7), capturing its exit code.
+    assert len(gate_calls) == 2
+    # The Gate ran at Item scope and again at mandatory integrated Run scope.
     assert gate_calls[0].kwargs["cwd"] == tmp_path / "wt" / "issue-7"
     assert gate_calls[0].kwargs["capture"] is True
+    assert gate_calls[1].kwargs["cwd"] == tmp_path / "wt" / "run-20260613-101500"
 
 
 def test_no_fixture_gate_makes_one_attempt_and_passes(

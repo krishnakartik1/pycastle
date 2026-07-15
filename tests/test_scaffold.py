@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
-from pycastle.graph import DONE, PhaseGraph, load_graph
+from pycastle.graph import DONE, PhaseGraph, load_graph, load_run
 from pycastle.scaffold import (
     _DOCKERFILE,
     _EXTENSION_EMPTY,
@@ -41,6 +41,9 @@ EXPECTED_TREE = {
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
+    "prompts/run-review.md",
+    "prompts/run-repair.md",
+    "prompts/run-report.md",
 }
 
 
@@ -327,7 +330,7 @@ def test_scaffolded_main_uses_the_declarative_builder_api(tmp_path: Path) -> Non
     assert "phase(" in main_py
     assert "DONE" in main_py
     assert "HUMAN" in main_py
-    assert "graph = build(" in main_py
+    assert "run = build_run(" in main_py
 
 
 def test_scaffolded_main_loads_as_a_valid_phase_graph(tmp_path: Path) -> None:
@@ -335,7 +338,11 @@ def test_scaffolded_main_loads_as_a_valid_phase_graph(tmp_path: Path) -> None:
     scaffold_fixture(tmp_path, sandbox="host")
     fixture_dir = tmp_path / ".pycastle"
 
-    graph = load_graph(fixture_dir)
+    definition = load_run(fixture_dir)
+    assert definition.before is None
+    assert definition.after is not None
+    assert list(definition.after.phases) == ["run-review", "run-repair", "run-report"]
+    graph = definition.item
     assert isinstance(graph, PhaseGraph)
 
     # The conservative default flow: plan → implement → review → DONE.

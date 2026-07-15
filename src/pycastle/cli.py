@@ -372,7 +372,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         outcome.completed,
         outcome.pr_opened,
     )
-    return 0 if outcome.pr_opened else 1
+    return 0 if outcome.pr_opened and outcome.succeeded else 1
 
 
 def _cmd_prune(args: argparse.Namespace) -> int:

@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import signal
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -39,7 +40,16 @@ from typing import Any
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
-from .graph import HUMAN, GraphExecutor, Phase, PhaseResult, WalkResult, load_graph
+from .graph import (
+    HUMAN,
+    GraphExecutor,
+    Phase,
+    PhaseGraph,
+    PhaseResult,
+    RunDefinition,
+    WalkResult,
+    load_run,
+)
 from .issues import IssueSource, select_batch
 from .models import IssueRef
 from .runtime import AgentCrashError, CodexRuntime, Runtime
@@ -209,6 +219,9 @@ class GateOutcome:
 
     passed: bool
     output: str
+    exit_code: int = 0
+    duration_seconds: float = 0.0
+    command: str = ".pycastle/gate"
 
 
 def _gates_always_pass(_worktree: Path) -> GateOutcome:
@@ -291,7 +304,8 @@ def _gate_outcome_from_result(result: Any) -> GateOutcome:
     output = (getattr(result, "stdout", "") or "") + (
         getattr(result, "stderr", "") or ""
     )
-    return GateOutcome(passed=getattr(result, "returncode", 1) == 0, output=output)
+    exit_code = getattr(result, "returncode", 1)
+    return GateOutcome(passed=exit_code == 0, output=output, exit_code=exit_code)
 
 
 def make_fixture_gate_check(
@@ -348,6 +362,7 @@ def make_fixture_gate_check(
     def _check(worktree: Path) -> GateOutcome:
         if not gate_path.is_file():
             return GateOutcome(passed=True, output="")
+        started = time.monotonic()
         try:
             if sandbox == "docker":
                 # Wrap the canonical gate through the same docker wrapper the
@@ -371,9 +386,14 @@ def make_fixture_gate_check(
             # aborting the whole batch.
             logger.exception("Could not run quality gate %s", gate_path)
             return GateOutcome(
-                passed=False, output=f"gate could not be launched: {exc}"
+                passed=False,
+                output=f"gate could not be launched: {exc}",
+                exit_code=126,
+                duration_seconds=time.monotonic() - started,
             )
-        return _gate_outcome_from_result(result)
+        outcome = _gate_outcome_from_result(result)
+        outcome.duration_seconds = time.monotonic() - started
+        return outcome
 
     return _check
 
@@ -395,6 +415,9 @@ class RunOutcome:
     run_branch: str
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
+    pr_ready: bool = False
+    succeeded: bool = True
+    stopping_point: str | None = None
 
     @property
     def completed(self) -> list[int]:
@@ -838,6 +861,7 @@ def _walk_issue(
     gate_check: GateCheck,
     gate_sink: Callable[[str, str, str], None],
     verbose: bool,
+    graph: PhaseGraph,
 ) -> WalkResult:
     """Walk the issue's phase graph, with the implement node under #8's retry.
 
@@ -850,7 +874,6 @@ def _walk_issue(
     a terminal — :data:`~pycastle.graph.DONE` (proceed to commit + merge) or
     :data:`~pycastle.graph.HUMAN` (hand the issue to a person).
     """
-    graph = load_graph(fixture_dir)
     executor = GraphExecutor(
         runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
     )
@@ -906,6 +929,7 @@ def _work_issue(
     impl_retries: int,
     gate_check: GateCheck,
     setup: Setup,
+    item_graph: PhaseGraph,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
@@ -971,6 +995,7 @@ def _work_issue(
         gate_check=gate_check,
         gate_sink=gate_sink,
         verbose=verbose,
+        graph=item_graph,
     )
     if walk.results:
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
@@ -1123,6 +1148,124 @@ def _merge_issue_branch(
     return False
 
 
+RUN_REPORT = ".pycastle/run-report.md"
+RUN_REPORT_LIMIT = 65_536
+
+
+def render_run_context(
+    run_id: str, selected: list[IssueRef], outcomes: list[IssueOutcome]
+) -> str:
+    """Render the bounded factual envelope supplied to each Run phase."""
+    outcome_by_number = {o.issue.number: o for o in outcomes}
+    rows = []
+    for issue in selected:
+        outcome = outcome_by_number.get(issue.number)
+        state = (
+            "pending"
+            if outcome is None
+            else ("completed" if outcome.merged else "skipped")
+        )
+        rows.append(f"- #{issue.number}: {issue.title} [{state}]")
+    return f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+
+
+def _checkpoint_run_phase(
+    phase: Phase,
+    *,
+    run_branch: str,
+    run_worktree: Path,
+    fixture_dir: Path,
+    run_id: str,
+    runner: Runner,
+) -> None:
+    """Commit a successful Run phase when dirty and attempt a durability push."""
+    runner(
+        [
+            "git",
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude,top).pycastle/run-review.md",
+            ":(exclude,top).pycastle/run-report.md",
+        ],
+        capture=True,
+        cwd=run_worktree,
+    )
+    dirty = runner(
+        ["git", "diff", "--cached", "--quiet"], capture=True, cwd=run_worktree
+    )
+    if getattr(dirty, "returncode", 0) != 0:
+        runner(
+            ["git", "commit", "-m", f"chore: checkpoint Run phase {phase.name}"],
+            capture=True,
+            cwd=run_worktree,
+        )
+    _push_run_branch(
+        run_branch=run_branch,
+        run_worktree=run_worktree,
+        fixture_dir=fixture_dir,
+        run_id=run_id,
+        runner=runner,
+        final=False,
+    )
+
+
+def _walk_run_graph(
+    graph: PhaseGraph,
+    *,
+    runtime: Runtime,
+    fixture_dir: Path,
+    run_id: str,
+    run_branch: str,
+    run_worktree: Path,
+    context: str,
+    runner: Runner,
+) -> WalkResult:
+    """Walk one Run phase graph, checkpointing each successful visit."""
+    executor = GraphExecutor(runtime, fixture_dir=fixture_dir, preamble=context)
+    default = executor._default_runner(run_worktree)
+
+    def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        passed, results = default(phase, extra)
+        if passed:
+            _checkpoint_run_phase(
+                phase,
+                run_branch=run_branch,
+                run_worktree=run_worktree,
+                fixture_dir=fixture_dir,
+                run_id=run_id,
+                runner=runner,
+            )
+        else:
+            runner(["git", "reset", "--hard", "HEAD"], capture=True, cwd=run_worktree)
+            runner(["git", "clean", "-fd"], capture=True, cwd=run_worktree)
+        return passed, results
+
+    return executor.execute(graph, cwd=run_worktree, phase_runner=run_phase)
+
+
+def _harvest_report(
+    fixture_dir: Path, run_id: str, run_worktree: Path
+) -> tuple[str | None, str | None]:
+    """Retain and validate the optional authored Run report without truncation."""
+    source = run_worktree / RUN_REPORT
+    if not source.exists():
+        return None, None
+    raw = source.read_bytes()
+    retained = _telemetry_dir(fixture_dir, run_id) / "run-report.md"
+    retained.write_bytes(raw)
+    if len(raw) > RUN_REPORT_LIMIT:
+        return (
+            None,
+            f"Run report exceeds the {RUN_REPORT_LIMIT}-byte publication limit.",
+        )
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "Run report is not valid UTF-8."
+
+
 def run_batch(
     *,
     runtime: Runtime,
@@ -1175,6 +1318,10 @@ def run_batch(
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
 
+    # Import once: Runtime edits to the fixture are proposed changes and cannot
+    # rewrite the active Run definition or weaken its graphs.
+    run_definition: RunDefinition = load_run(fixture_dir)
+
     issues = issue_source.list_ready()
     selected = select_batch(
         issues,
@@ -1200,6 +1347,40 @@ def run_batch(
         f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
     )
 
+    try:
+        setup(run_worktree)
+        if run_definition.before is not None:
+            before = _walk_run_graph(
+                run_definition.before,
+                runtime=runtime,
+                fixture_dir=fixture_dir,
+                run_id=run_id,
+                run_branch=run_branch,
+                run_worktree=run_worktree,
+                context=render_run_context(run_id, selected, []),
+                runner=runner,
+            )
+        else:
+            before = None
+    except KeyboardInterrupt:
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+        )
+        raise
+    except SetupError as exc:
+        outcome.succeeded = False
+        outcome.stopping_point = f"before-Run Setup: {exc}"
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        return outcome
+    if before is not None and before.terminal is HUMAN:
+        outcome.succeeded = False
+        outcome.stopping_point = "before-Run HUMAN"
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        return outcome
+
     # Track the issue currently in flight so an interrupt (SIGINT) or any
     # exception mid-issue can clean up that issue's worktree and restore its
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
@@ -1208,8 +1389,8 @@ def run_batch(
         try:
             for issue in selected:
                 in_flight = issue
-                outcome.issues.append(
-                    _work_issue(
+                try:
+                    item_outcome = _work_issue(
                         issue,
                         runtime=runtime,
                         issue_source=issue_source,
@@ -1224,9 +1405,28 @@ def run_batch(
                         impl_retries=impl_retries,
                         gate_check=gate_check,
                         setup=setup,
+                        item_graph=run_definition.item,
                         verbose=verbose,
                     )
-                )
+                except Exception as exc:  # handled infrastructure boundary
+                    cleanup_worktree(
+                        worktree_root / f"issue-{issue.number}",
+                        runner=runner,
+                        cwd=workspace,
+                    )
+                    issue_source.release(issue.number)
+                    if not outcome.completed:
+                        in_flight = None
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        raise
+                    outcome.succeeded = False
+                    outcome.stopping_point = (
+                        f"Item #{issue.number} infrastructure failure: {exc}"
+                    )
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    in_flight = None
+                    break
+                outcome.issues.append(item_outcome)
                 in_flight = None
         except BaseException:
             # An interrupt or unexpected error mid-issue: leave no orphaned
@@ -1247,7 +1447,51 @@ def run_batch(
 
     completed = outcome.completed
     if completed:
-        outcome.pr_opened = _open_pull_request(
+        run_gate: GateOutcome | None = None
+        publication_error: str | None = None
+        try:
+            if outcome.succeeded:
+                setup(run_worktree)
+                if run_definition.after is not None:
+                    after = _walk_run_graph(
+                        run_definition.after,
+                        runtime=runtime,
+                        fixture_dir=fixture_dir,
+                        run_id=run_id,
+                        run_branch=run_branch,
+                        run_worktree=run_worktree,
+                        context=render_run_context(run_id, selected, outcome.issues),
+                        runner=runner,
+                    )
+                    if after.terminal is HUMAN:
+                        outcome.succeeded = False
+                        outcome.stopping_point = "after-Run HUMAN"
+                run_gate = gate_check(run_worktree)
+                (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
+                    run_gate.output
+                )
+                if not run_gate.passed:
+                    outcome.succeeded = False
+                    outcome.stopping_point = "Run Gate"
+        except SetupError as exc:
+            if outcome.succeeded:
+                outcome.succeeded = False
+                outcome.stopping_point = "after-Run Setup"
+            _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
+        except KeyboardInterrupt:
+            cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+            _append_log(
+                fixture_dir,
+                run_id,
+                f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+            )
+            raise
+        report, report_error = _harvest_report(fixture_dir, run_id, run_worktree)
+        if report_error:
+            outcome.succeeded = False
+            outcome.stopping_point = "Run report validation"
+            publication_error = report_error
+        outcome.pr_opened, published, outcome.pr_ready = _open_pull_request(
             repo=repo,
             base_branch=base_branch,
             run_branch=run_branch,
@@ -1256,7 +1500,17 @@ def run_batch(
             run_worktree=run_worktree,
             fixture_dir=fixture_dir,
             runner=runner,
+            selected=selected,
+            skipped=[o.issue.number for o in outcome.issues if not o.merged],
+            gate=run_gate,
+            report=report,
+            publication_error=publication_error,
+            successful=outcome.succeeded,
+            stopping_point=outcome.stopping_point,
         )
+        if outcome.succeeded and not published:
+            outcome.succeeded = False
+            outcome.stopping_point = "Run report publication"
     else:
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
@@ -1274,12 +1528,15 @@ def _open_pull_request(
     run_worktree: Path,
     fixture_dir: Path,
     runner: Runner,
-) -> bool:
-    """Push the run branch and open one pull request closing every merged issue.
-
-    The body carries a ``- Closes #N`` line per completed issue so merging the
-    single run PR closes the whole batch.
-    """
+    selected: list[IssueRef],
+    skipped: list[int],
+    gate: GateOutcome | None,
+    report: str | None,
+    publication_error: str | None,
+    successful: bool,
+    stopping_point: str | None,
+) -> tuple[bool, bool, bool]:
+    """Final-push, draft-create, report, then ready a successful Run PR."""
     if not _push_run_branch(
         run_branch=run_branch,
         run_worktree=run_worktree,
@@ -1288,37 +1545,168 @@ def _open_pull_request(
         runner=runner,
         final=True,
     ):
-        return False
+        return False, False, False
     closes = "\n".join(f"- Closes #{number}" for number in completed)
     body = (
         f"Automated PyCastle run {run_id} completing {len(completed)} issue(s).\n\n"
         f"{closes}\n"
     )
-    pr = runner(
+    existing = runner(
         [
             "gh",
             "pr",
-            "create",
+            "list",
             "-R",
             repo,
-            "--base",
-            base_branch,
             "--head",
             run_branch,
-            "--title",
-            f"pycastle: run {run_id}",
-            "--body",
-            body,
+            "--state",
+            "open",
+            "--json",
+            "number",
         ],
         capture=True,
     )
+    pr_number: int | None = None
+    try:
+        rows = json.loads(getattr(existing, "stdout", "") or "[]")
+        if rows:
+            pr_number = int(rows[0]["number"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+    pr = existing
+    if pr_number is None:
+        pr = runner(
+            [
+                "gh",
+                "pr",
+                "create",
+                "-R",
+                repo,
+                "--base",
+                base_branch,
+                "--head",
+                run_branch,
+                "--title",
+                f"pycastle: run {run_id}",
+                "--body",
+                body,
+                "--draft",
+            ],
+            capture=True,
+        )
     opened = getattr(pr, "returncode", 1) == 0
     _append_log(
         fixture_dir,
         run_id,
         f"Pull request {'opened' if opened else 'failed'} for {run_branch}",
     )
-    return opened
+    if not opened:
+        return False, False, False
+
+    if pr_number is None:
+        view = runner(
+            [
+                "gh",
+                "pr",
+                "view",
+                run_branch,
+                "-R",
+                repo,
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            capture=True,
+        )
+        try:
+            pr_number = int((getattr(view, "stdout", "") or "").strip())
+        except ValueError:
+            pr_number = None
+
+    state = "complete" if successful else "draft"
+    gate_line = "not run"
+    if gate is not None:
+        gate_line = (
+            f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
+            f"(exit {gate.exit_code}, {gate.duration_seconds:.2f}s)"
+        )
+    selected_numbers = [issue.number for issue in selected]
+    marker = f"<!-- pycastle-run-report:{run_id} -->"
+    comment = (
+        f"{marker}\n## PyCastle Run {run_id}\n\n"
+        f"- State: **{state}**\n"
+        f"- Selected Items: {', '.join(f'#{n}' for n in selected_numbers) or 'none'}\n"
+        f"- Completed Items: {', '.join(f'#{n}' for n in completed) or 'none'}\n"
+        f"- Skipped Items: {', '.join(f'#{n}' for n in skipped) or 'none'}\n"
+        f"- Run Gate: {gate_line}\n"
+    )
+    if stopping_point:
+        comment += f"- Stopping point: {stopping_point}\n"
+    if publication_error:
+        comment += f"\n> Run report validation error: {publication_error}\n"
+    elif report is not None:
+        comment += "\n---\n\n" + report
+
+    comment_argv = [
+        "gh",
+        "pr",
+        "comment",
+        str(pr_number or run_branch),
+        "-R",
+        repo,
+        "--body",
+        comment,
+    ]
+    if pr_number is not None:
+        listed = runner(
+            ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"],
+            capture=True,
+        )
+        comment_id: int | None = None
+        try:
+            comments = json.loads(getattr(listed, "stdout", "") or "[]")
+            for candidate in comments:
+                if marker in candidate.get("body", ""):
+                    comment_id = int(candidate["id"])
+                    break
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+        endpoint = (
+            f"repos/{repo}/issues/comments/{comment_id}"
+            if comment_id is not None
+            else f"repos/{repo}/issues/{pr_number}/comments"
+        )
+        method = "PATCH" if comment_id is not None else "POST"
+        comment_argv = [
+            "gh",
+            "api",
+            "--method",
+            method,
+            endpoint,
+            "-f",
+            f"body={comment}",
+        ]
+    published = runner(comment_argv, capture=True)
+    if getattr(published, "returncode", 1) != 0:
+        _append_log(
+            fixture_dir, run_id, "Run report publication failed; PR remains draft."
+        )
+        return True, False, False
+    ready_succeeded = False
+    if successful:
+        ready = runner(
+            ["gh", "pr", "ready", str(pr_number or run_branch), "-R", repo],
+            capture=True,
+        )
+        if getattr(ready, "returncode", 1) != 0:
+            _append_log(
+                fixture_dir, run_id, "Ready transition failed; PR remains draft."
+            )
+        else:
+            ready_succeeded = True
+    return True, True if not successful else ready_succeeded, ready_succeeded
 
 
 def _push_run_branch(

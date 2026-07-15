@@ -4,8 +4,9 @@ A reusable, installable autonomous development loop for any repository.
 
 PyCastle owns the runner while each project owns its prompts, gate, and phase
 graph. It selects ready GitHub issues, gives each issue an isolated worktree,
-runs a plan → implement → review phase graph, retries failed implementation
-attempts with a handoff, and opens one pull request for the successful batch.
+runs a plan → implement → review Item phase graph, retries failed implementation
+attempts with a handoff, reviews the integrated Run, applies its final Gate, and
+publishes verified Run evidence to one pull request for the successful batch.
 Claude Code and Codex are supported as runtimes, on the host or in Docker.
 
 ## Requirements
@@ -49,8 +50,9 @@ choice can be scripted with `pycastle init --sandbox host` or
 unavailable and the prompt reaches end-of-file, `init` uses the host default.
 The fixture contains all of the project-owned behavior:
 
-- `.pycastle/main.py` — the executable phase graph and its transitions.
-- `.pycastle/prompts/` — instructions for the plan, implement, and review phases.
+- `.pycastle/main.py` — the Run definition containing its Item graph and optional
+  before-Run and after-Run graphs.
+- `.pycastle/prompts/` — instructions for Item and integrated Run phases.
 - `.pycastle/gate` — the quality gate run after an implementation attempt.
 - `.pycastle/Dockerfile` — the agent image recipe, including the project gate
   toolchain for detected Python projects.
