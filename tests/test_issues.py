@@ -6,6 +6,8 @@ import json
 import subprocess
 from unittest.mock import MagicMock
 
+import pytest
+
 from pycastle.issues import (
     GitHubIssueSource,
     assignee_logins,
@@ -216,6 +218,19 @@ def test_github_source_handles_empty_output() -> None:
     )
     source = GitHubIssueSource("owner/repo", runner=runner)
     assert source.list_ready() == []
+
+
+@pytest.mark.parametrize("method", ["list_ready", "list_ready_metadata"])
+def test_github_source_rejects_failed_list_commands(method: str) -> None:
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="GitHub unavailable"
+        )
+    )
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    with pytest.raises(OSError, match="listing failed"):
+        getattr(source, method)()
 
 
 def test_github_source_claim_assigns_and_drops_label() -> None:

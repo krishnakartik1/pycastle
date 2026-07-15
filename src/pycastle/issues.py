@@ -92,7 +92,7 @@ class IssueSource(ABC):
     """Lists, claims, and labels work items behind a stable interface."""
 
     @abstractmethod
-    def list_ready(self) -> list[IssueRef]:
+    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
         """Return the open work items ready for an agent."""
 
     @abstractmethod
@@ -124,8 +124,11 @@ class GitHubIssueSource(IssueSource):
         self.human_label = human_label
         self._run = runner
 
-    def list_ready(self) -> list[IssueRef]:
+    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
         """Return open issues carrying the ready label."""
+        options: dict[str, Any] = {"capture": True}
+        if timeout is not None:
+            options["timeout"] = timeout
         result = self._run(
             [
                 "gh",
@@ -142,8 +145,10 @@ class GitHubIssueSource(IssueSource):
                 "--json",
                 "number,title,body,labels,assignees,comments",
             ],
-            capture=True,
+            **options,
         )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub ready-Item listing failed")
         raw = (result.stdout or "").strip()
         if not raw:
             return []
@@ -170,6 +175,50 @@ class GitHubIssueSource(IssueSource):
                             key=lambda value: value.get("createdAt", ""),
                         )
                     ],
+                )
+            )
+        return issues
+
+    def list_ready_metadata(self, *, timeout: float | None = None) -> list[IssueRef]:
+        """List ready Items without fetching bodies, comments, or other content."""
+        result = self._run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "open",
+                "--label",
+                self.label,
+                "--limit",
+                "100",
+                "--json",
+                "number,title,labels,assignees",
+            ],
+            capture=True,
+            timeout=timeout,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub ready-Item metadata listing failed")
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return []
+        issues: list[IssueRef] = []
+        for item in json.loads(raw):
+            labels = [
+                label["name"] if isinstance(label, dict) else label
+                for label in item.get("labels", [])
+            ]
+            issues.append(
+                IssueRef(
+                    number=item["number"],
+                    title=item.get("title", ""),
+                    body="",
+                    labels=labels,
+                    assignees=assignee_logins(item),
+                    comments=[],
                 )
             )
         return issues

@@ -869,6 +869,7 @@ def test_run_works_one_issue_end_to_end_via_codex(
     outcome = orchestrator.run_batch(
         runtime=make_runtime("codex"),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -911,6 +912,7 @@ def test_run_works_one_issue_end_to_end_via_codex_in_docker(
     outcome = orchestrator.run_batch(
         runtime=CodexRuntime.in_docker(workspace=tmp_path),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",

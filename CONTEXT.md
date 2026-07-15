@@ -8,6 +8,12 @@ language so issues, ADRs, and code use one word per concept.
 
 ### The loop
 
+**Doctor**:
+A non-destructive readiness snapshot for one resolved Run configuration. It may
+prepare a content-addressed Agent image, but never reserves Items or authorizes a
+later Run; Run evaluates readiness again before side effects.
+_Avoid_: dry Run, canary Run, health score, reservation.
+
 **Run**:
 One bounded pass that turns up to N ready work items into a single pull request.
 Cuts a per-run branch, works each item on its own branch off it, folds the clean

@@ -20,6 +20,14 @@ import pytest
 from pycastle import cli, orchestrator, sandbox
 from pycastle.cli import main
 from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
+from pycastle.readiness import (
+    CHECK_IDS,
+    EligibleItem,
+    ReadinessCheck,
+    ReadinessConfiguration,
+    ReadinessReport,
+    Status,
+)
 from pycastle.runtime import AgentCrashError
 
 HANDOFF_REL = orchestrator.HANDOFF_DOC
@@ -109,6 +117,7 @@ def test_failed_gates_retry_with_prior_attempt_context(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -161,6 +170,7 @@ def test_agent_crash_counts_as_a_failed_attempt_and_retries(
     outcome = orchestrator.run_batch(
         runtime=crashing,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -199,6 +209,7 @@ def test_handoff_document_is_generated_on_gate_failure(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -308,6 +319,7 @@ def test_exhausted_retries_mark_for_human_and_loop_continues(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -356,6 +368,7 @@ def test_default_runs_a_single_attempt_with_no_retries(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -392,6 +405,7 @@ def test_default_with_no_gate_makes_one_attempt_and_passes(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -493,6 +507,7 @@ def test_crash_then_gate_fail_then_pass_is_a_single_worked_issue(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -541,6 +556,7 @@ def test_codex_thread_id_from_telemetry_resumes_through_the_loop(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -580,6 +596,7 @@ def test_missing_handoff_doc_degrades_to_a_plain_retry(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -621,6 +638,7 @@ def test_prior_attempt_block_carries_the_failing_gate_info(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -672,6 +690,7 @@ def test_retry_context_never_reaches_plan_or_review_phases(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -776,6 +795,7 @@ def test_fixture_gate_failure_drives_the_retry_path_through_run_batch(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -819,6 +839,7 @@ def test_fixture_gate_runs_in_the_issue_worktree(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -861,6 +882,7 @@ def test_no_fixture_gate_makes_one_attempt_and_passes(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -892,6 +914,23 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     project fixture rather than leaving the always-pass default in place (#14).
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_cli_readiness",
+        lambda _args: ReadinessReport(
+            1,
+            True,
+            "0.1.0",
+            ReadinessConfiguration(
+                "owner/repo", "main", "main", "stub", "host", None, "krishna", False, 1
+            ),
+            tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            (EligibleItem(1, "One"),),
+            (IssueRef(number=1, title="One"),),
+        ),
+    )
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
     monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
     monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
@@ -944,6 +983,7 @@ def test_fixture_gate_exhaustion_marks_for_human_through_run_batch(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1026,6 +1066,7 @@ def test_unexecutable_fixture_gate_marks_for_human_not_crash_the_run(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1269,6 +1310,7 @@ def test_gate_output_surfaced_on_failure_without_verbose(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1303,6 +1345,7 @@ def test_gate_output_not_surfaced_on_success_without_verbose(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1337,6 +1380,7 @@ def test_gate_output_surfaced_on_success_under_verbose(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",

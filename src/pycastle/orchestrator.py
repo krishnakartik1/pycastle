@@ -50,7 +50,7 @@ from .graph import (
     WalkResult,
     load_run,
 )
-from .issues import IssueSource, select_batch
+from .issues import IssueSource
 from .models import IssueRef
 from .runtime import AgentCrashError, CodexRuntime, Runtime
 
@@ -417,6 +417,7 @@ class RunOutcome:
 
     run_id: str
     run_branch: str
+    selected: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
     pr_ready: bool = False
@@ -428,8 +429,14 @@ class RunOutcome:
         """Issue numbers that merged cleanly into the run branch."""
         return [o.issue.number for o in self.issues if o.merged]
 
+    @property
+    def skipped(self) -> list[int]:
+        """Selected issue numbers not folded into the Run branch."""
+        completed = set(self.completed)
+        return [number for number in self.selected if number not in completed]
 
-@dataclass(frozen=True)
+
+@dataclass
 class RunContext:
     """Host-side identity and command boundary for one active Run worktree."""
 
@@ -438,6 +445,14 @@ class RunContext:
     worktree: Path
     fixture_dir: Path
     runner: Runner
+    remote_checkpoint_succeeded: bool = False
+
+
+@dataclass
+class CancellationState:
+    """Mutable ownership state inspected by the Run cancellation boundary."""
+
+    in_flight: IssueRef | None = None
 
 
 @dataclass(frozen=True)
@@ -645,39 +660,68 @@ def _sigint_as_keyboard_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGINT, previous)
 
 
-def _cleanup_interrupted(
+def _cleanup_cancelled(
     *,
-    issue: IssueRef,
+    issue: IssueRef | None,
     issue_source: IssueSource,
     worktree_root: Path,
     workspace: Path,
     run: RunContext,
 ) -> None:
-    """Tear down an interrupted run: remove worktrees, restore the ready state.
+    """Best-effort cancellation cleanup with a factual recovery summary."""
+    manual_cleanup: list[Path] = []
+    worktrees = ([worktree_root / f"issue-{issue.number}"] if issue else []) + [
+        run.worktree
+    ]
+    for worktree in worktrees:
+        failed = False
+        for argv in (
+            ["git", "worktree", "remove", str(worktree), "--force"],
+            ["git", "worktree", "prune"],
+        ):
+            try:
+                result = run.runner(argv, capture=True, cwd=workspace)
+                failed = failed or getattr(result, "returncode", 1) != 0
+            except BaseException:  # cleanup must never replace the interruption
+                failed = True
+                logger.exception("Cancellation cleanup command failed for %s", worktree)
+        if failed:
+            manual_cleanup.append(worktree)
 
-    Called when an interrupt (SIGINT/``KeyboardInterrupt``) or any exception
-    escapes while ``issue`` is in flight. It removes that issue's worktree and
-    the run worktree so no orphaned worktrees are left, then releases the issue
-    back to ``ready-for-agent`` so it is not stuck claimed. Cleanup is
-    best-effort: a failure removing one worktree must not stop the release, so
-    each step is guarded and logged rather than allowed to mask the interrupt.
-    """
-    issue_worktree = worktree_root / f"issue-{issue.number}"
-    for worktree in (issue_worktree, run.worktree):
+    release_failure = False
+    if issue is not None:
         try:
-            cleanup_worktree(worktree, runner=run.runner, cwd=workspace)
-        except Exception:  # noqa: BLE001 - best-effort teardown, never re-raise here
-            logger.exception("Failed to remove worktree %s during interrupt", worktree)
-    try:
-        issue_source.release(issue.number)
-    except Exception:  # noqa: BLE001 - best-effort restore, never mask the interrupt
-        logger.exception("Failed to restore ready state on #%s", issue.number)
-    _append_log(
-        run.fixture_dir,
-        run.run_id,
-        f"Run interrupted while working #{issue.number}; "
-        "worktrees removed and issue released to ready-for-agent.",
+            issue_source.release(issue.number)
+        except BaseException:  # release is independent best-effort cleanup
+            release_failure = True
+            logger.exception("Failed to release in-flight Item #%s", issue.number)
+
+    records = _telemetry_dir(run.fixture_dir, run.run_id)
+    recovery = (
+        f"Remote checkpoint: origin/{run.branch}."
+        if run.remote_checkpoint_succeeded
+        else "No remote checkpoint survived."
     )
+    cleanup = (
+        "Cleanup completed."
+        if not manual_cleanup
+        else "Manual worktree cleanup required: "
+        + ", ".join(str(path) for path in manual_cleanup)
+        + "."
+    )
+    release = (
+        f" In-flight Item #{issue.number} could not be released."
+        if issue is not None and release_failure
+        else (f" In-flight Item #{issue.number} released." if issue is not None else "")
+    )
+    summary = (
+        f"Run cancelled; no pull request opened. {recovery} "
+        f"Retained records: {records}. {cleanup}{release}"
+    )
+    try:
+        _append_log(run.fixture_dir, run.run_id, summary)
+    except BaseException:  # reporting is best-effort and cannot mask cancellation
+        logger.exception("Could not persist cancellation recovery summary: %s", summary)
 
 
 _HANDOFF_PROMPT = (
@@ -948,6 +992,7 @@ def _work_issue(
     gate_check: GateCheck,
     setup: Setup,
     item_graph: PhaseGraph,
+    cancellation: CancellationState | None = None,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
@@ -976,6 +1021,13 @@ def _work_issue(
     run_branch = run.branch
     runner = run.runner
     branch = issue_branch_name(issue)
+    # Record ownership before calling the external Issue source.  A claim can
+    # complete remotely and then surface ``KeyboardInterrupt`` locally, so
+    # recording it afterwards leaves a cancellation race where the Item stays
+    # claimed.  ``release`` is the existing idempotent recovery operation for
+    # claim failures as well as interruptions.
+    if cancellation is not None:
+        cancellation.in_flight = issue
     issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
@@ -1032,6 +1084,8 @@ def _work_issue(
             run_id,
             f"#{issue.number} reached the HUMAN terminal; marked ready-for-human.",
         )
+        if cancellation is not None:
+            cancellation.in_flight = None
         cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
         return IssueOutcome(issue=issue, branch=branch, merged=False)
@@ -1069,6 +1123,8 @@ def _work_issue(
             run_id,
             f"#{issue.number} produced no changes; marked ready-for-human.",
         )
+        if cancellation is not None:
+            cancellation.in_flight = None
         cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
         return IssueOutcome(issue=issue, branch=branch, merged=False)
@@ -1091,6 +1147,12 @@ def _work_issue(
         # The merge is the durability boundary: push it before cleaning up the
         # item worktree so the remote checkpoint follows the fold immediately.
         _push_run_branch(run=run, final=False)
+
+    # The Item outcome and its durability attempt are complete.  Clear ownership
+    # before local cleanup so an interrupt at the return boundary cannot release
+    # an Item whose outcome is already durable.
+    if cancellation is not None:
+        cancellation.in_flight = None
 
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
@@ -1261,6 +1323,21 @@ def _walk_run_graph(
     return executor.execute(graph, cwd=run.worktree, phase_runner=run_phase)
 
 
+def _discard_incomplete_run_scope(run: RunContext) -> None:
+    """Restore the Run worktree to its last committed durable checkpoint."""
+    commands = (
+        ["git", "reset", "--hard", "HEAD"],
+        ["git", "clean", "-fd"],
+        ["git", "clean", "-fdX", "--", RUN_REVIEW, RUN_REPORT],
+    )
+    for argv in commands:
+        result = run.runner(argv, capture=True, cwd=run.worktree)
+        if getattr(result, "returncode", 1) != 0:
+            raise RunCheckpointError(
+                f"could not discard incomplete Run scope ({' '.join(argv)})"
+            )
+
+
 def _harvest_report(run: RunContext) -> tuple[str | None, str | None]:
     """Retain and validate the optional authored Run report without truncation."""
     source = run.worktree / RUN_REPORT
@@ -1291,6 +1368,7 @@ def run_batch(
     *,
     runtime: Runtime,
     issue_source: IssueSource,
+    selected: Sequence[IssueRef],
     fixture_dir: Path,
     repo: str,
     base_branch: str,
@@ -1308,8 +1386,7 @@ def run_batch(
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
-    Selection is a pure function behind the Issue source boundary
-    (:func:`~pycastle.issues.select_batch`). A per-run branch is cut in its own
+    ``selected`` is the ordered batch frozen by readiness. A per-run branch is cut in its own
     worktree so the main checkout stays put; each selected issue is then worked
     in its own worktree off the run branch and, on a clean merge, folded into the
     run branch. One pull request is opened for the run, closing every issue that
@@ -1333,6 +1410,18 @@ def run_batch(
     default, so a normal run writes no transcript log and behaves exactly as
     before.
     """
+    # Copy again at the orchestration boundary so callers cannot mutate the
+    # active membership, order, or Item content during project execution.
+    selected = tuple(issue.model_copy(deep=True) for issue in selected)
+    run_branch = f"pycastle/run-{run_id}"
+    outcome = RunOutcome(
+        run_id=run_id,
+        run_branch=run_branch,
+        selected=[issue.number for issue in selected],
+    )
+    if not selected:
+        return outcome
+
     gate_check = gate_check or _gates_always_pass
     setup = setup or (lambda _worktree: None)
     workspace = workspace or Path.cwd()
@@ -1342,26 +1431,6 @@ def run_batch(
     # Import once: Runtime edits to the fixture are proposed changes and cannot
     # rewrite the active Run definition or weaken its graphs.
     run_definition: RunDefinition = load_run(fixture_dir)
-
-    issues = issue_source.list_ready()
-    # Snapshot the ordered selection before any project-owned Run phase executes.
-    # A tuple of deep copies makes the lifecycle invariant explicit: fixture
-    # edits, Issue source changes, and in-process Runtime behavior cannot mutate,
-    # add, remove, or reorder the active batch after selection.
-    selected = tuple(
-        issue.model_copy(deep=True)
-        for issue in select_batch(
-            issues,
-            assignee=assignee,
-            include_unassigned=include_unassigned,
-            limit=iterations,
-        )
-    )
-    run_branch = f"pycastle/run-{run_id}"
-    outcome = RunOutcome(run_id=run_id, run_branch=run_branch)
-    if not selected:
-        _append_log(fixture_dir, run_id, "No ready issues to work.")
-        return outcome
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
@@ -1382,23 +1451,26 @@ def run_batch(
         f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
     )
 
+    cancellation = CancellationState()
     try:
-        setup(run_worktree)
-        if run_definition.before is not None:
-            before = _walk_run_graph(
-                run_definition.before,
-                runtime=runtime,
-                run=run,
-                context=render_run_context(run_id, selected, []),
-            )
-        else:
-            before = None
+        with _sigint_as_keyboard_interrupt():
+            setup(run_worktree)
+            if run_definition.before is not None:
+                before = _walk_run_graph(
+                    run_definition.before,
+                    runtime=runtime,
+                    run=run,
+                    context=render_run_context(run_id, selected, []),
+                )
+            else:
+                before = None
     except KeyboardInterrupt:
-        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-        _append_log(
-            fixture_dir,
-            run_id,
-            f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+        _cleanup_cancelled(
+            issue=cancellation.in_flight,
+            issue_source=issue_source,
+            worktree_root=worktree_root,
+            workspace=workspace,
+            run=run,
         )
         raise
     except SetupError as exc:
@@ -1421,11 +1493,9 @@ def run_batch(
     # Track the issue currently in flight so an interrupt (SIGINT) or any
     # exception mid-issue can clean up that issue's worktree and restore its
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
-    in_flight: IssueRef | None = None
     with _sigint_as_keyboard_interrupt():
         try:
             for issue in selected:
-                in_flight = issue
                 try:
                     item_outcome = _work_issue(
                         issue,
@@ -1439,6 +1509,7 @@ def run_batch(
                         gate_check=gate_check,
                         setup=setup,
                         item_graph=run_definition.item,
+                        cancellation=cancellation,
                         verbose=verbose,
                     )
                 except Exception as exc:  # handled infrastructure boundary
@@ -1448,8 +1519,8 @@ def run_batch(
                         cwd=workspace,
                     )
                     issue_source.release(issue.number)
+                    cancellation.in_flight = None
                     if not outcome.completed:
-                        in_flight = None
                         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
                         raise
                     outcome.succeeded = False
@@ -1457,66 +1528,75 @@ def run_batch(
                         f"Item #{issue.number} infrastructure failure: {exc}"
                     )
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
-                    in_flight = None
                     break
                 outcome.issues.append(item_outcome)
-                in_flight = None
-        except BaseException:
-            # An interrupt or unexpected error mid-issue: leave no orphaned
-            # worktrees and no stuck-claimed issue, then re-raise so the caller
-            # sees the cancellation.
-            if in_flight is not None:
-                _cleanup_interrupted(
-                    issue=in_flight,
-                    issue_source=issue_source,
-                    worktree_root=worktree_root,
-                    workspace=workspace,
-                    run=run,
-                )
+        except KeyboardInterrupt:
+            _cleanup_cancelled(
+                issue=cancellation.in_flight,
+                issue_source=issue_source,
+                worktree_root=worktree_root,
+                workspace=workspace,
+                run=run,
+            )
             raise
 
     completed = outcome.completed
     if completed:
         run_gate: GateOutcome | None = None
         publication_error: str | None = None
+        suppress_report_harvest = False
         try:
-            if outcome.succeeded:
-                setup(run_worktree)
-                if run_definition.after is not None:
-                    after = _walk_run_graph(
-                        run_definition.after,
-                        runtime=runtime,
-                        run=run,
-                        context=render_run_context(run_id, selected, outcome.issues),
+            with _sigint_as_keyboard_interrupt():
+                if outcome.succeeded:
+                    setup(run_worktree)
+                    if run_definition.after is not None:
+                        after = _walk_run_graph(
+                            run_definition.after,
+                            runtime=runtime,
+                            run=run,
+                            context=render_run_context(
+                                run_id, selected, outcome.issues
+                            ),
+                        )
+                        if after.terminal is HUMAN:
+                            outcome.succeeded = False
+                            outcome.stopping_point = "after-Run HUMAN"
+                    run_gate = gate_check(run_worktree)
+                    (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
+                        run_gate.output
                     )
-                    if after.terminal is HUMAN:
+                    if not run_gate.passed:
                         outcome.succeeded = False
-                        outcome.stopping_point = "after-Run HUMAN"
-                run_gate = gate_check(run_worktree)
-                (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
-                    run_gate.output
-                )
-                if not run_gate.passed:
-                    outcome.succeeded = False
-                    outcome.stopping_point = "Run Gate"
+                        outcome.stopping_point = "Run Gate"
         except SetupError as exc:
+            suppress_report_harvest = True
             if outcome.succeeded:
                 outcome.succeeded = False
                 outcome.stopping_point = "after-Run Setup"
             _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
+            try:
+                _discard_incomplete_run_scope(run)
+            except RunCheckpointError as cleanup_error:
+                # Publication pushes committed history only. A failed worktree
+                # restore must be visible, but must not strand checkpoints that
+                # were already made durable before Setup failed.
+                _append_log(fixture_dir, run_id, str(cleanup_error))
         except RunCheckpointError as exc:
             outcome.succeeded = False
             outcome.stopping_point = f"after-Run checkpoint: {exc}"
             _append_log(fixture_dir, run_id, outcome.stopping_point)
         except KeyboardInterrupt:
-            cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-            _append_log(
-                fixture_dir,
-                run_id,
-                f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+            _cleanup_cancelled(
+                issue=cancellation.in_flight,
+                issue_source=issue_source,
+                worktree_root=worktree_root,
+                workspace=workspace,
+                run=run,
             )
             raise
-        report, report_error = _harvest_report(run)
+        report, report_error = (
+            (None, None) if suppress_report_harvest else _harvest_report(run)
+        )
         if report_error:
             outcome.succeeded = False
             outcome.stopping_point = "Run report validation"
@@ -1527,7 +1607,7 @@ def run_batch(
             run=run,
             completed=completed,
             selected=selected,
-            skipped=[o.issue.number for o in outcome.issues if not o.merged],
+            skipped=outcome.skipped,
             gate=run_gate,
             report=report,
             publication_error=publication_error,
@@ -1627,30 +1707,46 @@ def _open_pull_request(
         return PublicationOutcome(final_push_succeeded=True)
     pr = existing
     if pr_number is None:
-        pr = run.runner(
-            [
-                "gh",
-                "pr",
-                "create",
-                "-R",
-                repo,
-                "--base",
-                base_branch,
-                "--head",
-                run.branch,
-                "--title",
-                f"pycastle: run {run.run_id}",
-                "--body",
-                body,
-                "--draft",
-            ],
-            capture=True,
-        )
+        try:
+            pr = run.runner(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "-R",
+                    repo,
+                    "--base",
+                    base_branch,
+                    "--head",
+                    run.branch,
+                    "--title",
+                    f"pycastle: run {run.run_id}",
+                    "--body",
+                    body,
+                    "--draft",
+                ],
+                capture=True,
+            )
+        except OSError as exc:
+            records = _telemetry_dir(run.fixture_dir, run.run_id)
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                f"Pull request creation failed ({exc}); pushed branch origin/"
+                f"{run.branch} and retained records at {records}.",
+            )
+            return PublicationOutcome(final_push_succeeded=True)
     opened = getattr(pr, "returncode", 1) == 0
     _append_log(
         run.fixture_dir,
         run.run_id,
-        f"Pull request {'opened' if opened else 'failed'} for {run.branch}",
+        (
+            f"Pull request opened for {run.branch}"
+            if opened
+            else f"Pull request creation failed; pushed branch origin/{run.branch} "
+            f"and retained records at "
+            f"{_telemetry_dir(run.fixture_dir, run.run_id)}."
+        ),
     )
     if not opened:
         return PublicationOutcome(final_push_succeeded=True)
@@ -1835,6 +1931,8 @@ def _push_run_branch(
         logger.warning("Could not push Run branch %s: %s", run.branch, exc)
 
     if succeeded:
+        if not final:
+            run.remote_checkpoint_succeeded = True
         _append_log(run.fixture_dir, run.run_id, f"Pushed Run checkpoint {run.branch}")
         return True
 

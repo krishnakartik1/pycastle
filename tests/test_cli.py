@@ -12,8 +12,69 @@ from packaging.version import Version
 from pycastle import cli
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
+from pycastle.issues import IssueRef
+from pycastle.orchestrator import IssueOutcome, RunOutcome
 from pycastle.preflight import PreflightError
+from pycastle.readiness import (
+    CHECK_IDS,
+    EligibleItem,
+    ReadinessCheck,
+    ReadinessConfiguration,
+    ReadinessReport,
+    Status,
+)
 from pycastle.upgrade import FixtureMigration
+
+
+@pytest.fixture(autouse=True)
+def ready_run_preflight(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep legacy Run wiring tests focused below the readiness boundary."""
+    if request.node.name.startswith(
+        (
+            "test_incompatible_run",
+            "test_run_directs",
+            "test_run_docker_exits_nonzero_on_blank_image",
+            "test_run_docker_exits_nonzero_when_build_fails",
+        )
+    ):
+        return
+
+    def ready(args: object) -> ReadinessReport:
+        sandbox_kind = cli._resolve_sandbox(args.sandbox)
+        image = None
+        if sandbox_kind == "docker":
+            dockerfile = cli.FIXTURE_DIR / cli.DOCKERFILE_NAME
+            image = args.image or (
+                cli.sandbox.image_tag_for_dockerfile(dockerfile.read_text())
+                if dockerfile.is_file()
+                else cli.sandbox.DEFAULT_IMAGE
+            )
+        configuration = ReadinessConfiguration(
+            repository="owner/repo",
+            base_branch="main",
+            github_default_branch="main",
+            runtime=args.runtime,
+            sandbox=sandbox_kind,
+            agent_image=image,
+            assignee="krishna",
+            include_unassigned=args.include_unassigned,
+            item_limit=args.iterations,
+        )
+        return ReadinessReport(
+            schema_version=1,
+            ready=True,
+            runner_version="0.1.0",
+            configuration=configuration,
+            checks=tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            eligible_items=(EligibleItem(1, "One"),),
+            selected_items=(IssueRef(number=1, title="One"),),
+        )
+
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", ready)
 
 
 def test_version_flag_reports_built_package_version(
@@ -196,6 +257,7 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
     def fake_run_loop(*, run_id: str, **_kwargs: object) -> MagicMock:
         captured["run_id"] = run_id
         outcome = MagicMock()
+        outcome.selected = []
         outcome.issues = []
         return outcome
 
@@ -203,6 +265,57 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
 
     assert main(["run", "--runtime", "stub"]) == 0
     assert captured["run_id"] == "20260613-101500"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            RunOutcome(run_id="empty", run_branch="pycastle/run-empty", selected=[]),
+            0,
+        ),
+        (
+            RunOutcome(
+                run_id="before-human",
+                run_branch="pycastle/run-before-human",
+                selected=[107],
+                succeeded=False,
+                stopping_point="before-Run HUMAN",
+            ),
+            1,
+        ),
+        (
+            RunOutcome(
+                run_id="all-skipped",
+                run_branch="pycastle/run-all-skipped",
+                selected=[106, 107],
+                issues=[
+                    IssueOutcome(
+                        issue=IssueRef(number=106, title="Skipped"),
+                        branch="pycastle/issue-106",
+                        merged=False,
+                    ),
+                    IssueOutcome(
+                        issue=IssueRef(number=107, title="Human"),
+                        branch="pycastle/issue-107",
+                        merged=False,
+                    ),
+                ],
+            ),
+            1,
+        ),
+    ],
+)
+def test_run_exit_code_distinguishes_empty_selection_from_before_run_human(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: RunOutcome,
+    expected: int,
+) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
+    monkeypatch.setattr(cli, "run_loop", lambda **_kwargs: outcome)
+
+    assert main(["run", "--runtime", "stub"]) == expected
 
 
 def test_parses_run_sandbox_docker() -> None:
@@ -313,7 +426,7 @@ def test_main_fails_fast_when_preflight_fails(
         raise PreflightError("Required command(s) not found on PATH: gh")
 
     monkeypatch.setattr(cli, "check_required_commands", boom)
-    assert main(["run", "--runtime", "stub"]) == 1
+    assert main(["init", "--sandbox", "host"]) == 1
 
 
 def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,6 +436,18 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert main(["run", "--runtime", "stub"]) == 0
     dispatched.assert_called_once()
+
+
+def test_doctor_interrupt_emits_no_report_and_exits_130(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli, "_evaluate_cli_readiness", MagicMock(side_effect=KeyboardInterrupt)
+    )
+
+    assert main(["doctor", "--json"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
 
 
 def test_init_scaffolds_the_chosen_sandbox(
@@ -579,25 +704,13 @@ def test_run_docker_builds_docker_gate_check(
     assert call["image"] == captured["runtime_image"]
 
 
-def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
+def test_run_does_not_repeat_doctor_gate_toolchain_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:resolved")
     events: list[str] = []
-
-    def fake_gate_preflight(fixture_dir: Path, **kwargs: object) -> None:
-        events.append("gate-preflight")
-        assert fixture_dir == cli.FIXTURE_DIR
-        assert kwargs == {
-            "image": "agent:resolved",
-            "runtime_name": "claude",
-            "workspace": tmp_path,
-        }
-
-    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fake_gate_preflight)
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
@@ -619,54 +732,7 @@ def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
 
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
-    assert events == ["gate-preflight", "resolve-repo", "run-loop"]
-
-
-def test_run_docker_gate_toolchain_failure_aborts_before_issue_work(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:bad")
-
-    def fail_preflight(*_args: object, **_kwargs: object) -> None:
-        raise PreflightError("gate toolchain missing")
-
-    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fail_preflight)
-    monkeypatch.setattr(
-        cli,
-        "_resolve_repo",
-        lambda: pytest.fail("repo resolution must not start after failed preflight"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run_loop",
-        lambda **_kwargs: pytest.fail("phase graph must not start after preflight"),
-    )
-
-    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
-
-
-def test_run_host_does_not_preflight_docker_gate_toolchain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(
-        cli,
-        "check_docker_gate_toolchain",
-        lambda *_args, **_kwargs: pytest.fail("host run must not launch docker"),
-    )
-    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
-    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
-    monkeypatch.setattr(cli, "_resolve_assignee", lambda _login: "krishna")
-    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
-    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
-    )
-    monkeypatch.setattr(cli, "run_loop", lambda **_kwargs: MagicMock(issues=[]))
-
-    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+    assert events == ["run-loop"]
 
 
 def _write_marker(tmp_path: Path, value: str) -> None:
@@ -800,14 +866,10 @@ def test_run_falls_back_to_host_for_empty_or_garbage_marker(
         assert getattr(runtime, "argv_wrapper", None) is None
 
 
-def test_run_marker_docker_requires_docker_in_preflight(
+def test_run_marker_docker_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A docker marker (no flag) makes preflight require docker, not the agent CLI.
-
-    Resolution happens before preflight, so the required-command set matches
-    where the run will actually execute.
-    """
+    """Run delegates the resolved Docker command inventory to readiness."""
     _write_marker(tmp_path, "docker\n")
     monkeypatch.chdir(tmp_path)
 
@@ -821,8 +883,7 @@ def test_run_marker_docker_requires_docker_in_preflight(
 
     main(["run", "--runtime", "claude"])
 
-    assert "docker" in seen["commands"]
-    assert "claude" not in seen["commands"]
+    assert "commands" not in seen
 
 
 def test_resolve_sandbox_prefers_explicit_flag(
@@ -846,7 +907,7 @@ def test_resolve_sandbox_reads_marker_when_flag_absent(
     assert cli._resolve_sandbox(None) == "docker"
 
 
-def test_run_host_codex_requires_codex_in_preflight(
+def test_run_host_codex_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, list[str]] = {}
@@ -859,12 +920,10 @@ def test_run_host_codex_requires_codex_in_preflight(
 
     main(["run", "--sandbox", "host", "--runtime", "codex"])
 
-    # The host codex path needs the codex CLI on PATH, not docker.
-    assert "codex" in seen["commands"]
-    assert "docker" not in seen["commands"]
+    assert "commands" not in seen
 
 
-def test_run_docker_requires_docker_in_preflight(
+def test_run_docker_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, list[str]] = {}
@@ -877,9 +936,7 @@ def test_run_docker_requires_docker_in_preflight(
 
     main(["run", "--sandbox", "docker", "--runtime", "claude"])
 
-    assert "docker" in seen["commands"]
-    # The host claude binary is not required when the agent runs in Docker.
-    assert "claude" not in seen["commands"]
+    assert "commands" not in seen
 
 
 def test_build_runtime_docker_codex_builds_a_sandboxed_runtime(
@@ -1265,9 +1322,9 @@ def test_run_docker_exits_nonzero_on_blank_image(
 
     monkeypatch.setattr(cli, "run_cmd", runner)
 
-    assert (
-        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""]) == 1
-    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""])
+    assert exc_info.value.code == 2
 
 
 def test_resolve_agent_image_builds_when_tag_absent(

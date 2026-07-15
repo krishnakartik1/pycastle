@@ -363,6 +363,7 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -563,22 +564,22 @@ def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
         gate_paths.append(cwd)
         return orchestrator.GateOutcome(True, "green", exit_code=0)
 
-    with patch("pycastle.orchestrator.select_batch", return_value=selected_batch):
-        outcome = orchestrator.run_batch(
-            runtime=Runtime(),
-            issue_source=source,
-            fixture_dir=fixture,
-            repo="owner/repo",
-            base_branch="main",
-            assignee="krishna",
-            run_id="frozen",
-            iterations=2,
-            workspace=tmp_path,
-            worktree_root=tmp_path / "wt",
-            runner=runner,
-            gate_check=gate,
-            setup=setup,
-        )
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        selected=selected_batch,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="frozen",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        gate_check=gate,
+        setup=setup,
+    )
 
     assert events[:3] == [
         ("setup", run_worktree),
@@ -587,7 +588,7 @@ def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
     ]
     assert [number for number, inherited, _prompt in item_starts] == [101, 103]
     assert all(inherited for _number, inherited, _prompt in item_starts)
-    assert source.list_ready.call_count == 1
+    source.list_ready.assert_not_called()
     assert gate_paths[-1] == run_worktree
     assert outcome.completed == [101, 103]
     assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
@@ -823,6 +824,8 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
             if phase == "before":
+                (cwd / "tracked.txt").write_text("incomplete")
+                (cwd / "untracked.txt").write_text("discard me")
                 raise AgentCrashError("human", phase=phase, exit_code=1)
             return super().run(prompt, cwd=cwd, phase=phase)
 
@@ -830,6 +833,7 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -841,23 +845,150 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     )
 
     assert not outcome.succeeded
+    assert outcome.selected == [1]
+    assert outcome.issues == []
     assert outcome.stopping_point == "before-Run HUMAN"
     source.claim.assert_not_called()
+    source.mark_for_human.assert_not_called()
+    assert _calls_containing(runner, "git", "reset", "--hard", "HEAD")
+    assert _calls_containing(runner, "git", "clean", "-fd")
+    assert (fixture / "runs" / "before-human" / "run.log").is_file()
+    assert not _calls_containing(runner, "git", "branch", "pycastle/issue-")
     assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_empty_supplied_batch_is_side_effect_free(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    source = MagicMock()
+    runner = MagicMock()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=(),
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="empty",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.selected == []
+    assert not (tmp_path / "wt").exists()
+    assert not (fixture / "runs").exists()
+    source.list_ready.assert_not_called()
+    runner.assert_not_called()
+
+
+def test_all_human_items_stop_before_second_run_setup_gate_or_publication(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, before=True, after=True)
+    issues = [
+        IssueRef(number=1, title="First", assignees=["krishna"]),
+        IssueRef(number=2, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    phases: list[tuple[str, str]] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            phases.append((phase, cwd.name))
+            if phase == "before":
+                (cwd / "preparation.txt").write_text("prepared")
+                return super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "implement":
+                raise AgentCrashError("human", phase=phase, exit_code=1)
+            raise AssertionError(f"unexpected phase {phase}")
+
+    setup_paths: list[Path] = []
+    gate_paths: list[Path] = []
+    runner = _git_aware_runner()
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        selected=issues[:2],
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="all-human",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        setup=setup_paths.append,
+        gate_check=lambda cwd: (
+            gate_paths.append(cwd) or orchestrator.GateOutcome(True, "green")
+        ),
+    )
+
+    assert outcome.selected == [1, 2]
+    assert outcome.completed == []
+    assert outcome.skipped == [1, 2]
+    assert not outcome.pr_opened
+    assert phases == [
+        ("before", "run-all-human"),
+        ("implement", "issue-1"),
+        ("implement", "issue-1"),
+        ("implement", "issue-1"),
+        ("implement", "issue-2"),
+        ("implement", "issue-2"),
+        ("implement", "issue-2"),
+    ]
+    assert [path.name for path in setup_paths] == [
+        "run-all-human",
+        "issue-1",
+        "issue-2",
+    ]
+    assert gate_paths == []
+    assert source.claim.call_count == 2
+    assert source.mark_for_human.call_count == 2
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    removed = [
+        call.args[0][3]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "worktree", "remove"]
+    ]
+    assert removed == [
+        str(tmp_path / "wt" / "issue-1"),
+        str(tmp_path / "wt" / "issue-2"),
+        str(tmp_path / "wt" / "run-all-human"),
+    ]
 
 
 def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
     tmp_path: Path,
 ) -> None:
-    fixture = _scoped_fixture(tmp_path, after=True)
+    fixture = _scoped_fixture(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, build_run, phase\n"
+        "run = build_run("
+        "item=build(start='implement', phases=[phase('implement', 'item.md')]), "
+        "after=build(start='checkpoint', phases=["
+        "phase('checkpoint', 'after.md', on_success='failing'), "
+        "phase('failing', 'after.md')]))\n"
+    )
     source = MagicMock()
     source.list_ready.return_value = [
         IssueRef(number=1, title="First", assignees=["krishna"])
     ]
 
+    visits: list[str] = []
+
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
-            if phase == "after":
+            if phase == "checkpoint":
+                visits.append(phase)
+                (cwd / "durable.txt").write_text("checkpoint")
+            if phase == "failing":
+                visits.append(phase)
+                (cwd / "durable.txt").write_text("failing edit")
+                (cwd / "untracked.txt").write_text("discard me")
                 raise AgentCrashError("human", phase=phase, exit_code=1)
             return super().run(prompt, cwd=cwd, phase=phase)
 
@@ -865,12 +996,26 @@ def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
 
     def gate(cwd: Path) -> orchestrator.GateOutcome:
         gate_paths.append(cwd)
+        if cwd.name.startswith("run-"):
+            assert (cwd / "durable.txt").read_text() == "checkpoint"
+            assert not (cwd / "untracked.txt").exists()
         return orchestrator.GateOutcome(True, "green")
 
-    runner = _git_aware_runner()
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "reset", "--hard"]:
+            run_worktree = Path(str(kwargs["cwd"]))
+            (run_worktree / "durable.txt").write_text("checkpoint")
+        if argv[:3] == ["git", "clean", "-fd"]:
+            (Path(str(kwargs["cwd"])) / "untracked.txt").unlink(missing_ok=True)
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -883,65 +1028,142 @@ def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
     )
 
     assert outcome.completed == [1]
+    assert outcome.skipped == []
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "after-Run HUMAN"
     assert gate_paths[-1].name == "run-after-human"
+    assert visits == ["checkpoint", "failing"]
 
 
-def test_red_run_gate_keeps_pull_request_draft(
-    fixture_dir: Path, tmp_path: Path
-) -> None:
+def test_red_run_gate_keeps_pull_request_draft(tmp_path: Path) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, after=True)
     source = MagicMock()
     source.list_ready.return_value = [
-        IssueRef(number=1, title="First", assignees=["krishna"])
+        IssueRef(number=1, title="First", assignees=["krishna"]),
+        IssueRef(number=2, title="Second", assignees=["krishna"]),
     ]
 
+    visits: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if cwd.name == "issue-2" and phase == "implement":
+                raise AgentCrashError("skip", phase=phase, exit_code=1)
+            if cwd.name.startswith("run-"):
+                visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    gate_calls: list[Path] = []
+
     def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_calls.append(cwd)
         is_run = cwd.name.startswith("run-")
-        return orchestrator.GateOutcome(not is_run, "red" if is_run else "green")
+        return orchestrator.GateOutcome(
+            not is_run,
+            "raw stdout secret\nraw stderr secret" if is_run else "green",
+            exit_code=23 if is_run else 0,
+            duration_seconds=1.25 if is_run else 0,
+            command="project-safe-gate",
+        )
+
+    bodies: list[str] = []
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "comment"]:
+            bodies.append(argv[argv.index("--body") + 1])
+        return base_runner(argv, **kwargs)
 
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
         run_id="red-gate",
+        iterations=2,
+        impl_retries=0,
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=MagicMock(side_effect=side_effect),
         gate_check=gate,
     )
 
+    assert outcome.completed == [1]
+    assert outcome.skipped == [2]
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "Run Gate"
+    assert visits == ["after"]
+    assert sum(path.name.startswith("run-") for path in gate_calls) == 1
+    source.mark_for_human.assert_called_once_with(2)
+    source.release.assert_not_called()
+    assert "Completed Items: #1" in bodies[0]
+    assert "Skipped Items: #2" in bodies[0]
+    assert "`project-safe-gate` — FAIL (exit 23, 1.25s)" in bodies[0]
+    assert "raw stdout secret" not in bodies[0]
+    assert "raw stderr secret" not in bodies[0]
+    assert (fixture_dir / "runs" / "red-gate" / "run-gate.log").read_text() == (
+        "raw stdout secret\nraw stderr secret"
+    )
 
 
-def test_second_run_setup_failure_skips_gate_and_keeps_draft(
-    fixture_dir: Path, tmp_path: Path
+def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
+    tmp_path: Path,
 ) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, before=True, after=True)
     source = MagicMock()
     source.list_ready.return_value = [
         IssueRef(number=1, title="First", assignees=["krishna"])
     ]
     run_setup_count = 0
     gate_paths: list[Path] = []
+    after_visits: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "before":
+                (cwd / "tracked.txt").write_text("durable checkpoint\n")
+            if phase == "after":
+                after_visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
 
     def setup(cwd: Path) -> None:
         nonlocal run_setup_count
         if cwd.name.startswith("run-"):
             run_setup_count += 1
             if run_setup_count == 2:
+                assert (cwd / "tracked.txt").read_text() == "durable checkpoint\n"
+                (cwd / "tracked.txt").write_text("incomplete setup\n")
+                nested = cwd / "untracked" / "partial.txt"
+                nested.parent.mkdir()
+                nested.write_text("discard me\n")
                 raise orchestrator.SetupError("broken")
 
     def gate(cwd: Path) -> orchestrator.GateOutcome:
         gate_paths.append(cwd)
         return orchestrator.GateOutcome(True, "green")
 
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        cwd = Path(str(kwargs.get("cwd", tmp_path)))
+        if argv[:3] == ["git", "diff", "--cached"] and cwd.name == "run-setup-failure":
+            return subprocess.CompletedProcess(argv, 1, stdout="")
+        if argv[:3] == ["git", "reset", "--hard"]:
+            (cwd / "tracked.txt").write_text("durable checkpoint\n")
+        if argv[:3] == ["git", "clean", "-fd"]:
+            partial = cwd / "untracked" / "partial.txt"
+            partial.unlink(missing_ok=True)
+            partial.parent.rmdir()
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -949,7 +1171,7 @@ def test_second_run_setup_failure_skips_gate_and_keeps_draft(
         run_id="setup-failure",
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=runner,
         gate_check=gate,
         setup=setup,
     )
@@ -957,24 +1179,117 @@ def test_second_run_setup_failure_skips_gate_and_keeps_draft(
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "after-Run Setup"
     assert all(not path.name.startswith("run-") for path in gate_paths)
+    assert after_visits == []
+    assert _calls_containing(runner, "git", "reset", "--hard", "HEAD")
+    assert _calls_containing(runner, "git", "clean", "-fd")
+    assert _calls_containing(
+        runner, "git", "commit", "-m", "chore: checkpoint Run phase before"
+    )
+    final_push = [
+        call
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "push", "-u"]
+    ][-1]
+    assert final_push.kwargs["cwd"] == tmp_path / "wt" / "run-setup-failure"
+    comment_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    comment = comment_call[comment_call.index("--body") + 1]
+    assert "Completed Items: #1" in comment
+    assert "Run Gate: not run" in comment
+    assert "Stopping point: after-Run Setup" in comment
+
+
+def test_second_run_setup_cleanup_failure_still_publishes_durable_work(
+    tmp_path: Path,
+) -> None:
+    fixture_dir = _scoped_fixture(tmp_path)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+    run_setup_count = 0
+
+    def setup(cwd: Path) -> None:
+        nonlocal run_setup_count
+        if cwd.name.startswith("run-"):
+            run_setup_count += 1
+            if run_setup_count == 2:
+                report = cwd / orchestrator.RUN_REPORT
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("incomplete setup report")
+                raise orchestrator.SetupError("broken")
+
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "reset", "--hard"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="restore failed")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=source.list_ready(),
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="setup-cleanup-failure",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        setup=setup,
+    )
+
+    assert outcome.completed == [1]
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "after-Run Setup"
+    assert _calls_containing(
+        runner, "git", "push", "origin", "pycastle/run-setup-cleanup-failure"
+    )
+    log = (fixture_dir / "runs" / "setup-cleanup-failure" / "run.log").read_text()
+    assert "After-Run Setup failed: broken" in log
+    assert "could not discard incomplete Run scope" in log
+    publication_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    publication_body = publication_call[publication_call.index("--body") + 1]
+    assert "incomplete setup report" not in publication_body
 
 
 def test_handled_item_infrastructure_failure_stops_frozen_remainder(
-    fixture_dir: Path, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, after=True)
     issues = [
         IssueRef(number=n, title=f"Item {n}", assignees=["krishna"]) for n in (1, 2, 3)
     ]
     source = MagicMock()
     source.list_ready.return_value = issues
+    after_visits: list[str] = []
+    gate_paths: list[Path] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                after_visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
 
     def setup(cwd: Path) -> None:
         if cwd.name == "issue-2":
             raise RuntimeError("offline")
 
+    runner = _git_aware_runner()
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -983,19 +1298,85 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
         iterations=3,
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=runner,
         setup=setup,
+        gate_check=lambda cwd: (
+            gate_paths.append(cwd) or orchestrator.GateOutcome(True, "green")
+        ),
     )
 
     assert outcome.completed == [1]
+    assert outcome.skipped == [2, 3]
     assert outcome.stopping_point == "Item #2 infrastructure failure: offline"
     source.release.assert_called_once_with(2)
     assert [call.args[0] for call in source.claim.call_args_list] == [1, 2]
-    assert outcome.pr_opened and not outcome.pr_ready
+    source.mark_for_human.assert_not_called()
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert after_visits == []
+    assert all(not path.name.startswith("run-") for path in gate_paths)
+
+    comment_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    comment = comment_call[comment_call.index("--body") + 1]
+    assert "Completed Items: #1" in comment
+    assert "Skipped Items: #2, #3" in comment
 
 
+def test_draft_creation_os_error_retains_pushed_branch_and_run_records(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "create"]:
+            raise OSError("GitHub unavailable")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=source.list_ready(),
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="no-pr",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == [1]
+    assert not outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "Pull request publication"
+    assert _calls_containing(runner, "git", "push", "origin", "pycastle/run-no-pr")
+    assert not _calls_containing(runner, "gh", "pr", "comment")
+    assert not _calls_containing(runner, "gh", "pr", "ready")
+    log = (fixture_dir / "runs" / "no-pr" / "run.log").read_text()
+    assert "pushed branch origin/pycastle/run-no-pr" in log
+    assert "retained records" in log
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (b"\xff", "Run report is not valid UTF-8."),
+        (
+            b"x" * (orchestrator.RUN_REPORT_LIMIT + 1),
+            f"Run report exceeds the {orchestrator.RUN_REPORT_LIMIT}-byte publication limit.",
+        ),
+    ],
+)
 def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
-    tmp_path: Path,
+    tmp_path: Path, raw: bytes, message: str
 ) -> None:
     fixture = _scoped_fixture(tmp_path, after=True)
     source = MagicMock()
@@ -1008,7 +1389,7 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
             if phase == "after":
                 report = cwd / orchestrator.RUN_REPORT
                 report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_bytes(b"\xff")
+                report.write_bytes(raw)
             return super().run(prompt, cwd=cwd, phase=phase)
 
     bodies: list[str] = []
@@ -1022,6 +1403,7 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -1033,8 +1415,13 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
     )
 
     assert outcome.stopping_point == "Run report validation"
+    assert outcome.completed == [1]
+    assert outcome.skipped == []
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
-    assert "Run report is not valid UTF-8" in bodies[0]
+    assert message in bodies[0]
+    assert "Completed Items: #1" in bodies[0]
+    assert "Skipped Items: none" in bodies[0]
+    assert (fixture / "runs" / "invalid-report" / "run-report.md").read_bytes() == raw
 
 
 def test_interrupt_during_after_run_opens_no_pull_request(tmp_path: Path) -> None:
@@ -1055,6 +1442,7 @@ def test_interrupt_during_after_run_opens_no_pull_request(tmp_path: Path) -> Non
         orchestrator.run_batch(
             runtime=Runtime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -1161,6 +1549,7 @@ def test_ready_transition_failure_keeps_publication_success_distinct(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1212,6 +1601,7 @@ def test_verbose_run_binds_a_per_issue_transcript_sink(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1246,6 +1636,7 @@ def test_non_verbose_run_does_not_bind_a_transcript_sink(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1278,6 +1669,7 @@ def test_batch_works_up_to_n_issues_into_one_pr(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=issues[:2],
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1317,6 +1709,7 @@ def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1372,6 +1765,7 @@ def test_successful_branches_merge_and_one_pr_is_opened(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1416,6 +1810,7 @@ def test_each_successful_issue_merge_checkpoints_the_run_branch(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1458,6 +1853,7 @@ def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1510,6 +1906,7 @@ def test_incremental_push_os_error_is_logged_without_aborting_run(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1565,6 +1962,7 @@ def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1612,6 +2010,7 @@ def test_merge_conflict_marks_for_human_and_run_continues(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1672,6 +2071,7 @@ def test_merge_conflict_on_the_first_issue_still_runs_the_rest(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1723,6 +2123,7 @@ def test_empty_diff_routes_to_human_no_phantom_success(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1769,6 +2170,7 @@ def test_empty_diff_on_only_issue_opens_no_pull_request(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1833,6 +2235,7 @@ def test_run_worktree_add_failure_raises_and_works_no_issue(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -1874,6 +2277,7 @@ def test_run_branch_failure_aborts_before_worktree_add(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -1916,6 +2320,7 @@ def test_issue_branch_failure_releases_issue_before_worktree_add(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -1957,6 +2362,7 @@ def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2085,6 +2491,7 @@ def test_telemetry_and_run_log_are_written_into_the_fixture(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2124,9 +2531,13 @@ def test_batch_is_a_noop_when_no_issue_is_ready(
     source.list_ready.return_value = []
     runner = MagicMock(side_effect=_ok)
 
+    setup = MagicMock()
+    gate = MagicMock()
+    runtime = MagicMock(spec=StubRuntime)
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2136,13 +2547,21 @@ def test_batch_is_a_noop_when_no_issue_is_ready(
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
         runner=runner,
+        setup=setup,
+        gate_check=gate,
     )
 
+    assert outcome.selected == []
     assert outcome.issues == []
     assert outcome.completed == []
     assert outcome.pr_opened is False
+    assert outcome.succeeded is True
     source.claim.assert_not_called()
+    setup.assert_not_called()
+    gate.assert_not_called()
+    runtime.run.assert_not_called()
     # No branches, worktrees, or PRs when there is nothing to do.
+    assert not _calls_containing(runner, "git", "branch")
     assert not _calls_containing(runner, "git", "worktree", "add")
     assert not _calls_containing(runner, "gh", "pr", "create")
 
@@ -2158,6 +2577,7 @@ def test_worktrees_are_cleaned_up_after_the_run(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2192,6 +2612,7 @@ def test_worktrees_are_cleaned_up_even_when_an_issue_is_skipped(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2284,6 +2705,7 @@ def test_default_run_completes_plan_implement_review_in_order(
     outcome = orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2322,6 +2744,7 @@ def test_review_changes_are_committed_before_the_merge(
     orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2365,6 +2788,7 @@ def test_full_run_interleaves_phases_then_commit_then_merge(
     outcome = orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2447,6 +2871,7 @@ def test_plan_crash_routes_to_human_and_run_continues(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2493,6 +2918,149 @@ class _InterruptingRuntime:
         raise KeyboardInterrupt
 
 
+def test_cancellation_during_before_run_setup_retains_records_without_remote_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="before-setup-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+            setup=lambda _worktree: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+    source.claim.assert_not_called()
+    source.release.assert_not_called()
+    records = fixture / "runs" / "before-setup-cancel"
+    assert records.is_dir()
+    log = (records / "run.log").read_text()
+    assert "No remote checkpoint survived" in log
+    assert f"Retained records: {records}" in log
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_cancellation_during_after_run_preserves_completed_item_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    issue = IssueRef(number=2, title="Completed", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                raise KeyboardInterrupt
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="after-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_not_called()
+    source.mark_for_human.assert_not_called()
+    log = (fixture / "runs" / "after-cancel" / "run.log").read_text()
+    assert "Remote checkpoint: origin/pycastle/run-after-cancel" in log
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    assert not _calls_containing(runner, "gh", "pr", "ready")
+
+
+def test_cancellation_as_claim_returns_releases_only_that_item(tmp_path: Path) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issues = [
+        IssueRef(number=2, title="Claimed", assignees=["krishna"]),
+        IssueRef(number=4, title="Untouched", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    source.claim.side_effect = KeyboardInterrupt
+    runner = _git_aware_runner()
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="claim-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
+    source.mark_for_human.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_interrupt_after_item_settles_does_not_release_completed_item(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issue = IssueRef(number=2, title="Completed", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+
+    def interrupt_on_item_cleanup(argv: list[str], **kwargs: object) -> object:
+        if argv[:4] == ["git", "worktree", "remove", str(tmp_path / "wt" / "issue-2")]:
+            raise KeyboardInterrupt
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=interrupt_on_item_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="settled-boundary",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.release.assert_not_called()
+    assert _calls_containing(
+        runner, "git", "push", "origin", "pycastle/run-settled-boundary"
+    )
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
 def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -2509,6 +3077,7 @@ def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2565,6 +3134,7 @@ def test_interrupt_restores_only_the_in_flight_issue(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2610,6 +3180,7 @@ def test_interrupt_cleanup_still_releases_when_worktree_removal_errors(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2627,6 +3198,40 @@ def test_interrupt_cleanup_still_releases_when_worktree_removal_errors(
     assert raised
     # A failed worktree removal did not stop the restore: the issue is released.
     source.release.assert_called_once_with(2)
+    log = (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    assert f"Manual worktree cleanup required: {tmp_path / 'wt' / 'issue-2'}" in log
+    assert str(tmp_path / "wt" / "run-20260613-101500") in log
+
+
+def test_cancellation_cleanup_reports_nonzero_results_and_release_failure(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.release.side_effect = RuntimeError("GitHub unavailable")
+    runner = MagicMock(return_value=MagicMock(returncode=1))
+    run = orchestrator.RunContext(
+        run_id="cleanup-failure",
+        branch="pycastle/run-cleanup-failure",
+        worktree=tmp_path / "wt" / "run-cleanup-failure",
+        fixture_dir=fixture_dir,
+        runner=runner,
+    )
+
+    orchestrator._cleanup_cancelled(
+        issue=issue,
+        issue_source=source,
+        worktree_root=tmp_path / "wt",
+        workspace=tmp_path,
+        run=run,
+    )
+
+    source.release.assert_called_once_with(2)
+    assert runner.call_count == 4
+    log = (fixture_dir / "runs" / "cleanup-failure" / "run.log").read_text()
+    assert str(tmp_path / "wt" / "issue-2") in log
+    assert str(run.worktree) in log
+    assert "In-flight Item #2 could not be released" in log
 
 
 def test_interrupt_after_all_issues_complete_is_a_clean_run(
@@ -2646,6 +3251,7 @@ def test_interrupt_after_all_issues_complete_is_a_clean_run(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2828,6 +3434,7 @@ def test_issue_context_reaches_every_phase_prompt(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",

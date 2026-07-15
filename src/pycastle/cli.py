@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
 from . import __version__, sandbox
 from .commands import run_cmd
-from .compatibility import FixtureCompatibilityError, require_fixture_compatibility
+from .compatibility import FixtureCompatibilityError
 from .issues import GitHubIssueSource
 from .orchestrator import (
     PruneError,
@@ -22,8 +24,19 @@ from .orchestrator import (
 from .orchestrator import run_batch as run_loop
 from .preflight import (
     PreflightError,
-    check_docker_gate_toolchain,
     check_required_commands,
+)
+from .readiness import (
+    AgentImagePreparationError,
+    DefaultReadinessAdapter,
+    ReadinessConfiguration,
+    ReadinessReport,
+    Status,
+    evaluate_readiness,
+    prepare_agent_image,
+    render_human,
+    render_json,
+    resolve_agent_image_name,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import (
@@ -95,9 +108,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build .pycastle/Dockerfile into its content-addressed agent image",
     )
 
+    doctor_parser = sub.add_parser(
+        "doctor", help="Check one Run configuration without starting a Run"
+    )
+    doctor_parser.add_argument("-i", "--iterations", type=_positive_int, default=1)
+    doctor_parser.add_argument("--runtime", choices=RUNTIMES, default="claude")
+    doctor_parser.add_argument("--assignee", type=_non_empty, default="@me")
+    doctor_parser.add_argument("-u", "--include-unassigned", action="store_true")
+    doctor_parser.add_argument("--sandbox", choices=("host", "docker"), default=None)
+    doctor_parser.add_argument("--image", type=_non_empty, default=None)
+    doctor_parser.add_argument("--json", action="store_true")
+
     run_parser = sub.add_parser("run", help="Run the autonomous loop")
     run_parser.add_argument(
-        "-i", "--iterations", type=int, default=1, help="Max work items to process"
+        "-i",
+        "--iterations",
+        type=_positive_int,
+        default=1,
+        help="Max work items to process",
     )
     run_parser.add_argument(
         "--runtime",
@@ -107,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--assignee",
+        type=_non_empty,
         default="@me",
         help="Only work issues assigned to this login (default: the gh user)",
     )
@@ -138,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--image",
+        type=_non_empty,
         default=None,
         help=(
             "Agent image to run in the Docker sandbox (bring-your-own-image). "
@@ -199,22 +229,19 @@ def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
     non-zero exit is treated as "absent → build", and that one ``docker build``
     is the only build invoked. Returns the resolved tag.
     """
-    tag = sandbox.image_tag_for_dockerfile(dockerfile_text)
-    inspect = run_cmd(["docker", "image", "inspect", tag], capture=True)
-    if getattr(inspect, "returncode", 1) == 0:
-        logger.info("Agent image %s is already built; skipping build.", tag)
-        return tag
-    logger.info("Building the agent image %s from %s ...", tag, fixture_dir)
-    build = run_cmd(["docker", "build", "-t", tag, str(fixture_dir)])
-    if getattr(build, "returncode", 1) != 0:
-        # A failed build must not be swallowed: returning the tag here would let
-        # the run proceed against an image that was never built (or a stale tag
-        # from an earlier build), failing opaquely deeper in `docker run`.
+    # Preserve this established API while delegating to the one readiness/Run
+    # preparation path. The text argument is retained for compatibility and is
+    # validated against the canonical fixture recipe.
+    if sandbox.image_tag_for_dockerfile(dockerfile_text) != resolve_agent_image_name(
+        None, fixture_dir
+    ):
+        raise PreflightError("Dockerfile content changed during image resolution.")
+    try:
+        return prepare_agent_image(None, fixture_dir, runner=run_cmd)
+    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
         raise PreflightError(
-            f"Failed to build the agent image {tag} from {fixture_dir}; "
-            "fix the Dockerfile and retry."
-        )
-    return tag
+            "Failed to build the Agent image; fix the Dockerfile and retry."
+        ) from error
 
 
 def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
@@ -232,19 +259,12 @@ def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
 
     Only ever called for a Docker run; a host run never resolves an image.
     """
-    if image_flag is not None:
-        if not image_flag.strip():
-            raise PreflightError(
-                "The --image value is empty; pass a real agent image tag, or "
-                "omit --image to build .pycastle/Dockerfile or use the default."
-            )
-        return image_flag
-    dockerfile = fixture_dir / DOCKERFILE_NAME
-    if dockerfile.is_file():
-        # A present-but-unreadable Dockerfile surfaces here rather than being
-        # treated as absent: the read raises, it is not swallowed.
-        return _build_image_for_dockerfile(dockerfile.read_text(), fixture_dir)
-    return sandbox.DEFAULT_IMAGE
+    try:
+        return prepare_agent_image(image_flag, fixture_dir, runner=run_cmd)
+    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
+        raise PreflightError(
+            "Failed to prepare the Agent image; fix the Dockerfile or --image."
+        ) from error
 
 
 def _build_runtime(
@@ -299,12 +319,164 @@ def _make_run_id() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _positive_int(value: str) -> int:
+    """Parse a strictly positive CLI integer."""
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _non_empty(value: str) -> str:
+    """Parse a non-empty CLI string without changing the supplied value."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
+def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration:
+    """Resolve Doctor/Run inputs once using the shared CLI defaults."""
+    sandbox_kind = _resolve_sandbox(args.sandbox)
+    image: str | None = None
+    if sandbox_kind == "docker":
+        if args.image is not None:
+            if not args.image.strip():
+                raise PreflightError("The --image value is empty.")
+            image = args.image
+        else:
+            image = resolve_agent_image_name(None, FIXTURE_DIR)
+
+    def resolve(argv: list[str]) -> str:
+        try:
+            result = run_cmd(argv, capture=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return (result.stdout or "").strip()
+
+    repository = resolve(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
+    )
+    base_branch = resolve(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    default_branch = resolve(
+        [
+            "gh",
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ]
+    )
+    assignee = (
+        args.assignee
+        if args.assignee != "@me"
+        else resolve(["gh", "api", "user", "--jq", ".login"])
+    )
+    return ReadinessConfiguration(
+        repository=repository,
+        base_branch=base_branch,
+        github_default_branch=default_branch or None,
+        runtime=args.runtime,
+        sandbox=sandbox_kind,
+        agent_image=image,
+        assignee=assignee,
+        include_unassigned=args.include_unassigned,
+        item_limit=args.iterations,
+    )
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Evaluate and render one non-destructive readiness snapshot."""
+    report = _evaluate_cli_readiness(args)
+    output = render_json(report) if args.json else render_human(report)
+    print(output)
+    return 0 if report.ready else 1
+
+
+def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
+    """Resolve and evaluate the readiness configuration used by Doctor and Run."""
+    configuration = _readiness_configuration(args)
+    cleanup_reporter = (
+        (lambda message: print(message, file=sys.stderr))
+        if args.command == "doctor"
+        else None
+    )
+    with DefaultReadinessAdapter(
+        FIXTURE_DIR,
+        Path.cwd(),
+        image_flag=args.image,
+        include_item_content=args.command == "run",
+        # Human Doctor may show a first build's progress. Run and JSON keep
+        # child output captured so stdout remains a single report document.
+        stream_image_build=args.command == "doctor" and not args.json,
+        cleanup_reporter=cleanup_reporter,
+    ) as adapter:
+        progress = None
+        if args.command == "doctor" and args.json:
+
+            def report_progress(
+                event: str, check_id: str, status: Status | None
+            ) -> None:
+                print(
+                    f"Doctor {check_id}: {status.value if status else event}",
+                    file=sys.stderr,
+                )
+
+            progress = report_progress
+        return evaluate_readiness(
+            configuration, adapter.dependencies(), progress=progress
+        )
+
+
+def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
+    """Return whether the sole readiness failure is Run's intentional empty no-op."""
+    failures = [
+        check
+        for check in report.checks
+        if check.status in {Status.FAIL, Status.BLOCKED}
+    ]
+    return (
+        len(failures) == 1
+        and failures[0].id == "eligible_items"
+        and failures[0].facts.get("count") == 0
+    )
+
+
+def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
+    """Return whether every eligible Item has matching Run-only content."""
+    if len(report.selected_items) != len(report.eligible_items):
+        return False
+    return all(
+        selected.number == eligible.number and selected.title == eligible.title
+        for selected, eligible in zip(
+            report.selected_items, report.eligible_items, strict=True
+        )
+    )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     workspace = Path.cwd()
-    # This is deliberately the first Run operation. In particular, a Docker
-    # image build and all git/gh resolution wait until the fixture is known safe.
-    require_fixture_compatibility(FIXTURE_DIR)
+    # Readiness is deliberately the first Run operation. It may prepare a
+    # content-addressed Agent image, but creates no Run ID, record, branch,
+    # worktree, claim, phase, Setup invocation, or ordinary Gate invocation.
+    report = _evaluate_cli_readiness(args)
+    if _run_can_preserve_empty_batch_noop(report):
+        logger.info("Nothing to do.")
+        return 0
+    if not report.ready:
+        for check in report.checks:
+            if check.status in {Status.FAIL, Status.BLOCKED}:
+                logger.error("Readiness %s: %s", check.id, check.summary)
+        return 1
+    if not _run_has_complete_frozen_batch(report):
+        logger.error("Readiness did not return a complete frozen Item batch.")
+        return 1
+
+    configuration = report.configuration
     # Resolve the agent image once, before the run loop, so a missing image is
     # built exactly once rather than per iteration. Resolution is docker-only.
     # The single --sandbox flag drives BOTH the runtime and the gate onto the
@@ -312,57 +484,61 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # image as the phases, wrapped through the same sandbox wrapper; under host it
     # runs as a host subprocess (unchanged). Building the gate-check here, in the
     # branch that already resolves the image, keeps them in lockstep.
-    if args.sandbox == "docker":
-        image = _resolve_agent_image(args.image, FIXTURE_DIR)
-        check_docker_gate_toolchain(
-            FIXTURE_DIR,
-            image=image,
-            runtime_name=args.runtime,
-            workspace=workspace,
-        )
+    if configuration.sandbox == "docker":
+        image = configuration.agent_image
+        if image is None:  # Defensive: a ready Docker report always has an image.
+            raise PreflightError("No Agent image was resolved.")
         runtime = _build_runtime(
-            args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
+            configuration.runtime,
+            configuration.sandbox,
+            workspace,
+            image=image,
+            verbose=args.verbose,
         )
         gate_check = make_fixture_gate_check(
             FIXTURE_DIR,
             sandbox="docker",
             image=image,
-            runtime_name=args.runtime,
+            runtime_name=configuration.runtime,
             workspace=workspace,
         )
         setup = make_fixture_setup(
             FIXTURE_DIR,
             sandbox="docker",
             image=image,
-            runtime_name=args.runtime,
+            runtime_name=configuration.runtime,
             workspace=workspace,
         )
     else:
         runtime = _build_runtime(
-            args.runtime, args.sandbox, workspace, verbose=args.verbose
+            configuration.runtime,
+            configuration.sandbox,
+            workspace,
+            verbose=args.verbose,
         )
         gate_check = make_fixture_gate_check(FIXTURE_DIR)
         setup = make_fixture_setup(FIXTURE_DIR)
-    repo = _resolve_repo()
-    base_branch = _resolve_base_branch()
-    assignee = _resolve_assignee(args.assignee)
+    repo = configuration.repository
+    base_branch = configuration.base_branch
+    assignee = configuration.assignee
     issue_source = GitHubIssueSource(repo)
 
     outcome = run_loop(
         runtime=runtime,
         issue_source=issue_source,
+        selected=report.selected_items,
         fixture_dir=FIXTURE_DIR,
         repo=repo,
         base_branch=base_branch,
         assignee=assignee,
         run_id=_make_run_id(),
-        iterations=args.iterations,
-        include_unassigned=args.include_unassigned,
+        iterations=configuration.item_limit,
+        include_unassigned=configuration.include_unassigned,
         gate_check=gate_check,
         setup=setup,
         verbose=args.verbose,
     )
-    if not outcome.issues:
+    if not outcome.selected:
         logger.info("Nothing to do.")
         return 0
     logger.info(
@@ -577,7 +753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     required = ["git", "gh"]
-    if args.command == "run":
+    if args.command in {"run", "doctor"}:
         # Resolve the effective sandbox (flag -> .pycastle/sandbox marker ->
         # host) before preflight so the required-command set matches where the
         # run will actually execute. The resolved value is written back onto
@@ -592,7 +768,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "sandbox":
         required.append("docker")
     try:
-        check_required_commands(required)
+        if args.command not in {"doctor", "run"}:
+            check_required_commands(required)
+        if args.command == "doctor":
+            return _cmd_doctor(args)
         if args.command == "run":
             return _cmd_run(args)
         if args.command == "init":
@@ -615,4 +794,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)
         return 1
+    except KeyboardInterrupt:
+        return 130
     return 2
