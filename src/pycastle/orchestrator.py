@@ -1556,6 +1556,7 @@ def run_batch(
     if completed:
         run_gate: GateOutcome | None = None
         publication_error: str | None = None
+        suppress_report_harvest = False
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
@@ -1580,11 +1581,18 @@ def run_batch(
                         outcome.succeeded = False
                         outcome.stopping_point = "Run Gate"
         except SetupError as exc:
+            suppress_report_harvest = True
             if outcome.succeeded:
                 outcome.succeeded = False
                 outcome.stopping_point = "after-Run Setup"
             _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
-            _discard_incomplete_run_scope(run)
+            try:
+                _discard_incomplete_run_scope(run)
+            except RunCheckpointError as cleanup_error:
+                # Publication pushes committed history only. A failed worktree
+                # restore must be visible, but must not strand checkpoints that
+                # were already made durable before Setup failed.
+                _append_log(fixture_dir, run_id, str(cleanup_error))
         except RunCheckpointError as exc:
             outcome.succeeded = False
             outcome.stopping_point = f"after-Run checkpoint: {exc}"
@@ -1598,7 +1606,9 @@ def run_batch(
                 run=run,
             )
             raise
-        report, report_error = _harvest_report(run)
+        report, report_error = (
+            (None, None) if suppress_report_harvest else _harvest_report(run)
+        )
         if report_error:
             outcome.succeeded = False
             outcome.stopping_point = "Run report validation"

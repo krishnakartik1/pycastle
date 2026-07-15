@@ -1081,7 +1081,7 @@ def test_red_run_gate_keeps_pull_request_draft(tmp_path: Path) -> None:
 def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
     tmp_path: Path,
 ) -> None:
-    fixture_dir = _scoped_fixture(tmp_path, after=True)
+    fixture_dir = _scoped_fixture(tmp_path, before=True, after=True)
     source = MagicMock()
     source.list_ready.return_value = [
         IssueRef(number=1, title="First", assignees=["krishna"])
@@ -1092,6 +1092,8 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "before":
+                (cwd / "tracked.txt").write_text("durable checkpoint\n")
             if phase == "after":
                 after_visits.append(phase)
             return super().run(prompt, cwd=cwd, phase=phase)
@@ -1101,6 +1103,7 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
         if cwd.name.startswith("run-"):
             run_setup_count += 1
             if run_setup_count == 2:
+                assert (cwd / "tracked.txt").read_text() == "durable checkpoint\n"
                 (cwd / "tracked.txt").write_text("incomplete setup\n")
                 nested = cwd / "untracked" / "partial.txt"
                 nested.parent.mkdir()
@@ -1115,8 +1118,10 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
 
     def side_effect(argv: list[str], **kwargs: object) -> object:
         cwd = Path(str(kwargs.get("cwd", tmp_path)))
+        if argv[:3] == ["git", "diff", "--cached"] and cwd.name == "run-setup-failure":
+            return subprocess.CompletedProcess(argv, 1, stdout="")
         if argv[:3] == ["git", "reset", "--hard"]:
-            (cwd / "tracked.txt").unlink(missing_ok=True)
+            (cwd / "tracked.txt").write_text("durable checkpoint\n")
         if argv[:3] == ["git", "clean", "-fd"]:
             partial = cwd / "untracked" / "partial.txt"
             partial.unlink(missing_ok=True)
@@ -1145,6 +1150,15 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
     assert after_visits == []
     assert _calls_containing(runner, "git", "reset", "--hard", "HEAD")
     assert _calls_containing(runner, "git", "clean", "-fd")
+    assert _calls_containing(
+        runner, "git", "commit", "-m", "chore: checkpoint Run phase before"
+    )
+    final_push = [
+        call
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "push", "-u"]
+    ][-1]
+    assert final_push.kwargs["cwd"] == tmp_path / "wt" / "run-setup-failure"
     comment_call = next(
         call.args[0]
         for call in runner.call_args_list
@@ -1154,6 +1168,66 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
     assert "Completed Items: #1" in comment
     assert "Run Gate: not run" in comment
     assert "Stopping point: after-Run Setup" in comment
+
+
+def test_second_run_setup_cleanup_failure_still_publishes_durable_work(
+    tmp_path: Path,
+) -> None:
+    fixture_dir = _scoped_fixture(tmp_path)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+    run_setup_count = 0
+
+    def setup(cwd: Path) -> None:
+        nonlocal run_setup_count
+        if cwd.name.startswith("run-"):
+            run_setup_count += 1
+            if run_setup_count == 2:
+                report = cwd / orchestrator.RUN_REPORT
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("incomplete setup report")
+                raise orchestrator.SetupError("broken")
+
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "reset", "--hard"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="restore failed")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="setup-cleanup-failure",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        setup=setup,
+    )
+
+    assert outcome.completed == [1]
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "after-Run Setup"
+    assert _calls_containing(
+        runner, "git", "push", "origin", "pycastle/run-setup-cleanup-failure"
+    )
+    log = (fixture_dir / "runs" / "setup-cleanup-failure" / "run.log").read_text()
+    assert "After-Run Setup failed: broken" in log
+    assert "could not discard incomplete Run scope" in log
+    publication_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    publication_body = publication_call[publication_call.index("--body") + 1]
+    assert "incomplete setup report" not in publication_body
 
 
 def test_handled_item_infrastructure_failure_stops_frozen_remainder(
