@@ -928,6 +928,7 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
             (EligibleItem(1, "One"),),
+            (IssueRef(number=1, title="One"),),
         ),
     )
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")

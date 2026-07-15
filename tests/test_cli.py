@@ -71,6 +71,7 @@ def ready_run_preflight(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
             eligible_items=(EligibleItem(1, "One"),),
+            selected_items=(IssueRef(number=1, title="One"),),
         )
 
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", ready)

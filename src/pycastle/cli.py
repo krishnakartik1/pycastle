@@ -445,6 +445,18 @@ def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
     )
 
 
+def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
+    """Return whether every eligible Item has matching Run-only content."""
+    if len(report.selected_items) != len(report.eligible_items):
+        return False
+    return all(
+        selected.number == eligible.number and selected.title == eligible.title
+        for selected, eligible in zip(
+            report.selected_items, report.eligible_items, strict=True
+        )
+    )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     workspace = Path.cwd()
@@ -459,6 +471,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         for check in report.checks:
             if check.status in {Status.FAIL, Status.BLOCKED}:
                 logger.error("Readiness %s: %s", check.id, check.summary)
+        return 1
+    if not _run_has_complete_frozen_batch(report):
+        logger.error("Readiness did not return a complete frozen Item batch.")
         return 1
 
     configuration = report.configuration

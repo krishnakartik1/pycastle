@@ -1067,6 +1067,46 @@ def test_run_maps_only_zero_eligible_items_to_noop_success(
     assert cli._cmd_run(args) == 0
 
 
+@pytest.mark.parametrize(
+    ("eligible_items", "selected_items"),
+    [
+        ((EligibleItem(1, "One"),), ()),
+        (
+            (EligibleItem(1, "One"), EligibleItem(2, "Two")),
+            (IssueRef(number=1, title="One"),),
+        ),
+        (
+            (EligibleItem(1, "One"),),
+            (IssueRef(number=1, title="Different"),),
+        ),
+    ],
+)
+def test_run_rejects_incomplete_or_mismatched_frozen_batch_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    eligible_items: tuple[EligibleItem, ...],
+    selected_items: tuple[IssueRef, ...],
+) -> None:
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
+            eligible_items=lambda _configuration: list(eligible_items),
+        ),
+    )
+    object.__setattr__(report, "selected_items", selected_items)
+
+    side_effect = MagicMock(side_effect=AssertionError("Run side effect started"))
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
+    monkeypatch.setattr(cli, "_make_run_id", side_effect)
+    monkeypatch.setattr(cli, "_build_runtime", side_effect)
+    monkeypatch.setattr(cli, "run_loop", side_effect)
+
+    args = cli.build_parser().parse_args(["run", "--runtime", "stub"])
+    args.sandbox = "host"
+    assert cli._cmd_run(args) == 1
+    side_effect.assert_not_called()
+
+
 def test_readiness_freezes_full_items_but_reports_only_safe_metadata() -> None:
     item = IssueRef(
         number=7,
