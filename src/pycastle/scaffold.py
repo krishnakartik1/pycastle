@@ -229,13 +229,21 @@ ran=0
 missing=()
 
 run_if_available() {
-  if command -v "$1" >/dev/null 2>&1; then
+  if [ -n "${VIRTUAL_ENV:-}" ] && command -v python >/dev/null 2>&1; then
+    if python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('$1') is None)"; then
+      ran=$((ran + 1))
+      module="$1"
+      shift
+      python -m "$module" "$@"
+      return
+    fi
+  elif command -v "$1" >/dev/null 2>&1; then
     ran=$((ran + 1))
     "$@"
-  else
-    missing+=("$1")
-    echo "skipping gate step (not installed): $1"
+    return
   fi
+  missing+=("$1")
+  echo "skipping gate step (not installed): $1"
 }
 
 if [ "${1:-}" = "--check-tools" ]; then

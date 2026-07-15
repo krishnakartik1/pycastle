@@ -781,13 +781,14 @@ def test_scaffolded_setup_and_gate_share_environment_across_invocations(
     assert first.returncode == 0, first.stderr
     assert not (tmp_path / ".venv").exists()
 
-    pytest_command = tmp_path / ".pycastle" / "venv" / "bin" / "pytest"
-    pytest_command.write_text(
-        "#!/usr/bin/env python\n"
-        "from importlib.metadata import version\n"
-        "assert version('fixture-demo') == '1.0'\n"
-    )
-    pytest_command.chmod(0o755)
+    for module in ("ruff", "black", "pytest"):
+        package = tmp_path / module
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "__main__.py").write_text(
+            "from importlib.metadata import version\n"
+            "assert version('fixture-demo') == '1.0'\n"
+        )
 
     second = subprocess.run(
         [str(gate)],
@@ -797,6 +798,13 @@ def test_scaffolded_setup_and_gate_share_environment_across_invocations(
         env=dict(os.environ, PATH="/usr/bin:/bin"),
     )
     assert second.returncode == 0, second.stderr
+
+
+def test_scaffolded_gate_runs_tools_with_activated_python(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+    gate = (tmp_path / ".pycastle" / "gate").read_text()
+
+    assert 'python -m "$module" "$@"' in gate
 
 
 def test_scaffolded_gate_mode_is_exactly_0755(tmp_path: Path) -> None:

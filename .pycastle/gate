@@ -27,6 +27,6 @@ fi
 fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$fixture_dir/setup"
 
-ruff check . --exit-non-zero-on-fix
-black --check .
-pytest -q
+python -m ruff check . --exit-non-zero-on-fix
+python -m black --check .
+python -m pytest -q

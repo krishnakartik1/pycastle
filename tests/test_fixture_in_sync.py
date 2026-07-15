@@ -200,9 +200,9 @@ def test_committed_gate_sources_setup_and_uses_its_canonical_environment() -> No
     assert ".venv/bin" not in gate_text
     assert "source .pycastle/venv/bin/activate" in setup.read_text()
     for command in (
-        "ruff check . --exit-non-zero-on-fix",
-        "black --check .",
-        "pytest -q",
+        "python -m ruff check . --exit-non-zero-on-fix",
+        "python -m black --check .",
+        "python -m pytest -q",
     ):
         assert command in gate_text
 
