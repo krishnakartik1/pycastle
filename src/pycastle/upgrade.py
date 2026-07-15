@@ -77,25 +77,34 @@ def validate_fixture(fixture_dir: Path) -> None:
         definition = load_run(fixture_dir)
     except Exception as exc:
         raise FixtureUpgradeError(
-            f"Could not load the fixture Phase graph: {exc}"
+            f"Could not load the fixture Run definition: {exc}"
         ) from exc
     finally:
         sys.dont_write_bytecode = previous_bytecode
-    graphs = [definition.item]
-    graphs.extend(graph for graph in (definition.before, definition.after) if graph)
-    for phase in (phase for graph in graphs for phase in graph.phases.values()):
-        prompts_dir = (fixture_dir / "prompts").resolve()
-        prompt = (prompts_dir / phase.prompt).resolve()
-        try:
-            prompt.relative_to(prompts_dir)
-        except ValueError as exc:
-            raise FixtureUpgradeError(
-                f"Phase {phase.name!r} references prompt outside prompts/: {phase.prompt}"
-            ) from exc
-        if not _regular_file(prompt):
-            raise FixtureUpgradeError(
-                f"Phase {phase.name!r} references missing prompt {phase.prompt}."
-            )
+    scoped_graphs = [("Item phase", definition.item)]
+    scoped_graphs.extend(
+        (scope, graph)
+        for scope, graph in (
+            ("before-Run phase", definition.before),
+            ("after-Run phase", definition.after),
+        )
+        if graph is not None
+    )
+    for scope, graph in scoped_graphs:
+        for phase in graph.phases.values():
+            prompts_dir = (fixture_dir / "prompts").resolve()
+            prompt = (prompts_dir / phase.prompt).resolve()
+            try:
+                prompt.relative_to(prompts_dir)
+            except ValueError as exc:
+                raise FixtureUpgradeError(
+                    f"{scope} {phase.name!r} references prompt outside prompts/: "
+                    f"{phase.prompt}"
+                ) from exc
+            if not _regular_file(prompt):
+                raise FixtureUpgradeError(
+                    f"{scope} {phase.name!r} references missing prompt {phase.prompt}."
+                )
 
 
 def _ensure_clean(project_dir: Path) -> None:

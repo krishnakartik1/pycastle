@@ -176,11 +176,11 @@ pycastle upgrade
 ```
 
 Run `pycastle upgrade` once in every initialized repository. It applies only
-bundled runner/fixture contract migrations; it does not synchronize newer
-scaffold templates or overwrite project-owned improvements. The command refuses
-a dirty worktree and leaves a successful migration as an unstaged diff for you
-to inspect. PyCastle performs no self-update or update discovery, and it does
-not create a commit, branch, pull request, or merge authorization.
+bundled runner/fixture contract migrations; it does not synchronize newer Project
+fixture defaults or overwrite project-owned improvements. The command refuses a
+dirty worktree and leaves a successful migration as an unstaged diff for you to
+inspect. PyCastle performs no self-update or update discovery, and it does not
+create a commit, branch, pull request, or merge authorization.
 
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
 agent image. An unchanged recipe reuses its content-addressed image; editing the
