@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -230,10 +231,67 @@ def test_migration_specific_validation_failure_changes_nothing(tmp_path: Path) -
     ],
 )
 def test_fixture_validator_checks_each_builtin_invariant(
-    tmp_path: Path, mutate: object, message: str
+    tmp_path: Path, mutate: Callable[[Path], object], message: str
 ) -> None:
     _, fixture = _project(tmp_path)
-    mutate(fixture)  # type: ignore[operator]
+    mutate(fixture)
 
     with pytest.raises(FixtureUpgradeError, match=message):
         validate_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    "required", ["main.py", "gate", "sandbox", "Dockerfile", "version"]
+)
+def test_fixture_validator_rejects_each_missing_required_file(
+    tmp_path: Path, required: str
+) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / required).unlink()
+
+    with pytest.raises(FixtureUpgradeError, match=required):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_rejects_broken_setup_symlink(tmp_path: Path) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "setup").unlink()
+    (fixture / "setup").symlink_to("missing-setup")
+
+    with pytest.raises(FixtureUpgradeError, match="setup.*executable"):
+        validate_fixture(fixture)
+
+
+@pytest.mark.parametrize("marker", ["", "host\ndocker\n"])
+def test_fixture_validator_rejects_empty_or_multiline_sandbox_marker(
+    tmp_path: Path, marker: str
+) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "sandbox").write_text(marker)
+
+    with pytest.raises(FixtureUpgradeError, match="sandbox"):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_rejects_prompt_outside_prompts_directory(
+    tmp_path: Path,
+) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "outside.md").write_text("outside\n")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, phase\n"
+        "graph = build(start='work', phases=[phase('work', '../outside.md')])\n"
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="outside prompts"):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_does_not_execute_gate(tmp_path: Path) -> None:
+    project, fixture = _project(tmp_path)
+    side_effect = project / "gate-ran"
+    (fixture / "gate").write_text(f"#!/bin/sh\ntouch {side_effect}\n")
+
+    validate_fixture(fixture)
+
+    assert not side_effect.exists()

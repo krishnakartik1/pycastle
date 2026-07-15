@@ -55,7 +55,10 @@ def validate_fixture(fixture_dir: Path) -> None:
 
     for hook_name in ("gate", "setup"):
         hook = fixture_dir / hook_name
-        if hook_name == "setup" and not hook.exists():
+        # ``Path.exists`` is false for a broken symlink.  Such a path is still
+        # a present, unsafe customized Setup hook rather than an absent optional
+        # hook, so only skip it when no directory entry exists at all.
+        if hook_name == "setup" and not hook.exists() and not hook.is_symlink():
             continue
         if not _regular_file(hook) or not os.access(hook, os.X_OK):
             raise FixtureUpgradeError(
