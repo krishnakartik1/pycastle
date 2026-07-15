@@ -104,7 +104,40 @@ def test_scaffolded_setup_is_a_documented_noop_without_manifest(tmp_path: Path) 
 
     setup = (tmp_path / ".pycastle" / "setup").read_text()
     assert "No supported dependency manifest was found" in setup
-    assert "exit 0" in setup
+    assert "exit 0" not in setup
+
+
+def test_scaffolded_noop_setup_returns_to_sourcing_shell(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+    setup = tmp_path / ".pycastle" / "setup"
+
+    proc = subprocess.run(
+        ["bash", "-c", 'source "$1"; printf caller-continued', "bash", str(setup)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "caller-continued"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    ["uv.lock", "poetry.lock", "pyproject.toml", "requirements.txt"],
+)
+def test_scaffolded_python_setup_activates_canonical_environment_when_sourced(
+    tmp_path: Path, manifest: str
+) -> None:
+    (tmp_path / manifest).write_text("")
+    scaffold_fixture(tmp_path, sandbox="host")
+    setup = tmp_path / ".pycastle" / "setup"
+    text = setup.read_text()
+
+    assert "python3 -m venv --system-site-packages .pycastle/venv" in text
+    assert "source .pycastle/venv/bin/activate" in text
+    assert "exit 0" not in text
+    assert stat.S_IMODE(setup.stat().st_mode) == 0o755
 
 
 def _written_relative(written: list[Path], fixture_dir: Path) -> set[str]:
@@ -695,6 +728,77 @@ def test_scaffolded_gate_is_executable_and_has_a_shebang(tmp_path: Path) -> None
     assert gate.stat().st_mode & 0o111
 
 
+def test_scaffolded_gate_sources_its_canonical_sibling_setup_first(
+    tmp_path: Path,
+) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+    gate = (tmp_path / ".pycastle" / "gate").read_text()
+
+    source = 'source "$fixture_dir/setup"'
+    assert "fixture_dir=" in gate
+    assert "${BASH_SOURCE[0]}" in gate
+    assert gate.index(source) < gate.index("run_if_available ruff")
+
+
+def test_scaffolded_setup_and_gate_share_environment_across_invocations(
+    tmp_path: Path,
+) -> None:
+    """A fresh Gate uses the editable distribution installed by Setup (#110)."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[build-system]\n"
+        "requires = []\n"
+        "build-backend = 'backend'\n"
+        "backend-path = ['.']\n"
+        "[project]\n"
+        "name = 'fixture-demo'\n"
+        "version = '1.0'\n"
+    )
+    (tmp_path / "backend.py").write_text(
+        "def build_editable(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    import zipfile\n"
+        "    wheel = wheel_directory + '/fixture_demo-1.0-py3-none-any.whl'\n"
+        "    with zipfile.ZipFile(wheel, 'w') as archive:\n"
+        "        archive.writestr('fixture_demo-1.0.dist-info/METADATA', "
+        "'Metadata-Version: 2.1\\nName: fixture-demo\\nVersion: 1.0\\n')\n"
+        "        archive.writestr('fixture_demo-1.0.dist-info/WHEEL', "
+        "'Wheel-Version: 1.0\\nGenerator: test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')\n"
+        "        archive.writestr('fixture_demo-1.0.dist-info/RECORD', '')\n"
+        "    return wheel.rsplit('/', 1)[-1]\n"
+        "def get_requires_for_build_editable(config_settings=None): return []\n"
+        "def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):\n"
+        "    import os\n"
+        "    path = os.path.join(metadata_directory, 'fixture_demo-1.0.dist-info')\n"
+        "    os.makedirs(path)\n"
+        "    open(os.path.join(path, 'METADATA'), 'w').write("
+        "'Metadata-Version: 2.1\\nName: fixture-demo\\nVersion: 1.0\\n')\n"
+        "    return 'fixture_demo-1.0.dist-info'\n"
+    )
+    scaffold_fixture(tmp_path, sandbox="host")
+    setup = tmp_path / ".pycastle" / "setup"
+    gate = tmp_path / ".pycastle" / "gate"
+
+    first = subprocess.run([str(setup)], cwd=tmp_path, capture_output=True, text=True)
+    assert first.returncode == 0, first.stderr
+    assert not (tmp_path / ".venv").exists()
+
+    pytest_command = tmp_path / ".pycastle" / "venv" / "bin" / "pytest"
+    pytest_command.write_text(
+        "#!/usr/bin/env python\n"
+        "from importlib.metadata import version\n"
+        "assert version('fixture-demo') == '1.0'\n"
+    )
+    pytest_command.chmod(0o755)
+
+    second = subprocess.run(
+        [str(gate)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, PATH="/usr/bin:/bin"),
+    )
+    assert second.returncode == 0, second.stderr
+
+
 def test_scaffolded_gate_mode_is_exactly_0755(tmp_path: Path) -> None:
     """The gate is mode 0755 regardless of the caller's umask.
 
@@ -817,6 +921,30 @@ def test_scaffolded_gate_check_tools_only_looks_up_tools(tmp_path: Path) -> None
     # The generic gate's existing policy is non-vacuousness: one available
     # configured tool is enough. Exit 99 would prove ruff was actually run.
     assert proc.returncode == 0, proc.stderr
+
+
+def test_scaffolded_gate_check_tools_does_not_source_setup(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    gate = tmp_path / ".pycastle" / "gate"
+    marker = tmp_path / "setup-was-sourced"
+    setup = tmp_path / ".pycastle" / "setup"
+    setup.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n")
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    tool = bindir / "ruff"
+    tool.write_text("#!/usr/bin/env bash\nexit 99\n")
+    tool.chmod(0o755)
+
+    proc = subprocess.run(
+        [str(gate), "--check-tools"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin"),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
 
 
 def test_repository_gate_check_tools_requires_every_unconditional_tool(

@@ -253,6 +253,9 @@ if [ "${1:-}" = "--check-tools" ]; then
   exit 0
 fi
 
+fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$fixture_dir/setup"
+
 run_if_available ruff check . --exit-non-zero-on-fix
 run_if_available black --check .
 run_if_available pytest -q
@@ -273,7 +276,7 @@ _SETUP_NOOP = """\
 # No supported dependency manifest was found when `pycastle init` ran.
 # Replace this no-op with the command that prepares your project for its phases
 # and gate. PyCastle executes this project-owned hook at the start of each issue.
-exit 0
+:
 """
 
 
