@@ -243,6 +243,215 @@ def runtime_configuration(runtime: str) -> ReadinessConfiguration:
     )
 
 
+def docker_configuration(
+    runtime: str = "claude", image: str = "example/agent:ready"
+) -> ReadinessConfiguration:
+    return ReadinessConfiguration(
+        **{
+            **configuration().__dict__,
+            "runtime": runtime,
+            "sandbox": "docker",
+            "agent_image": image,
+        }
+    )
+
+
+class DockerRecordingRunner:
+    def __init__(self, *, fail_gate: bool = False) -> None:
+        self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        self.fail_gate = fail_gate
+
+    def __call__(
+        self, argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        call = tuple(argv)
+        self.calls.append((call, kwargs))
+        returncode = 1 if self.fail_gate and "--check-tools" in call else 0
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+
+def test_explicit_agent_image_is_probed_as_is_without_touching_dockerfile(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    # A directory at the Dockerfile path makes any attempted recipe read fail.
+    (fixture / "Dockerfile").mkdir()
+    runner = DockerRecordingRunner()
+    config = docker_configuration(image="registry.example/agent:exact")
+
+    with DefaultReadinessAdapter(
+        fixture, tmp_path, runner=runner, image_flag=config.agent_image
+    ) as adapter:
+        result = adapter.check_agent_image(config)
+
+    assert result.status is Status.PASS
+    assert not any(
+        call[:3] == ("docker", "image", "inspect") for call, _ in runner.calls
+    )
+    assert not any(call[:2] == ("docker", "build") for call, _ in runner.calls)
+    assert any(config.agent_image in call for call, _ in runner.calls)
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_docker_probes_share_isolated_workspace_and_runtime_conventions(
+    tmp_path: Path, runtime: str
+) -> None:
+    fixture = _valid_fixture(tmp_path)
+    runner = DockerRecordingRunner()
+    config = docker_configuration(runtime)
+    repository = tmp_path.resolve()
+
+    with DefaultReadinessAdapter(
+        fixture, tmp_path, runner=runner, image_flag=config.agent_image
+    ) as adapter:
+        image = adapter.check_agent_image(config)
+        gate = adapter.check_gate_toolchain(config)
+        disposable = adapter._docker_workspace
+        assert disposable is not None and disposable.exists()
+        assert (disposable / "gate").read_text() == (fixture / "gate").read_text()
+
+    assert image.status is Status.PASS
+    assert gate.status is Status.PASS
+    assert disposable is not None and not disposable.exists()
+    docker_runs = [call for call, _ in runner.calls if call[:2] == ("docker", "run")]
+    assert len(docker_runs) == 2
+    mount_sources = [
+        next(
+            value.split(":", 1)[0] for value in call if value.endswith(f":{disposable}")
+        )
+        for call in docker_runs
+    ]
+    assert mount_sources == [str(disposable), str(disposable)]
+    assert all(str(repository) not in call for call in docker_runs)
+    runtime_config = sandbox.RUNTIME_CONFIG[runtime]
+    assert all(config.agent_image in call for call in docker_runs)
+    assert all(sandbox.SANDBOX_USER in call for call in docker_runs)
+    assert all(
+        f"{sandbox.auth_volume(runtime)}:{runtime_config.config_dir}" in call
+        for call in docker_runs
+    )
+    assert all(
+        f"{runtime_config.config_env}={runtime_config.config_dir}" in call
+        for call in docker_runs
+    )
+    contract = " ".join(docker_runs[0])
+    assert 'test "$(id -un)" = node' in contract
+    assert 'test "$HOME" = /home/node' in contract
+    assert 'command -v "$runtime"' in contract
+    assert 'auth_file="$config_dir/$auth_name"' in contract
+    assert 'workspace_file="$PWD/$workspace_name"' in contract
+    assert docker_runs[1][-2:] == (str(disposable / "gate"), "--check-tools")
+    assert str((fixture / "gate").resolve()) not in docker_runs[1]
+
+
+def test_disposable_workspace_is_cleaned_when_docker_gate_fails(tmp_path: Path) -> None:
+    fixture = _valid_fixture(tmp_path)
+    runner = DockerRecordingRunner(fail_gate=True)
+    config = docker_configuration()
+
+    with DefaultReadinessAdapter(
+        fixture, tmp_path, runner=runner, image_flag=config.agent_image
+    ) as adapter:
+        assert adapter.check_agent_image(config).status is Status.PASS
+        assert adapter.check_gate_toolchain(config).status is Status.FAIL
+        disposable = adapter._docker_workspace
+
+    assert disposable is not None and not disposable.exists()
+
+
+def test_disposable_workspace_is_cleaned_when_probe_raises(tmp_path: Path) -> None:
+    fixture = _valid_fixture(tmp_path)
+    config = docker_configuration()
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(argv, 15.0, output="secret")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        with DefaultReadinessAdapter(
+            fixture, tmp_path, runner=runner, image_flag=config.agent_image
+        ) as adapter:
+            disposable = adapter._readiness_workspace()
+            adapter.check_agent_image(config)
+
+    assert not disposable.exists()
+
+
+@pytest.mark.parametrize(
+    ("stream_build", "expected_capture"), [(True, False), (False, True)]
+)
+def test_agent_image_build_capture_tracks_human_versus_json_mode(
+    tmp_path: Path, stream_build: bool, expected_capture: bool
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    dockerfile = fixture / "Dockerfile"
+    dockerfile.write_text("FROM node:22-slim\n")
+    image = sandbox.image_tag_for_dockerfile(dockerfile.read_text())
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((tuple(argv), kwargs))
+        returncode = 1 if argv[:3] == ["docker", "image", "inspect"] else 0
+        return subprocess.CompletedProcess(argv, returncode, "secret", "secret")
+
+    with DefaultReadinessAdapter(
+        fixture,
+        tmp_path,
+        runner=runner,
+        stream_image_build=stream_build,
+    ) as adapter:
+        result = adapter.check_agent_image(docker_configuration(image=image))
+
+    assert result.status is Status.PASS
+    inspect = next(
+        entry for entry in calls if entry[0][:3] == ("docker", "image", "inspect")
+    )
+    build = next(entry for entry in calls if entry[0][:2] == ("docker", "build"))
+    assert inspect[1]["capture"] is True
+    assert inspect[1]["timeout"] == 15.0
+    assert build[1]["capture"] is expected_capture
+    assert build[1]["timeout"] == 900.0
+    assert "secret" not in repr(result)
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_docker_authentication_uses_resolved_image_and_canonical_auth_volume(
+    tmp_path: Path, runtime: str
+) -> None:
+    runner = DockerRecordingRunner()
+    config = docker_configuration(runtime, "registry.example/agent:digest")
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+
+    result = adapter.check_runtime_authentication(config)
+
+    assert result.status is Status.PASS
+    call, kwargs = runner.calls[0]
+    assert call == tuple(
+        sandbox.build_status_command(runtime, image=config.agent_image)
+    )
+    assert kwargs == {"cwd": tmp_path, "capture": True, "timeout": 15.0}
+    other = "codex" if runtime == "claude" else "claude"
+    assert sandbox.auth_volume(other) not in call
+
+
+def test_missing_gate_runs_nothing_and_creates_no_disposable_workspace(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    runner = DockerRecordingRunner()
+    adapter = DefaultReadinessAdapter(fixture, tmp_path, runner=runner)
+
+    result = adapter.check_gate_toolchain(docker_configuration())
+
+    assert result.status is Status.NOT_APPLICABLE
+    assert runner.calls == []
+    assert adapter._docker_workspace is None
+
+
 class ScriptedRuntimeRunner:
     def __init__(
         self,

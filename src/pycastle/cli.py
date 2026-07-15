@@ -26,13 +26,16 @@ from .preflight import (
     check_required_commands,
 )
 from .readiness import (
+    AgentImagePreparationError,
     DefaultReadinessAdapter,
     ReadinessConfiguration,
     ReadinessReport,
     Status,
     evaluate_readiness,
+    prepare_agent_image,
     render_human,
     render_json,
+    resolve_agent_image_name,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import (
@@ -225,22 +228,19 @@ def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
     non-zero exit is treated as "absent → build", and that one ``docker build``
     is the only build invoked. Returns the resolved tag.
     """
-    tag = sandbox.image_tag_for_dockerfile(dockerfile_text)
-    inspect = run_cmd(["docker", "image", "inspect", tag], capture=True)
-    if getattr(inspect, "returncode", 1) == 0:
-        logger.info("Agent image %s is already built; skipping build.", tag)
-        return tag
-    logger.info("Building the agent image %s from %s ...", tag, fixture_dir)
-    build = run_cmd(["docker", "build", "-t", tag, str(fixture_dir)])
-    if getattr(build, "returncode", 1) != 0:
-        # A failed build must not be swallowed: returning the tag here would let
-        # the run proceed against an image that was never built (or a stale tag
-        # from an earlier build), failing opaquely deeper in `docker run`.
+    # Preserve this established API while delegating to the one readiness/Run
+    # preparation path. The text argument is retained for compatibility and is
+    # validated against the canonical fixture recipe.
+    if sandbox.image_tag_for_dockerfile(dockerfile_text) != resolve_agent_image_name(
+        None, fixture_dir
+    ):
+        raise PreflightError("Dockerfile content changed during image resolution.")
+    try:
+        return prepare_agent_image(None, fixture_dir, runner=run_cmd)
+    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
         raise PreflightError(
-            f"Failed to build the agent image {tag} from {fixture_dir}; "
-            "fix the Dockerfile and retry."
-        )
-    return tag
+            "Failed to build the Agent image; fix the Dockerfile and retry."
+        ) from error
 
 
 def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
@@ -258,19 +258,12 @@ def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
 
     Only ever called for a Docker run; a host run never resolves an image.
     """
-    if image_flag is not None:
-        if not image_flag.strip():
-            raise PreflightError(
-                "The --image value is empty; pass a real agent image tag, or "
-                "omit --image to build .pycastle/Dockerfile or use the default."
-            )
-        return image_flag
-    dockerfile = fixture_dir / DOCKERFILE_NAME
-    if dockerfile.is_file():
-        # A present-but-unreadable Dockerfile surfaces here rather than being
-        # treated as absent: the read raises, it is not swallowed.
-        return _build_image_for_dockerfile(dockerfile.read_text(), fixture_dir)
-    return sandbox.DEFAULT_IMAGE
+    try:
+        return prepare_agent_image(image_flag, fixture_dir, runner=run_cmd)
+    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
+        raise PreflightError(
+            "Failed to prepare the Agent image; fix the Dockerfile or --image."
+        ) from error
 
 
 def _build_runtime(
@@ -350,12 +343,7 @@ def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration
                 raise PreflightError("The --image value is empty.")
             image = args.image
         else:
-            dockerfile = FIXTURE_DIR / DOCKERFILE_NAME
-            image = (
-                sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-                if dockerfile.is_file()
-                else sandbox.DEFAULT_IMAGE
-            )
+            image = resolve_agent_image_name(None, FIXTURE_DIR)
 
     def resolve(argv: list[str]) -> str:
         try:
@@ -410,8 +398,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
     """Resolve and evaluate the readiness configuration used by Doctor and Run."""
     configuration = _readiness_configuration(args)
-    adapter = DefaultReadinessAdapter(FIXTURE_DIR, Path.cwd())
-    return evaluate_readiness(configuration, adapter.dependencies())
+    with DefaultReadinessAdapter(
+        FIXTURE_DIR,
+        Path.cwd(),
+        image_flag=args.image,
+        # Human Doctor may show a first build's progress. Run and JSON keep
+        # child output captured so stdout remains a single report document.
+        stream_image_build=args.command == "doctor" and not args.json,
+    ) as adapter:
+        return evaluate_readiness(configuration, adapter.dependencies())
 
 
 def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
