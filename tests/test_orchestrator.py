@@ -623,6 +623,18 @@ def test_harvest_report_accepts_boundary_sizes(tmp_path: Path, size: int) -> Non
     assert error is None
 
 
+def test_harvest_report_accepts_missing_optional_report(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    report, error = orchestrator._harvest_report(fixture, "run-86", worktree)
+
+    assert report is None
+    assert error is None
+    assert not (fixture / "runs" / "run-86" / "run-report.md").exists()
+
+
 def test_harvest_report_rejects_one_byte_over_limit_without_truncating(
     tmp_path: Path,
 ) -> None:

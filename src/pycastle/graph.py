@@ -1,14 +1,12 @@
-"""The Phase graph and its declarative Builder API.
+"""Scope-specific phase graphs and the declarative Builder API.
 
-A project describes its workflow in ``.pycastle/main.py`` by assembling a
-:class:`PhaseGraph` from a list of :func:`phase` rows and assigning it to a
-module-level ``graph``. Each phase names its own success and failure
-destinations, so the workflow can branch — implement → review on success,
-implement → handoff (or a human) on failure — rather than running a fixed
-linear list. The executor is a transition *walker*: from ``start`` it runs each
-phase, maps the phase's outcome onto its ``on_success`` / ``on_failure`` edge,
-and follows that edge until it reaches a terminal (:data:`DONE` or
-:data:`HUMAN`). See ADR-0004 for why the API reads as declarative rows.
+A project describes its Run in ``.pycastle/main.py`` by assigning a
+:class:`RunDefinition` to module-level ``run``. The definition wraps one required
+Item phase graph with optional before-Run and after-Run phase graphs. Each graph
+is assembled from :func:`phase` rows whose success and failure destinations are
+explicit, so execution can branch rather than following declaration order. The
+executor walks those transitions until it reaches :data:`DONE` or :data:`HUMAN`.
+See ADR-0004 for the row API and ADR-0008 for the Run definition.
 """
 
 from __future__ import annotations

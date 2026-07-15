@@ -2,11 +2,10 @@
 
 This is the deep module behind ``pycastle init`` (#11): it takes the host-first
 vs Docker-first choice and writes the Project fixture — a Builder-style
-``main.py``, a ``Dockerfile`` for the agent image, the plan/implement/review
+``main.py``, a ``Dockerfile`` for the agent image, the default Item and after-Run
 prompts, default ``setup`` and ``gate`` executables, a ``sandbox`` marker, and a
-release ``version`` marker, plus a ``.gitignore`` that excludes run logs and
-generated run artifacts. The output is a file tree, which is what the tests
-assert.
+release ``version`` marker, plus a ``.gitignore`` that excludes Run records and
+scratch files. The output is a file tree, which is what the tests assert.
 
 There is no interactive I/O here: the CLI does the prompting and passes the
 choice in, so this stays a pure-ish function that is trivial to unit-test

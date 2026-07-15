@@ -442,6 +442,39 @@ def test_scaffolded_after_run_graph_reviews_repairs_and_reports(tmp_path: Path) 
     assert (fixture_dir / "run-report.md").read_text() == "# Repaired batch\n"
 
 
+def test_scaffolded_after_run_graph_handles_no_findings_without_repairs(
+    tmp_path: Path,
+) -> None:
+    """The default after-Run path can report an already-clean integrated state."""
+    from pycastle.graph import GraphExecutor, Phase, PhaseResult
+
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture_dir = tmp_path / ".pycastle"
+    integrated = tmp_path / "integrated.txt"
+    integrated.write_text("already clean\n")
+    graph = load_run(fixture_dir).after
+    assert graph is not None
+
+    def run_phase(ph: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        if ph.name == "run-review":
+            (fixture_dir / "run-review.md").write_text("No findings\n")
+        elif ph.name == "run-repair":
+            assert (fixture_dir / "run-review.md").read_text() == "No findings\n"
+            assert integrated.read_text() == "already clean\n"
+        elif ph.name == "run-report":
+            assert integrated.read_text() == "already clean\n"
+            (fixture_dir / "run-report.md").write_text("# Clean batch\n")
+        return True, []
+
+    walk = GraphExecutor(runtime=object(), fixture_dir=fixture_dir).execute(
+        graph, cwd=tmp_path, phase_runner=run_phase
+    )
+
+    assert walk.terminal is DONE
+    assert integrated.read_text() == "already clean\n"
+    assert (fixture_dir / "run-report.md").read_text() == "# Clean batch\n"
+
+
 # --------------------------------------------------------------------------- #
 # The scaffolded Dockerfile and gate                                           #
 # --------------------------------------------------------------------------- #
