@@ -423,6 +423,44 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     ]
 
 
+def test_successful_run_phase_with_no_changes_pushes_without_empty_commit(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A successful no-op Run phase remains durable without a fake commit."""
+    run_worktree = tmp_path / "run-worktree"
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout=""),
+            _ok(),
+        ]
+    )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="integrated-review", prompt="review.md"),
+        run_branch="pycastle/run-run-101",
+        run_worktree=run_worktree,
+        fixture_dir=fixture_dir,
+        run_id="run-101",
+        runner=runner,
+    )
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    assert calls == [
+        [
+            "git",
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude,top).pycastle/run-review.md",
+            ":(exclude,top).pycastle/run-report.md",
+        ],
+        ["git", "diff", "--cached", "--quiet"],
+        ["git", "push", "-u", "origin", "pycastle/run-run-101"],
+    ]
+
+
 @pytest.mark.parametrize("size", [0, orchestrator.RUN_REPORT_LIMIT])
 def test_harvest_report_accepts_boundary_sizes(tmp_path: Path, size: int) -> None:
     fixture = tmp_path / ".pycastle"
