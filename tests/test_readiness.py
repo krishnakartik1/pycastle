@@ -822,6 +822,52 @@ def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
     assert report.ready is False
 
 
+@pytest.mark.parametrize(
+    "items",
+    [
+        None,
+        (EligibleItem(1, "One"),),
+        [EligibleItem(0, "Zero")],
+        [EligibleItem(-1, "Negative")],
+        [EligibleItem(True, "Boolean")],
+        [EligibleItem("1", "String")],
+        [EligibleItem(1, None)],
+    ],
+)
+def test_invalid_item_values_make_doctor_unready(items: object) -> None:
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
+            eligible_items=lambda _configuration: items,  # type: ignore[return-value]
+        ),
+    )
+
+    assert report.checks[-1].status is Status.FAIL
+    assert report.eligible_items == ()
+    assert report.ready is False
+
+
+def test_invalid_probe_result_becomes_a_failed_check_and_evaluation_continues() -> None:
+    def probe(check_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        if check_id == "working_tree":
+            return None  # type: ignore[return-value]
+        return CheckResult(Status.PASS, "Ready")
+
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=probe,
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+    by_id = {check.id: check for check in report.checks}
+
+    assert by_id["working_tree"].status is Status.FAIL
+    assert by_id["base_branch"].status is Status.PASS
+    assert len(report.checks) == len(CHECK_IDS)
+
+
 def test_child_diagnostics_are_not_retained_in_report() -> None:
     secret = "ghp_super_secret raw gate output"
     report = evaluate_readiness(

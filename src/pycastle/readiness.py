@@ -213,10 +213,10 @@ def evaluate_readiness(
             )
         elif check_id == "eligible_items":
             try:
-                items = sorted(
-                    EligibleItem(item.number, _bounded_text(item.title, 200))
-                    for item in dependencies.eligible_items(configuration)
-                )
+                loaded_items = dependencies.eligible_items(configuration)
+                if not isinstance(loaded_items, list):
+                    raise TypeError("Eligible Item metadata must be a list")
+                items = sorted(_safe_eligible_item(item) for item in loaded_items)
                 result = (
                     CheckResult(
                         Status.PASS,
@@ -248,6 +248,8 @@ def evaluate_readiness(
         else:
             try:
                 result = dependencies.probe(check_id, configuration)
+                if not isinstance(result, CheckResult):
+                    raise TypeError("Probe returned an invalid result")
             except subprocess.TimeoutExpired:
                 result = CheckResult(
                     Status.FAIL,
@@ -301,6 +303,21 @@ def _bounded_text(value: object, limit: int) -> str:
     if not isinstance(value, str):
         return ""
     return "".join(char for char in value if char.isprintable())[:limit]
+
+
+def _safe_eligible_item(item: object) -> EligibleItem:
+    """Validate and bound Issue metadata before it enters a report."""
+    if not isinstance(item, EligibleItem):
+        raise TypeError("Eligible Item metadata has an invalid shape")
+    if (
+        not isinstance(item.number, int)
+        or isinstance(item.number, bool)
+        or item.number < 1
+    ):
+        raise ValueError("Eligible Item number must be a positive integer")
+    if not isinstance(item.title, str):
+        raise TypeError("Eligible Item title must be text")
+    return EligibleItem(item.number, _bounded_text(item.title, 200))
 
 
 def _safe_fact_text(value: object, limit: int) -> str:
