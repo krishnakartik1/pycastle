@@ -172,7 +172,7 @@ normally. If a host Run needs an advisory Black self-check, invoke one file per
 Black process, for example:
 
 ```bash
-git ls-files -z '*.py' | xargs -0 -r -n 1 black --check
+git ls-files -z '*.py' | xargs -0 -r -n 1 black --check --
 ```
 
 Passing `--workers 1` does not avoid the hang. PyCastle launches the

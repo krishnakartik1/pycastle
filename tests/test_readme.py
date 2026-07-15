@@ -41,6 +41,7 @@ def test_readme_documents_codex_host_black_workaround() -> None:
     assert "black --check ." in readme
     assert "--sandbox docker" in readme
     assert "one file per Black process" in prose
+    assert "xargs -0 -r -n 1 black --check --" in readme
     assert "--workers 1" in readme
     assert "does not avoid the hang" in prose
     assert "Gate remains authoritative" in prose
