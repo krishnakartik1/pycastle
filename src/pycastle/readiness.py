@@ -279,6 +279,33 @@ class DefaultReadinessAdapter:
     def _ok(result: Any) -> bool:
         return getattr(result, "returncode", 1) == 0
 
+    def _runtime_command(
+        self, config: ReadinessConfiguration, inner_argv: list[str]
+    ) -> list[str]:
+        if config.sandbox == "host":
+            return inner_argv
+        return sandbox.build_run_command(
+            config.runtime,
+            inner_argv=inner_argv,
+            workspace=self.workspace,
+            image=config.agent_image or sandbox.DEFAULT_IMAGE,
+        )
+
+    @staticmethod
+    def _safe_version(result: Any) -> str | None:
+        if not DefaultReadinessAdapter._ok(result):
+            return None
+        value = getattr(result, "stdout", "")
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        allowed = frozenset(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._()+/-"
+        )
+        if not value or len(value) > 100 or any(char not in allowed for char in value):
+            return None
+        return value
+
     def probe(self, check_id: str, config: ReadinessConfiguration) -> CheckResult:
         method = getattr(self, f"check_{check_id}")
         return method(config)
@@ -470,24 +497,20 @@ class DefaultReadinessAdapter:
     def check_runtime(self, config: ReadinessConfiguration) -> CheckResult:
         if config.runtime == "stub":
             return CheckResult(Status.PASS, "Stub Runtime is available.")
-        argv = [config.runtime, "--version"]
-        if config.sandbox == "docker":
-            argv = sandbox.build_run_command(
-                config.runtime,
-                inner_argv=argv,
-                workspace=self.workspace,
-                image=config.agent_image or sandbox.DEFAULT_IMAGE,
-            )
-        result = self._run(argv)
-        return (
-            CheckResult(Status.PASS, "Runtime is present and launchable.")
-            if self._ok(result)
-            else CheckResult(
+        argv = self._runtime_command(config, [config.runtime, "--version"])
+        try:
+            result = self._run(argv)
+        except subprocess.TimeoutExpired:
+            return CheckResult(Status.PASS, "Runtime is present and launchable.")
+        except OSError:
+            return CheckResult(
                 Status.FAIL,
                 "Runtime is not launchable.",
                 remediation="Install or repair the selected Runtime.",
             )
-        )
+        version = self._safe_version(result)
+        facts = {"version": version} if version else {}
+        return CheckResult(Status.PASS, "Runtime is present and launchable.", facts)
 
     def check_runtime_authentication(
         self, config: ReadinessConfiguration
@@ -501,7 +524,14 @@ class DefaultReadinessAdapter:
             argv = sandbox.build_status_command(
                 config.runtime, image=config.agent_image or sandbox.DEFAULT_IMAGE
             )
-        result = self._run(argv)
+        try:
+            result = self._run(argv)
+        except (OSError, subprocess.TimeoutExpired):
+            return CheckResult(
+                Status.FAIL,
+                "Runtime authentication status could not be checked.",
+                remediation=f"Verify {config.runtime} and authenticate it in the selected Sandbox.",
+            )
         return (
             CheckResult(Status.PASS, "Runtime native authentication status passed.")
             if self._ok(result)

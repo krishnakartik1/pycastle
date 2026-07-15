@@ -234,6 +234,184 @@ def configuration() -> ReadinessConfiguration:
     )
 
 
+def runtime_configuration(runtime: str) -> ReadinessConfiguration:
+    return ReadinessConfiguration(
+        **{
+            **configuration().__dict__,
+            "runtime": runtime,
+        }
+    )
+
+
+class ScriptedRuntimeRunner:
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], subprocess.CompletedProcess[str] | OSError],
+    ) -> None:
+        self.responses = responses
+        self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def __call__(
+        self, argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        call = tuple(argv)
+        self.calls.append((call, kwargs))
+        response = self.responses[call]
+        if isinstance(response, OSError):
+            raise response
+        return response
+
+
+@pytest.mark.parametrize(
+    ("runtime", "version", "status_argv"),
+    [
+        ("claude", "1.2.3 (Claude Code)\n", ("claude", "auth", "status")),
+        ("codex", "codex-cli 4.5.6\n", ("codex", "login", "status")),
+    ],
+)
+def test_host_runtime_ready_uses_native_non_interactive_status(
+    tmp_path: Path, runtime: str, version: str, status_argv: tuple[str, ...]
+) -> None:
+    version_argv = (runtime, "--version")
+    runner = ScriptedRuntimeRunner(
+        {
+            version_argv: subprocess.CompletedProcess(version_argv, 0, version, ""),
+            status_argv: subprocess.CompletedProcess(
+                status_argv, 0, "authenticated", ""
+            ),
+        }
+    )
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+    config = runtime_configuration(runtime)
+
+    runtime_result = adapter.check_runtime(config)
+    authentication_result = adapter.check_runtime_authentication(config)
+
+    assert runtime_result.status is Status.PASS
+    assert runtime_result.facts == {"version": version.strip()}
+    assert authentication_result.status is Status.PASS
+    assert [call for call, _kwargs in runner.calls] == [version_argv, status_argv]
+    assert all(
+        kwargs == {"cwd": tmp_path, "capture": True, "timeout": 15.0}
+        for _call, kwargs in runner.calls
+    )
+    assert all("prompt" not in " ".join(call) for call, _kwargs in runner.calls)
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_host_runtime_missing_is_reported_by_required_commands(
+    tmp_path: Path, runtime: str
+) -> None:
+    adapter = DefaultReadinessAdapter(
+        tmp_path,
+        tmp_path,
+        runner=lambda *_args, **_kwargs: pytest.fail("missing Runtime was invoked"),
+        exists=lambda command: command in {"git", "gh"},
+    )
+
+    result = adapter.check_required_commands(runtime_configuration(runtime))
+
+    assert result.status is Status.FAIL
+    assert result.facts == {"missing": [runtime]}
+    assert result.remediation
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_host_runtime_unlaunchable_has_fixed_safe_failure(
+    tmp_path: Path, runtime: str
+) -> None:
+    version_argv = (runtime, "--version")
+    secret = "credential=do-not-report"
+    runner = ScriptedRuntimeRunner({version_argv: PermissionError(secret)})
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+
+    result = adapter.check_runtime(runtime_configuration(runtime))
+
+    assert result.status is Status.FAIL
+    assert result.summary == "Runtime is not launchable."
+    assert result.remediation == "Install or repair the selected Runtime."
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("runtime", "status_argv"),
+    [
+        ("claude", ("claude", "auth", "status")),
+        ("codex", ("codex", "login", "status")),
+    ],
+)
+def test_host_runtime_authentication_failure_never_reports_child_output(
+    tmp_path: Path, runtime: str, status_argv: tuple[str, ...]
+) -> None:
+    secret = "token=do-not-report"
+    runner = ScriptedRuntimeRunner(
+        {
+            status_argv: subprocess.CompletedProcess(
+                status_argv, 1, f"stdout {secret}", f"stderr {secret}"
+            )
+        }
+    )
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+
+    result = adapter.check_runtime_authentication(runtime_configuration(runtime))
+    report = evaluate_readiness(
+        runtime_configuration(runtime),
+        ReadinessDependencies(
+            probe=lambda check_id, _config: (
+                result
+                if check_id == "runtime_authentication"
+                else CheckResult(Status.PASS, "Ready")
+            ),
+            eligible_items=lambda _config: [EligibleItem(1, "One")],
+        ),
+    )
+
+    assert result.status is Status.FAIL
+    assert result.facts == {}
+    assert result.remediation == f"Authenticate {runtime} in the selected Sandbox."
+    assert secret not in render_json(report)
+    assert secret not in render_human(report)
+
+
+@pytest.mark.parametrize(
+    ("runtime", "status_argv"),
+    [
+        ("claude", ("claude", "auth", "status")),
+        ("codex", ("codex", "login", "status")),
+    ],
+)
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, "unsupported"), (0, "line one\nline two"), (0, "x" * 101)],
+)
+def test_host_runtime_version_unavailable_does_not_fail_readiness(
+    tmp_path: Path,
+    runtime: str,
+    status_argv: tuple[str, ...],
+    returncode: int,
+    stdout: str,
+) -> None:
+    version_argv = (runtime, "--version")
+    runner = ScriptedRuntimeRunner(
+        {
+            version_argv: subprocess.CompletedProcess(
+                version_argv, returncode, stdout, "diagnostic"
+            ),
+            status_argv: subprocess.CompletedProcess(status_argv, 0, "ready", ""),
+        }
+    )
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+    config = runtime_configuration(runtime)
+
+    result = adapter.check_runtime(config)
+    authentication = adapter.check_runtime_authentication(config)
+
+    assert result.status is Status.PASS
+    assert result.facts == {}
+    assert authentication.status is Status.PASS
+    assert [call for call, _kwargs in runner.calls] == [version_argv, status_argv]
+
+
 def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
     calls: list[str] = []
 
