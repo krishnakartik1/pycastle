@@ -14,36 +14,64 @@ Cuts a per-run branch, works each item on its own branch off it, folds the clean
 ones back, and opens one PR for the batch.
 _Avoid_: job, session, cycle.
 
-**Phase**:
-One step the agent performs on an item (e.g. plan, implement, review), driven by
-its own prompt. Each phase names a success and a failure destination.
-_Avoid_: stage, step.
+**Item phase**:
+One prompt-driven step a **Runtime** performs on one item (e.g. plan, implement,
+review). Each Item phase names a success and a failure destination.
+_Avoid_: Phase without a scope, stage, step.
 
-**Phase graph**:
-The project-owned graph of phases and their success/failure edges, authored in
-`.pycastle/main.py`, that a run walks per item until it reaches a terminal.
-_Avoid_: workflow, pipeline.
+**Run phase**:
+One prompt-driven step a **Runtime** performs on the Run as a whole, before or
+after its items are worked. It operates on the Run branch rather than an item branch.
+_Avoid_: Phase without a scope, hook, job.
+
+**Item phase graph**:
+The project-owned graph of **Item phases** and their success/failure edges that
+a Run walks once per item until it reaches a terminal.
+_Avoid_: Phase graph without a scope, workflow, pipeline.
+
+**Run phase graph**:
+An optional project-owned graph of **Run phases** and their success/failure
+edges, walked once either before or after the Run's items are worked.
+_Avoid_: Phase graph without a scope, hook list, pipeline.
+
+**Run definition**:
+The project-owned declaration that combines one required **Item phase graph**
+with optional before-Run and after-Run **Run phase graphs**.
+_Avoid_: workflow, pipeline, full graph.
+
+**Terminal**:
+A destination that ends an Item or Run phase graph. `DONE` completes the current
+scope; `HUMAN` stops autonomous progression and hands that scope to a person.
+_Avoid_: exit, return state.
 
 **Gate**:
-The project-owned quality check run after the implement phase; a non-zero exit
-means the attempt failed and is retried with a handoff.
+The project-owned quality check applied at both item and Run scope. An Item Gate
+failure drives an implement retry; a Run Gate verifies the integrated Run before
+its pull request is opened.
 _Avoid_: check, CI, test step (the gate may *run* tests, but it is not "the tests").
 
 **Setup**:
 The optional project-owned `.pycastle/setup` executable that prepares runtime
-and test dependencies in an issue worktree before its phase graph is walked.
+and test dependencies in a project worktree before phases or a Gate run there.
+It is idempotent and applies at both Item and Run scope.
 
 **Handoff**:
 The document a failed attempt leaves for the next attempt, summarizing what was
 tried and what to fix.
 _Avoid_: note, summary.
 
+**Run report**:
+A project-authored artifact that summarizes the integrated Run for its pull
+request. A Run phase writes its content; PyCastle alone publishes it.
+_Avoid_: PR comment, final review, test report.
+
 ### The pieces
 
 **Project fixture**:
-The `.pycastle/` directory a project owns and PyCastle reads: prompts, the gate,
-the phase graph, the agent Dockerfile, the sandbox marker, and the release marker
-used to verify fixture compatibility before a Run. Scaffolded by `pycastle init`.
+The `.pycastle/` directory a project owns and PyCastle reads: prompts, the Gate,
+the **Run definition**, the agent Dockerfile, the sandbox marker, and the release
+marker used to verify fixture compatibility before a Run. Scaffolded by
+`pycastle init`.
 _Avoid_: config, template, project config.
 
 **Issue source**:
@@ -106,3 +134,9 @@ _Avoid_: credentials mount, secret.
 > **Maintainer:** Then PyCastle runs it as-is and never builds the Dockerfile —
 > but it still has to meet the contract: the `node` user, the **runtime** CLI,
 > and your gate toolchain.
+> **Dev:** Where does an integrated review fit when one **Run** contains several
+> items?
+> **Maintainer:** The **Run definition** wraps the required **Item phase graph**
+> with optional before-Run and after-Run **Run phase graphs**. The after graph can
+> repair the integrated branch and author a **Run report**; PyCastle then applies
+> the Run **Gate** and publishes that report.
