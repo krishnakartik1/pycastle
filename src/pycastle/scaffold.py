@@ -4,8 +4,9 @@ This is the deep module behind ``pycastle init`` (#11): it takes the host-first
 vs Docker-first choice and writes the Project fixture — a Builder-style
 ``main.py``, a ``Dockerfile`` for the agent image, the plan/implement/review
 prompts, default ``setup`` and ``gate`` executables, a ``sandbox`` marker, and a
-``.gitignore`` that excludes run logs and generated run artifacts. The output is
-a file tree, which is what the tests assert.
+release ``version`` marker, plus a ``.gitignore`` that excludes run logs and
+generated run artifacts. The output is a file tree, which is what the tests
+assert.
 
 There is no interactive I/O here: the CLI does the prompting and passes the
 choice in, so this stays a pure-ish function that is trivial to unit-test
@@ -25,6 +26,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Literal
+
+from . import __version__
+from .compatibility import VERSION_MARKER
 
 logger = logging.getLogger("pycastle")
 
@@ -426,6 +430,7 @@ def _fixture_files(
         "gate": _GATE,
         "setup": setup,
         SANDBOX_MARKER: f"{sandbox}\n",
+        VERSION_MARKER: f"{__version__}\n",
         "Dockerfile": _dockerfile(python=python),
         ".gitignore": _GITIGNORE,
         "prompts/plan.md": _PLAN_MD,

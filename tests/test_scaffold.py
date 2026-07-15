@@ -13,9 +13,11 @@ import os
 import shutil
 import stat
 import subprocess
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 from pycastle.graph import DONE, PhaseGraph, load_graph
 from pycastle.scaffold import (
@@ -33,12 +35,21 @@ EXPECTED_TREE = {
     "gate",
     "setup",
     "sandbox",
+    "version",
     "Dockerfile",
     ".gitignore",
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
 }
+
+
+def test_scaffold_records_normalized_installed_version(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+
+    assert (tmp_path / ".pycastle" / "version").read_text() == (
+        f"{Version(version('pycastle'))}\n"
+    )
 
 
 @pytest.mark.parametrize(

@@ -8,8 +8,9 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import sandbox
+from . import __version__, sandbox
 from .commands import run_cmd
+from .compatibility import FixtureCompatibilityError, require_fixture_compatibility
 from .issues import GitHubIssueSource
 from .orchestrator import (
     PruneError,
@@ -38,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pycastle",
         description="A reusable autonomous development loop.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -272,6 +276,9 @@ def _make_run_id() -> str:
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     workspace = Path.cwd()
+    # This is deliberately the first Run operation. In particular, a Docker
+    # image build and all git/gh resolution wait until the fixture is known safe.
+    require_fixture_compatibility(FIXTURE_DIR)
     # Resolve the agent image once, before the run loop, so a missing image is
     # built exactly once rather than per iteration. Resolution is docker-only.
     # The single --sandbox flag drives BOTH the runtime and the gate onto the
@@ -538,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)
             return _cmd_sandbox_setup(args)
-    except (PreflightError, PruneError) as exc:
+    except (FixtureCompatibilityError, PreflightError, PruneError) as exc:
         # Covers both preflight (missing commands) and a failed on-demand image
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)
