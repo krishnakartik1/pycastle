@@ -1046,6 +1046,7 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
         if cwd.name == "issue-2":
             raise RuntimeError("offline")
 
+    runner = _git_aware_runner()
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
@@ -1057,15 +1058,25 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
         iterations=3,
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=runner,
         setup=setup,
     )
 
     assert outcome.completed == [1]
+    assert outcome.skipped == [2, 3]
     assert outcome.stopping_point == "Item #2 infrastructure failure: offline"
     source.release.assert_called_once_with(2)
     assert [call.args[0] for call in source.claim.call_args_list] == [1, 2]
     assert outcome.pr_opened and not outcome.pr_ready
+
+    comment_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    comment = comment_call[comment_call.index("--body") + 1]
+    assert "Completed Items: #1" in comment
+    assert "Skipped Items: #2, #3" in comment
 
 
 @pytest.mark.parametrize(

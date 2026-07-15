@@ -417,6 +417,7 @@ class RunOutcome:
 
     run_id: str
     run_branch: str
+    selected: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
     pr_ready: bool = False
@@ -430,8 +431,9 @@ class RunOutcome:
 
     @property
     def skipped(self) -> list[int]:
-        """Issue numbers worked by this Run but not folded into its branch."""
-        return [o.issue.number for o in self.issues if not o.merged]
+        """Selected issue numbers not folded into the Run branch."""
+        completed = set(self.completed)
+        return [number for number in self.selected if number not in completed]
 
 
 @dataclass
@@ -1418,7 +1420,11 @@ def run_batch(
         )
     )
     run_branch = f"pycastle/run-{run_id}"
-    outcome = RunOutcome(run_id=run_id, run_branch=run_branch)
+    outcome = RunOutcome(
+        run_id=run_id,
+        run_branch=run_branch,
+        selected=[issue.number for issue in selected],
+    )
     if not selected:
         _append_log(fixture_dir, run_id, "No ready issues to work.")
         return outcome
