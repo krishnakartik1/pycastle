@@ -13,6 +13,7 @@ def run_cmd(
     *,
     cwd: Path | None = None,
     capture: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command as text, optionally capturing its output.
 
@@ -25,6 +26,7 @@ def run_cmd(
         capture_output=capture,
         text=True,
         check=False,
+        timeout=timeout,
     )
 
 

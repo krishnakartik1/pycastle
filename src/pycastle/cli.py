@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -24,6 +25,13 @@ from .preflight import (
     PreflightError,
     check_docker_gate_toolchain,
     check_required_commands,
+)
+from .readiness import (
+    DefaultReadinessAdapter,
+    ReadinessConfiguration,
+    evaluate_readiness,
+    render_human,
+    render_json,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import (
@@ -94,6 +102,17 @@ def build_parser() -> argparse.ArgumentParser:
         "build",
         help="Build .pycastle/Dockerfile into its content-addressed agent image",
     )
+
+    doctor_parser = sub.add_parser(
+        "doctor", help="Check one Run configuration without starting a Run"
+    )
+    doctor_parser.add_argument("-i", "--iterations", type=int, default=1)
+    doctor_parser.add_argument("--runtime", choices=RUNTIMES, default="claude")
+    doctor_parser.add_argument("--assignee", default="@me")
+    doctor_parser.add_argument("-u", "--include-unassigned", action="store_true")
+    doctor_parser.add_argument("--sandbox", choices=("host", "docker"), default=None)
+    doctor_parser.add_argument("--image", default=None)
+    doctor_parser.add_argument("--json", action="store_true")
 
     run_parser = sub.add_parser("run", help="Run the autonomous loop")
     run_parser.add_argument(
@@ -297,6 +316,73 @@ def _build_runtime(
 def _make_run_id() -> str:
     """Return a timestamp-based run id for a fresh run."""
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration:
+    """Resolve Doctor/Run inputs once using the shared CLI defaults."""
+    sandbox_kind = _resolve_sandbox(args.sandbox)
+    image: str | None = None
+    if sandbox_kind == "docker":
+        if args.image is not None:
+            if not args.image.strip():
+                raise PreflightError("The --image value is empty.")
+            image = args.image
+        else:
+            dockerfile = FIXTURE_DIR / DOCKERFILE_NAME
+            image = (
+                sandbox.image_tag_for_dockerfile(dockerfile.read_text())
+                if dockerfile.is_file()
+                else sandbox.DEFAULT_IMAGE
+            )
+
+    def resolve(argv: list[str]) -> str:
+        try:
+            result = run_cmd(argv, capture=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return (result.stdout or "").strip()
+
+    repository = resolve(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
+    )
+    base_branch = resolve(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    default_branch = resolve(
+        [
+            "gh",
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ]
+    )
+    assignee = (
+        args.assignee
+        if args.assignee != "@me"
+        else resolve(["gh", "api", "user", "--jq", ".login"])
+    )
+    return ReadinessConfiguration(
+        repository=repository,
+        base_branch=base_branch,
+        github_default_branch=default_branch or None,
+        runtime=args.runtime,
+        sandbox=sandbox_kind,
+        agent_image=image,
+        assignee=assignee,
+        include_unassigned=args.include_unassigned,
+        item_limit=args.iterations,
+    )
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Evaluate and render one non-destructive readiness snapshot."""
+    configuration = _readiness_configuration(args)
+    adapter = DefaultReadinessAdapter(FIXTURE_DIR, Path.cwd())
+    report = evaluate_readiness(configuration, adapter.dependencies())
+    output = render_json(report) if args.json else render_human(report)
+    print(output)
+    return 0 if report.ready else 1
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -577,7 +663,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     required = ["git", "gh"]
-    if args.command == "run":
+    if args.command in {"run", "doctor"}:
         # Resolve the effective sandbox (flag -> .pycastle/sandbox marker ->
         # host) before preflight so the required-command set matches where the
         # run will actually execute. The resolved value is written back onto
@@ -592,7 +678,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "sandbox":
         required.append("docker")
     try:
-        check_required_commands(required)
+        if args.command != "doctor":
+            check_required_commands(required)
+        if args.command == "doctor":
+            return _cmd_doctor(args)
         if args.command == "run":
             return _cmd_run(args)
         if args.command == "init":
@@ -615,4 +704,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)
         return 1
+    except KeyboardInterrupt:
+        return 130
     return 2

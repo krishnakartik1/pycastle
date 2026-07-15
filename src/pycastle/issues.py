@@ -174,6 +174,48 @@ class GitHubIssueSource(IssueSource):
             )
         return issues
 
+    def list_ready_metadata(self, *, timeout: float | None = None) -> list[IssueRef]:
+        """List ready Items without fetching bodies, comments, or other content."""
+        result = self._run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "open",
+                "--label",
+                self.label,
+                "--limit",
+                "100",
+                "--json",
+                "number,title,labels,assignees",
+            ],
+            capture=True,
+            timeout=timeout,
+        )
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return []
+        issues: list[IssueRef] = []
+        for item in json.loads(raw):
+            labels = [
+                label["name"] if isinstance(label, dict) else label
+                for label in item.get("labels", [])
+            ]
+            issues.append(
+                IssueRef(
+                    number=item["number"],
+                    title=item.get("title", ""),
+                    body="",
+                    labels=labels,
+                    assignees=assignee_logins(item),
+                    comments=[],
+                )
+            )
+        return issues
+
     def claim(self, number: int, *, assignee: str) -> None:
         """Assign the issue and drop the ready label so other runs skip it."""
         self._run(
