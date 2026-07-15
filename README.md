@@ -52,6 +52,8 @@ fixture contains all of the project-owned behavior:
 - `.pycastle/Dockerfile` — the agent image recipe, including the project gate
   toolchain for detected Python projects.
 - `.pycastle/sandbox` — the default `host` or `docker` sandbox choice.
+- `.pycastle/version` — the installed PyCastle release that initialized or last
+  migrated the fixture; `run` checks it before starting any Run side effects.
 - `.pycastle/.gitignore` — Run artifacts and runtime scratch files that should
   stay out of version control.
 
@@ -96,6 +98,7 @@ keeps their branches intact.
 
 ## Commands
 
+- `pycastle --version` — print the normalized installed PyCastle release.
 - `pycastle init` — scaffold the `.pycastle/` project fixture described above.
 - `pycastle run -i N --runtime claude` — work up to `N` ready issues; the
   default is one. Use `--include-unassigned` to include unassigned issues.

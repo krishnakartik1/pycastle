@@ -543,16 +543,15 @@ def test_run_host_does_not_preflight_docker_gate_toolchain(
 
 def _write_marker(tmp_path: Path, value: str) -> None:
     """Write ``value`` into a ``.pycastle/sandbox`` marker under ``tmp_path``."""
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir(parents=True, exist_ok=True)
+    fixture = _write_version_marker(tmp_path)
     (fixture / "sandbox").write_text(value)
-    (fixture / "version").write_text("0.1.0\n")
 
 
-def _write_version_marker(tmp_path: Path) -> None:
+def _write_version_marker(tmp_path: Path) -> Path:
     fixture = tmp_path / ".pycastle"
     fixture.mkdir(parents=True, exist_ok=True)
     (fixture / "version").write_text("0.1.0\n")
+    return fixture
 
 
 def _mock_run_externals(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -1067,10 +1066,8 @@ def test_sandbox_setup_tag_matches_build_and_run(
 
 def _write_dockerfile(tmp_path: Path, text: str) -> Path:
     """Write a ``Dockerfile`` into a ``.pycastle/`` fixture under ``tmp_path``."""
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir(parents=True, exist_ok=True)
+    fixture = _write_version_marker(tmp_path)
     (fixture / "Dockerfile").write_text(text)
-    (fixture / "version").write_text("0.1.0\n")
     return fixture
 
 

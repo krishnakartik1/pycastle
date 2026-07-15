@@ -42,8 +42,8 @@ _Avoid_: note, summary.
 
 **Project fixture**:
 The `.pycastle/` directory a project owns and PyCastle reads: prompts, the gate,
-the phase graph, the agent Dockerfile, and the sandbox marker. Scaffolded by
-`pycastle init`.
+the phase graph, the agent Dockerfile, the sandbox marker, and the release marker
+used to verify fixture compatibility before a Run. Scaffolded by `pycastle init`.
 _Avoid_: config, template, project config.
 
 **Issue source**:
