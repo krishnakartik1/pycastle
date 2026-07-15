@@ -7,6 +7,7 @@ import datetime
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from . import __version__, sandbox
 from .commands import run_cmd
@@ -25,7 +26,13 @@ from .preflight import (
     check_required_commands,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
-from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
+from .scaffold import (
+    FixtureExistsError,
+    SandboxChoice,
+    read_sandbox,
+    scaffold_fixture,
+)
+from .upgrade import FixtureUpgradeError, upgrade_fixture
 
 logger = logging.getLogger("pycastle")
 
@@ -45,8 +52,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
-    sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
+    init_parser = sub.add_parser(
+        "init", help="Scaffold a .pycastle/ Project fixture into this repo"
+    )
+    init_parser.add_argument(
+        "--sandbox",
+        choices=("host", "docker"),
+        default=None,
+        help=(
+            "Default Sandbox recorded in the Project fixture. When omitted, "
+            "init prompts; an empty answer or unavailable stdin defaults to host."
+        ),
+    )
+    sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
+    prune_parser = sub.add_parser(
+        "prune", help="Delete run branches whose PRs are no longer open"
+    )
+    prune_parser.add_argument(
+        "--include-no-pr",
+        action="store_true",
+        help="Also delete Run branches with no associated pull request",
+    )
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
     sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
@@ -346,12 +372,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         outcome.completed,
         outcome.pr_opened,
     )
-    return 0 if outcome.pr_opened else 1
+    return 0 if outcome.pr_opened and outcome.succeeded else 1
 
 
-def _cmd_prune() -> int:
+def _cmd_prune(args: argparse.Namespace) -> int:
     """Delete remote Run branches after their pull requests close or merge."""
-    deleted = prune_run_branches(repo=_resolve_repo(), cwd=Path.cwd())
+    deleted = prune_run_branches(
+        repo=_resolve_repo(), cwd=Path.cwd(), include_no_pr=args.include_no_pr
+    )
     if deleted:
         logger.info(
             "Deleted %d stale run branch(es): %s", len(deleted), ", ".join(deleted)
@@ -474,28 +502,38 @@ def _setup_codex(image: str) -> int:
     return 0
 
 
-def _prompt_sandbox() -> str:
+def _prompt_sandbox() -> SandboxChoice:
     """Ask whether execution is host-first or Docker-first; default to host.
 
     The default is host-first because it needs no Docker image build to run the
     scaffolded fixture. An empty answer (Enter) takes the default; ``docker``
-    (or ``d``) picks Docker-first. This interactive prompt is not unit-tested;
-    the scaffolding it drives is.
+    (or ``d``) picks Docker-first. End-of-file is treated like an empty answer
+    so non-interactive callers retain the host default.
     """
-    answer = input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
+    try:
+        answer = (
+            input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
+        )
+    except EOFError:
+        answer = ""
     return "docker" if answer in {"docker", "d"} else "host"
 
 
-def _cmd_init(_args: argparse.Namespace) -> int:
+def _cmd_init(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle init``: scaffold the Project fixture into the cwd.
 
-    Prompts for host-first vs Docker-first, then writes the fixture to match.
-    Refuses to clobber an existing ``.pycastle/`` so a project's prompts, gate,
-    and graph shape are never silently replaced.
+    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts for
+    host-first vs Docker-first when omitted. Refuses to clobber an existing
+    ``.pycastle/`` so a project's prompts, gate, and graph shape are never
+    silently replaced.
     """
-    choice = _prompt_sandbox()
+    choice = (
+        cast(SandboxChoice, args.sandbox)
+        if args.sandbox is not None
+        else _prompt_sandbox()
+    )
     try:
-        written = scaffold_fixture(Path.cwd(), sandbox=choice)  # type: ignore[arg-type]
+        written = scaffold_fixture(Path.cwd(), sandbox=choice)
     except FixtureExistsError as exc:
         logger.error("%s", exc)
         return 1
@@ -510,6 +548,26 @@ def _cmd_init(_args: argparse.Namespace) -> int:
         "Edit .pycastle/prompts/, .pycastle/gate, and .pycastle/main.py to "
         "customize the loop, then run `pycastle run`."
     )
+    return 0
+
+
+def _cmd_upgrade() -> int:
+    """Migrate the Project fixture and leave a reviewable unstaged diff."""
+    result = upgrade_fixture(Path.cwd())
+    if result.changed:
+        detail = ", ".join(result.applied_versions) or "already-corrected targets"
+        logger.info(
+            "Upgraded the Project fixture from %s to %s (migrations: %s).",
+            result.fixture_version,
+            result.runner_version,
+            detail,
+        )
+    else:
+        logger.info(
+            "Project fixture %s is compatible with PyCastle %s; no migration applies.",
+            result.fixture_version,
+            result.runner_version,
+        )
     return 0
 
 
@@ -539,13 +597,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_run(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "upgrade":
+            return _cmd_upgrade()
         if args.command == "prune":
-            return _cmd_prune()
+            return _cmd_prune(args)
         if args.command == "sandbox":
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)
             return _cmd_sandbox_setup(args)
-    except (FixtureCompatibilityError, PreflightError, PruneError) as exc:
+    except (
+        FixtureCompatibilityError,
+        FixtureUpgradeError,
+        PreflightError,
+        PruneError,
+    ) as exc:
         # Covers both preflight (missing commands) and a failed on-demand image
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)

@@ -31,7 +31,8 @@ import json
 import logging
 import re
 import signal
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,16 @@ from typing import Any
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
-from .graph import HUMAN, GraphExecutor, Phase, PhaseResult, WalkResult, load_graph
+from .graph import (
+    HUMAN,
+    GraphExecutor,
+    Phase,
+    PhaseGraph,
+    PhaseResult,
+    RunDefinition,
+    WalkResult,
+    load_run,
+)
 from .issues import IssueSource, select_batch
 from .models import IssueRef
 from .runtime import AgentCrashError, CodexRuntime, Runtime
@@ -73,15 +83,23 @@ class PruneError(RuntimeError):
     """Run-branch discovery or deletion failed, making pruning unsafe."""
 
 
+class RunCheckpointError(RuntimeError):
+    """A successful Run phase could not be committed durably."""
+
+
 def prune_run_branches(
     *,
     repo: str,
     cwd: Path,
+    include_no_pr: bool = False,
     runner: Runner = run_cmd,
 ) -> list[str]:
-    """Delete remote run branches whose pull requests are no longer open.
+    """Delete remote Run branches whose pull requests are no longer open.
 
-    The open PR heads are resolved before any remote branches are considered.
+    Pull-request history is resolved before any remote branches are considered.
+    Branches with no associated pull request are recovery artifacts and are
+    retained unless ``include_no_pr`` is true. Branches with an open pull
+    request are always retained.
     If either discovery call fails, pruning stops without deleting anything so
     an unavailable GitHub API can never make an open PR branch look stale.
     """
@@ -93,11 +111,11 @@ def prune_run_branches(
             "-R",
             repo,
             "--state",
-            "open",
+            "all",
             "--limit",
             "10000",
             "--json",
-            "headRefName",
+            "headRefName,state",
         ],
         capture=True,
     )
@@ -113,12 +131,14 @@ def prune_run_branches(
         not isinstance(pr, dict)
         or not isinstance(pr.get("headRefName"), str)
         or not pr["headRefName"]
+        or pr.get("state") not in {"OPEN", "CLOSED", "MERGED"}
         for pr in pr_data
     ):
         raise PruneError(
             "Could not parse open pull requests; no branches were deleted."
         )
-    open_heads = {pr["headRefName"] for pr in pr_data}
+    associated_heads = {pr["headRefName"] for pr in pr_data}
+    open_heads = {pr["headRefName"] for pr in pr_data if pr.get("state") == "OPEN"}
 
     refs = runner(
         ["git", "ls-remote", "--heads", "origin", "refs/heads/pycastle/run-*"],
@@ -139,14 +159,27 @@ def prune_run_branches(
 
     ref_prefix = "refs/heads/pycastle/run-"
     remote_branches: list[str] = []
+    seen_branches: set[str] = set()
     for line in ref_lines:
         fields = line.split("\t")
-        if len(fields) != 2 or not fields[0] or not fields[1].startswith(ref_prefix):
+        branch = fields[1].removeprefix("refs/heads/") if len(fields) == 2 else ""
+        if (
+            len(fields) != 2
+            or not fields[0]
+            or fields[1] == ref_prefix
+            or not fields[1].startswith(ref_prefix)
+            or branch in seen_branches
+        ):
             raise PruneError(
                 "Could not parse remote run branches; no branches were deleted."
             )
-        remote_branches.append(fields[1].removeprefix("refs/heads/"))
-    stale = [branch for branch in remote_branches if branch not in open_heads]
+        remote_branches.append(branch)
+        seen_branches.add(branch)
+    stale = [
+        branch
+        for branch in remote_branches
+        if branch not in open_heads and (branch in associated_heads or include_no_pr)
+    ]
     deleted: list[str] = []
     for branch in stale:
         result = runner(
@@ -190,6 +223,9 @@ class GateOutcome:
 
     passed: bool
     output: str
+    exit_code: int = 0
+    duration_seconds: float = 0.0
+    command: str = ".pycastle/gate"
 
 
 def _gates_always_pass(_worktree: Path) -> GateOutcome:
@@ -272,7 +308,8 @@ def _gate_outcome_from_result(result: Any) -> GateOutcome:
     output = (getattr(result, "stdout", "") or "") + (
         getattr(result, "stderr", "") or ""
     )
-    return GateOutcome(passed=getattr(result, "returncode", 1) == 0, output=output)
+    exit_code = getattr(result, "returncode", 1)
+    return GateOutcome(passed=exit_code == 0, output=output, exit_code=exit_code)
 
 
 def make_fixture_gate_check(
@@ -329,6 +366,7 @@ def make_fixture_gate_check(
     def _check(worktree: Path) -> GateOutcome:
         if not gate_path.is_file():
             return GateOutcome(passed=True, output="")
+        started = time.monotonic()
         try:
             if sandbox == "docker":
                 # Wrap the canonical gate through the same docker wrapper the
@@ -352,9 +390,14 @@ def make_fixture_gate_check(
             # aborting the whole batch.
             logger.exception("Could not run quality gate %s", gate_path)
             return GateOutcome(
-                passed=False, output=f"gate could not be launched: {exc}"
+                passed=False,
+                output=f"gate could not be launched: {exc}",
+                exit_code=126,
+                duration_seconds=time.monotonic() - started,
             )
-        return _gate_outcome_from_result(result)
+        outcome = _gate_outcome_from_result(result)
+        outcome.duration_seconds = time.monotonic() - started
+        return outcome
 
     return _check
 
@@ -376,11 +419,35 @@ class RunOutcome:
     run_branch: str
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
+    pr_ready: bool = False
+    succeeded: bool = True
+    stopping_point: str | None = None
 
     @property
     def completed(self) -> list[int]:
         """Issue numbers that merged cleanly into the run branch."""
         return [o.issue.number for o in self.issues if o.merged]
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """Host-side identity and command boundary for one active Run worktree."""
+
+    run_id: str
+    branch: str
+    worktree: Path
+    fixture_dir: Path
+    runner: Runner
+
+
+@dataclass(frozen=True)
+class PublicationOutcome:
+    """Named outcomes from final push and pull-request publication."""
+
+    pr_opened: bool = False
+    report_published: bool = False
+    pr_ready: bool = False
+    final_push_succeeded: bool = False
 
 
 def slugify(title: str, *, max_words: int = 6) -> str:
@@ -583,11 +650,8 @@ def _cleanup_interrupted(
     issue: IssueRef,
     issue_source: IssueSource,
     worktree_root: Path,
-    run_worktree: Path,
     workspace: Path,
-    fixture_dir: Path,
-    run_id: str,
-    runner: Runner,
+    run: RunContext,
 ) -> None:
     """Tear down an interrupted run: remove worktrees, restore the ready state.
 
@@ -599,9 +663,9 @@ def _cleanup_interrupted(
     each step is guarded and logged rather than allowed to mask the interrupt.
     """
     issue_worktree = worktree_root / f"issue-{issue.number}"
-    for worktree in (issue_worktree, run_worktree):
+    for worktree in (issue_worktree, run.worktree):
         try:
-            cleanup_worktree(worktree, runner=runner, cwd=workspace)
+            cleanup_worktree(worktree, runner=run.runner, cwd=workspace)
         except Exception:  # noqa: BLE001 - best-effort teardown, never re-raise here
             logger.exception("Failed to remove worktree %s during interrupt", worktree)
     try:
@@ -609,8 +673,8 @@ def _cleanup_interrupted(
     except Exception:  # noqa: BLE001 - best-effort restore, never mask the interrupt
         logger.exception("Failed to restore ready state on #%s", issue.number)
     _append_log(
-        fixture_dir,
-        run_id,
+        run.fixture_dir,
+        run.run_id,
         f"Run interrupted while working #{issue.number}; "
         "worktrees removed and issue released to ready-for-agent.",
     )
@@ -819,6 +883,7 @@ def _walk_issue(
     gate_check: GateCheck,
     gate_sink: Callable[[str, str, str], None],
     verbose: bool,
+    graph: PhaseGraph,
 ) -> WalkResult:
     """Walk the issue's phase graph, with the implement node under #8's retry.
 
@@ -831,7 +896,6 @@ def _walk_issue(
     a terminal — :data:`~pycastle.graph.DONE` (proceed to commit + merge) or
     :data:`~pycastle.graph.HUMAN` (hand the issue to a person).
     """
-    graph = load_graph(fixture_dir)
     executor = GraphExecutor(
         runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
     )
@@ -876,17 +940,14 @@ def _work_issue(
     *,
     runtime: Runtime,
     issue_source: IssueSource,
-    fixture_dir: Path,
-    run_id: str,
-    run_branch: str,
-    run_worktree: Path,
+    run: RunContext,
     worktree_root: Path,
     assignee: str,
     workspace: Path,
-    runner: Runner,
     impl_retries: int,
     gate_check: GateCheck,
     setup: Setup,
+    item_graph: PhaseGraph,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
@@ -910,6 +971,10 @@ def _work_issue(
     ``ready-for-human`` (#9) so a person resolves the conflict while the run
     carries on with the remaining items.
     """
+    fixture_dir = run.fixture_dir
+    run_id = run.run_id
+    run_branch = run.branch
+    runner = run.runner
     branch = issue_branch_name(issue)
     issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
@@ -952,6 +1017,7 @@ def _work_issue(
         gate_check=gate_check,
         gate_sink=gate_sink,
         verbose=verbose,
+        graph=item_graph,
     )
     if walk.results:
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
@@ -992,9 +1058,7 @@ def _work_issue(
         cwd=issue_worktree,
     )
 
-    if _branch_has_no_diff(
-        branch, run_branch=run_branch, run_worktree=run_worktree, runner=runner
-    ):
+    if _branch_has_no_diff(branch, run=run):
         # The walk reached DONE but the phase produced no change (e.g. a runtime
         # that silently no-ops): the issue branch equals the run branch, so a
         # merge would be a clean no-op and report a phantom success with no PR.
@@ -1012,10 +1076,7 @@ def _work_issue(
     merged = _merge_issue_branch(
         branch,
         issue=issue,
-        fixture_dir=fixture_dir,
-        run_id=run_id,
-        run_worktree=run_worktree,
-        runner=runner,
+        run=run,
     )
     if not merged:
         # The merge conflicted and was aborted (#9): hand the issue to a human so
@@ -1026,6 +1087,10 @@ def _work_issue(
             run_id,
             f"#{issue.number} did not merge cleanly; marked ready-for-human.",
         )
+    else:
+        # The merge is the durability boundary: push it before cleaning up the
+        # item worktree so the remote checkpoint follows the fold immediately.
+        _push_run_branch(run=run, final=False)
 
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
@@ -1035,9 +1100,7 @@ def _work_issue(
 def _branch_has_no_diff(
     branch: str,
     *,
-    run_branch: str,
-    run_worktree: Path,
-    runner: Runner,
+    run: RunContext,
 ) -> bool:
     """Whether the issue branch introduced no change over the run branch.
 
@@ -1049,10 +1112,10 @@ def _branch_has_no_diff(
     resolve both branch refs. It stays git-only and does not touch the Issue
     source.
     """
-    diff = runner(
-        ["git", "diff", "--quiet", run_branch, branch],
+    diff = run.runner(
+        ["git", "diff", "--quiet", run.branch, branch],
         capture=True,
-        cwd=run_worktree,
+        cwd=run.worktree,
     )
     return getattr(diff, "returncode", 1) == 0
 
@@ -1061,10 +1124,7 @@ def _merge_issue_branch(
     branch: str,
     *,
     issue: IssueRef,
-    fixture_dir: Path,
-    run_id: str,
-    run_worktree: Path,
-    runner: Runner,
+    run: RunContext,
 ) -> bool:
     """Merge an issue branch into the run worktree; return True on a clean merge.
 
@@ -1073,24 +1133,158 @@ def _merge_issue_branch(
     labels a skipped issue ``ready-for-human`` (#9); this stays git-only and does
     not touch the Issue source.
     """
-    merge = runner(
+    merge = run.runner(
         ["git", "merge", branch, "--no-edit"],
         capture=True,
-        cwd=run_worktree,
+        cwd=run.worktree,
     )
     if getattr(merge, "returncode", 1) == 0:
-        _append_log(fixture_dir, run_id, f"Merged #{issue.number} into {run_id}")
+        _append_log(
+            run.fixture_dir,
+            run.run_id,
+            f"Merged #{issue.number} into {run.run_id}",
+        )
         return True
 
     # A conflicting merge is aborted and the issue skipped; the caller marks it
     # ready-for-human so a person resolves the conflict (#9).
     _append_log(
-        fixture_dir,
-        run_id,
+        run.fixture_dir,
+        run.run_id,
         f"Merge of #{issue.number} did not apply cleanly; skipping for a human.",
     )
-    runner(["git", "merge", "--abort"], capture=True, cwd=run_worktree)
+    run.runner(["git", "merge", "--abort"], capture=True, cwd=run.worktree)
     return False
+
+
+RUN_REPORT = ".pycastle/run-report.md"
+RUN_REVIEW = ".pycastle/run-review.md"
+RUN_REPORT_LIMIT = 65_536
+
+
+def render_run_context(
+    run_id: str, selected: Sequence[IssueRef], outcomes: Sequence[IssueOutcome]
+) -> str:
+    """Render the bounded factual envelope supplied to each Run phase."""
+    outcome_by_number = {o.issue.number: o for o in outcomes}
+    rows = []
+    for issue in selected:
+        outcome = outcome_by_number.get(issue.number)
+        state = (
+            "pending"
+            if outcome is None
+            else ("completed" if outcome.merged else "skipped")
+        )
+        rows.append(f"- #{issue.number}: {issue.title} [{state}]")
+    return f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+
+
+def _checkpoint_run_phase(
+    phase: Phase,
+    *,
+    run: RunContext,
+) -> None:
+    """Commit a successful Run phase when dirty and attempt a durability push."""
+    try:
+        staged = run.runner(
+            [
+                "git",
+                "add",
+                "-A",
+                "--",
+                ".",
+                f":(exclude,top){RUN_REVIEW}",
+                f":(exclude,top){RUN_REPORT}",
+            ],
+            capture=True,
+            cwd=run.worktree,
+        )
+        if getattr(staged, "returncode", 1) != 0:
+            raise RunCheckpointError(f"git add failed for {phase.name}")
+
+        dirty = run.runner(
+            ["git", "diff", "--cached", "--quiet"],
+            capture=True,
+            cwd=run.worktree,
+        )
+        dirty_code = getattr(dirty, "returncode", 2)
+        if dirty_code not in (0, 1):
+            raise RunCheckpointError(f"staged diff inspection failed for {phase.name}")
+        if dirty_code == 1:
+            committed = run.runner(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    f"chore: checkpoint Run phase {phase.name}",
+                ],
+                capture=True,
+                cwd=run.worktree,
+            )
+            if getattr(committed, "returncode", 1) != 0:
+                raise RunCheckpointError(f"git commit failed for {phase.name}")
+    except OSError as exc:
+        raise RunCheckpointError(f"checkpoint failed for {phase.name}: {exc}") from exc
+
+    _push_run_branch(run=run, final=False)
+
+
+def _walk_run_graph(
+    graph: PhaseGraph,
+    *,
+    runtime: Runtime,
+    run: RunContext,
+    context: str,
+) -> WalkResult:
+    """Walk one Run phase graph, checkpointing each successful visit."""
+    executor = GraphExecutor(runtime, fixture_dir=run.fixture_dir, preamble=context)
+    default = executor._default_runner(run.worktree)
+
+    def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        passed, results = default(phase, extra)
+        if passed:
+            _checkpoint_run_phase(phase, run=run)
+        else:
+            run.runner(
+                ["git", "reset", "--hard", "HEAD"],
+                capture=True,
+                cwd=run.worktree,
+            )
+            run.runner(["git", "clean", "-fd"], capture=True, cwd=run.worktree)
+            run.runner(
+                ["git", "clean", "-fdX", "--", RUN_REVIEW, RUN_REPORT],
+                capture=True,
+                cwd=run.worktree,
+            )
+        return passed, results
+
+    return executor.execute(graph, cwd=run.worktree, phase_runner=run_phase)
+
+
+def _harvest_report(run: RunContext) -> tuple[str | None, str | None]:
+    """Retain and validate the optional authored Run report without truncation."""
+    source = run.worktree / RUN_REPORT
+    if source.is_symlink():
+        return None, "Run report must be a regular file."
+    if not source.exists():
+        return None, None
+    if not source.is_file():
+        return None, "Run report must be a regular file."
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        return None, f"Run report could not be read: {exc}."
+    retained = _telemetry_dir(run.fixture_dir, run.run_id) / "run-report.md"
+    retained.write_bytes(raw)
+    if len(raw) > RUN_REPORT_LIMIT:
+        return (
+            None,
+            f"Run report exceeds the {RUN_REPORT_LIMIT}-byte publication limit.",
+        )
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "Run report is not valid UTF-8."
 
 
 def run_batch(
@@ -1145,12 +1339,23 @@ def run_batch(
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
 
+    # Import once: Runtime edits to the fixture are proposed changes and cannot
+    # rewrite the active Run definition or weaken its graphs.
+    run_definition: RunDefinition = load_run(fixture_dir)
+
     issues = issue_source.list_ready()
-    selected = select_batch(
-        issues,
-        assignee=assignee,
-        include_unassigned=include_unassigned,
-        limit=iterations,
+    # Snapshot the ordered selection before any project-owned Run phase executes.
+    # A tuple of deep copies makes the lifecycle invariant explicit: fixture
+    # edits, Issue source changes, and in-process Runtime behavior cannot mutate,
+    # add, remove, or reorder the active batch after selection.
+    selected = tuple(
+        issue.model_copy(deep=True)
+        for issue in select_batch(
+            issues,
+            assignee=assignee,
+            include_unassigned=include_unassigned,
+            limit=iterations,
+        )
     )
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(run_id=run_id, run_branch=run_branch)
@@ -1164,11 +1369,54 @@ def run_batch(
     # A failed run-worktree add is fatal: no issue can be worked without it, so
     # raise rather than silently drive the batch against a missing directory (#64).
     add_worktree(run_worktree, run_branch, runner=runner, cwd=workspace)
+    run = RunContext(
+        run_id=run_id,
+        branch=run_branch,
+        worktree=run_worktree,
+        fixture_dir=fixture_dir,
+        runner=runner,
+    )
     _append_log(
         fixture_dir,
         run_id,
         f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
     )
+
+    try:
+        setup(run_worktree)
+        if run_definition.before is not None:
+            before = _walk_run_graph(
+                run_definition.before,
+                runtime=runtime,
+                run=run,
+                context=render_run_context(run_id, selected, []),
+            )
+        else:
+            before = None
+    except KeyboardInterrupt:
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _append_log(
+            fixture_dir,
+            run_id,
+            f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+        )
+        raise
+    except SetupError as exc:
+        outcome.succeeded = False
+        outcome.stopping_point = f"before-Run Setup: {exc}"
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        return outcome
+    except RunCheckpointError as exc:
+        outcome.succeeded = False
+        outcome.stopping_point = f"before-Run checkpoint: {exc}"
+        _append_log(fixture_dir, run_id, outcome.stopping_point)
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        return outcome
+    if before is not None and before.terminal is HUMAN:
+        outcome.succeeded = False
+        outcome.stopping_point = "before-Run HUMAN"
+        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        return outcome
 
     # Track the issue currently in flight so an interrupt (SIGINT) or any
     # exception mid-issue can clean up that issue's worktree and restore its
@@ -1178,25 +1426,40 @@ def run_batch(
         try:
             for issue in selected:
                 in_flight = issue
-                outcome.issues.append(
-                    _work_issue(
+                try:
+                    item_outcome = _work_issue(
                         issue,
                         runtime=runtime,
                         issue_source=issue_source,
-                        fixture_dir=fixture_dir,
-                        run_id=run_id,
-                        run_branch=run_branch,
-                        run_worktree=run_worktree,
+                        run=run,
                         worktree_root=worktree_root,
                         assignee=assignee,
                         workspace=workspace,
-                        runner=runner,
                         impl_retries=impl_retries,
                         gate_check=gate_check,
                         setup=setup,
+                        item_graph=run_definition.item,
                         verbose=verbose,
                     )
-                )
+                except Exception as exc:  # handled infrastructure boundary
+                    cleanup_worktree(
+                        worktree_root / f"issue-{issue.number}",
+                        runner=runner,
+                        cwd=workspace,
+                    )
+                    issue_source.release(issue.number)
+                    if not outcome.completed:
+                        in_flight = None
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        raise
+                    outcome.succeeded = False
+                    outcome.stopping_point = (
+                        f"Item #{issue.number} infrastructure failure: {exc}"
+                    )
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    in_flight = None
+                    break
+                outcome.issues.append(item_outcome)
                 in_flight = None
         except BaseException:
             # An interrupt or unexpected error mid-issue: leave no orphaned
@@ -1207,26 +1470,84 @@ def run_batch(
                     issue=in_flight,
                     issue_source=issue_source,
                     worktree_root=worktree_root,
-                    run_worktree=run_worktree,
                     workspace=workspace,
-                    fixture_dir=fixture_dir,
-                    run_id=run_id,
-                    runner=runner,
+                    run=run,
                 )
             raise
 
     completed = outcome.completed
     if completed:
-        outcome.pr_opened = _open_pull_request(
+        run_gate: GateOutcome | None = None
+        publication_error: str | None = None
+        try:
+            if outcome.succeeded:
+                setup(run_worktree)
+                if run_definition.after is not None:
+                    after = _walk_run_graph(
+                        run_definition.after,
+                        runtime=runtime,
+                        run=run,
+                        context=render_run_context(run_id, selected, outcome.issues),
+                    )
+                    if after.terminal is HUMAN:
+                        outcome.succeeded = False
+                        outcome.stopping_point = "after-Run HUMAN"
+                run_gate = gate_check(run_worktree)
+                (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
+                    run_gate.output
+                )
+                if not run_gate.passed:
+                    outcome.succeeded = False
+                    outcome.stopping_point = "Run Gate"
+        except SetupError as exc:
+            if outcome.succeeded:
+                outcome.succeeded = False
+                outcome.stopping_point = "after-Run Setup"
+            _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
+        except RunCheckpointError as exc:
+            outcome.succeeded = False
+            outcome.stopping_point = f"after-Run checkpoint: {exc}"
+            _append_log(fixture_dir, run_id, outcome.stopping_point)
+        except KeyboardInterrupt:
+            cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+            _append_log(
+                fixture_dir,
+                run_id,
+                f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+            )
+            raise
+        report, report_error = _harvest_report(run)
+        if report_error:
+            outcome.succeeded = False
+            outcome.stopping_point = "Run report validation"
+            publication_error = report_error
+        publication = _open_pull_request(
             repo=repo,
             base_branch=base_branch,
-            run_branch=run_branch,
-            run_id=run_id,
+            run=run,
             completed=completed,
-            run_worktree=run_worktree,
-            fixture_dir=fixture_dir,
-            runner=runner,
+            selected=selected,
+            skipped=[o.issue.number for o in outcome.issues if not o.merged],
+            gate=run_gate,
+            report=report,
+            publication_error=publication_error,
+            successful=outcome.succeeded,
+            stopping_point=outcome.stopping_point,
         )
+        outcome.pr_opened = publication.pr_opened
+        outcome.pr_ready = publication.pr_ready
+        if not publication.final_push_succeeded:
+            outcome.succeeded = False
+            outcome.stopping_point = "Final push"
+        elif not publication.pr_opened:
+            outcome.succeeded = False
+            outcome.stopping_point = "Pull request publication"
+        elif outcome.succeeded and not publication.report_published:
+            outcome.succeeded = False
+            outcome.stopping_point = "Run report publication"
+        elif outcome.succeeded and not outcome.pr_ready:
+            outcome.succeeded = False
+            outcome.stopping_point = "Pull request ready transition"
     else:
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
@@ -1238,50 +1559,290 @@ def _open_pull_request(
     *,
     repo: str,
     base_branch: str,
-    run_branch: str,
-    run_id: str,
+    run: RunContext,
     completed: list[int],
-    run_worktree: Path,
-    fixture_dir: Path,
-    runner: Runner,
-) -> bool:
-    """Push the run branch and open one pull request closing every merged issue.
-
-    The body carries a ``- Closes #N`` line per completed issue so merging the
-    single run PR closes the whole batch.
-    """
-    runner(
-        ["git", "push", "-u", "origin", run_branch],
-        capture=True,
-        cwd=run_worktree,
-    )
+    selected: Sequence[IssueRef],
+    skipped: list[int],
+    gate: GateOutcome | None,
+    report: str | None,
+    publication_error: str | None,
+    successful: bool,
+    stopping_point: str | None,
+) -> PublicationOutcome:
+    """Final-push, draft-create, report, then ready a successful Run PR."""
+    if not _push_run_branch(run=run, final=True):
+        return PublicationOutcome()
     closes = "\n".join(f"- Closes #{number}" for number in completed)
     body = (
-        f"Automated PyCastle run {run_id} completing {len(completed)} issue(s).\n\n"
+        f"Automated PyCastle run {run.run_id} completing {len(completed)} issue(s).\n\n"
         f"{closes}\n"
     )
-    pr = runner(
-        [
-            "gh",
-            "pr",
-            "create",
-            "-R",
-            repo,
-            "--base",
-            base_branch,
-            "--head",
-            run_branch,
-            "--title",
-            f"pycastle: run {run_id}",
-            "--body",
-            body,
-        ],
-        capture=True,
-    )
+    try:
+        existing = run.runner(
+            [
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                repo,
+                "--head",
+                run.branch,
+                "--state",
+                "open",
+                "--json",
+                "number",
+            ],
+            capture=True,
+        )
+    except OSError as exc:
+        _append_log(
+            run.fixture_dir,
+            run.run_id,
+            f"Pull request lookup failed ({exc}); refusing to create a possible duplicate.",
+        )
+        return PublicationOutcome(final_push_succeeded=True)
+    if getattr(existing, "returncode", 1) != 0:
+        _append_log(
+            run.fixture_dir,
+            run.run_id,
+            "Pull request lookup failed; refusing to create a possible duplicate.",
+        )
+        return PublicationOutcome(final_push_succeeded=True)
+    pr_number: int | None = None
+    try:
+        raw_rows = getattr(existing, "stdout", None)
+        if not isinstance(raw_rows, str) or not raw_rows.strip():
+            raise TypeError
+        rows = json.loads(raw_rows)
+        if not isinstance(rows, list):
+            raise TypeError
+        if rows:
+            pr_number = int(rows[0]["number"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        _append_log(
+            run.fixture_dir,
+            run.run_id,
+            "Pull request lookup returned invalid data; refusing to create a possible duplicate.",
+        )
+        return PublicationOutcome(final_push_succeeded=True)
+    pr = existing
+    if pr_number is None:
+        pr = run.runner(
+            [
+                "gh",
+                "pr",
+                "create",
+                "-R",
+                repo,
+                "--base",
+                base_branch,
+                "--head",
+                run.branch,
+                "--title",
+                f"pycastle: run {run.run_id}",
+                "--body",
+                body,
+                "--draft",
+            ],
+            capture=True,
+        )
     opened = getattr(pr, "returncode", 1) == 0
     _append_log(
-        fixture_dir,
-        run_id,
-        f"Pull request {'opened' if opened else 'failed'} for {run_branch}",
+        run.fixture_dir,
+        run.run_id,
+        f"Pull request {'opened' if opened else 'failed'} for {run.branch}",
     )
-    return opened
+    if not opened:
+        return PublicationOutcome(final_push_succeeded=True)
+
+    if pr_number is None:
+        view = run.runner(
+            [
+                "gh",
+                "pr",
+                "view",
+                run.branch,
+                "-R",
+                repo,
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            capture=True,
+        )
+        try:
+            if getattr(view, "returncode", 1) != 0:
+                raise ValueError
+            pr_number = int((getattr(view, "stdout", "") or "").strip())
+        except ValueError:
+            pr_number = None
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                "Pull request number lookup failed; publishing by branch.",
+            )
+
+    state = "complete" if successful else "draft"
+    gate_line = "not run"
+    if gate is not None:
+        gate_line = (
+            f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
+            f"(exit {gate.exit_code}, {gate.duration_seconds:.2f}s)"
+        )
+    selected_numbers = [issue.number for issue in selected]
+    marker = f"<!-- pycastle-run-report:{run.run_id} -->"
+    comment = (
+        f"{marker}\n## PyCastle Run {run.run_id}\n\n"
+        f"- State: **{state}**\n"
+        f"- Selected Items: {', '.join(f'#{n}' for n in selected_numbers) or 'none'}\n"
+        f"- Completed Items: {', '.join(f'#{n}' for n in completed) or 'none'}\n"
+        f"- Skipped Items: {', '.join(f'#{n}' for n in skipped) or 'none'}\n"
+        f"- Run Gate: {gate_line}\n"
+    )
+    if stopping_point:
+        comment += f"- Stopping point: {stopping_point}\n"
+    if publication_error:
+        comment += f"\n> Run report validation error: {publication_error}\n"
+    elif report is not None:
+        comment += "\n---\n\n" + report
+
+    comment_argv = [
+        "gh",
+        "pr",
+        "comment",
+        str(pr_number or run.branch),
+        "-R",
+        repo,
+        "--body",
+        comment,
+    ]
+    if pr_number is not None:
+        try:
+            listed = run.runner(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo}/issues/{pr_number}/comments",
+                    "--paginate",
+                ],
+                capture=True,
+            )
+        except OSError as exc:
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                f"Run report lookup failed ({exc}); PR remains draft.",
+            )
+            return PublicationOutcome(
+                pr_opened=True,
+                final_push_succeeded=True,
+            )
+        if getattr(listed, "returncode", 1) != 0:
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                "Run report lookup failed; PR remains draft.",
+            )
+            return PublicationOutcome(
+                pr_opened=True,
+                final_push_succeeded=True,
+            )
+        comment_id: int | None = None
+        try:
+            raw_comments = getattr(listed, "stdout", None)
+            if not isinstance(raw_comments, str) or not raw_comments.strip():
+                raise TypeError
+            comments = json.loads(raw_comments)
+            if not isinstance(comments, list):
+                raise TypeError
+            for candidate in comments:
+                if not isinstance(candidate, dict):
+                    raise TypeError
+                if marker in candidate.get("body", ""):
+                    comment_id = int(candidate["id"])
+                    break
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                "Run report lookup returned invalid data; PR remains draft.",
+            )
+            return PublicationOutcome(
+                pr_opened=True,
+                final_push_succeeded=True,
+            )
+        endpoint = (
+            f"repos/{repo}/issues/comments/{comment_id}"
+            if comment_id is not None
+            else f"repos/{repo}/issues/{pr_number}/comments"
+        )
+        method = "PATCH" if comment_id is not None else "POST"
+        comment_argv = [
+            "gh",
+            "api",
+            "--method",
+            method,
+            endpoint,
+            "-f",
+            f"body={comment}",
+        ]
+    published = run.runner(comment_argv, capture=True)
+    if getattr(published, "returncode", 1) != 0:
+        _append_log(
+            run.fixture_dir,
+            run.run_id,
+            "Run report publication failed; PR remains draft.",
+        )
+        return PublicationOutcome(pr_opened=True, final_push_succeeded=True)
+    ready_succeeded = False
+    if successful:
+        ready = run.runner(
+            ["gh", "pr", "ready", str(pr_number or run.branch), "-R", repo],
+            capture=True,
+        )
+        if getattr(ready, "returncode", 1) != 0:
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                "Ready transition failed; PR remains draft.",
+            )
+        else:
+            ready_succeeded = True
+    return PublicationOutcome(
+        pr_opened=True,
+        report_published=True,
+        pr_ready=ready_succeeded,
+        final_push_succeeded=True,
+    )
+
+
+def _push_run_branch(
+    *,
+    run: RunContext,
+    final: bool,
+) -> bool:
+    """Push the current Run checkpoint, logging failures without raising."""
+    try:
+        result = run.runner(
+            ["git", "push", "-u", "origin", run.branch],
+            capture=True,
+            cwd=run.worktree,
+        )
+        succeeded = getattr(result, "returncode", 1) == 0
+    except OSError as exc:
+        succeeded = False
+        logger.warning("Could not push Run branch %s: %s", run.branch, exc)
+
+    if succeeded:
+        _append_log(run.fixture_dir, run.run_id, f"Pushed Run checkpoint {run.branch}")
+        return True
+
+    kind = "Final" if final else "Durability"
+    _append_log(
+        run.fixture_dir,
+        run.run_id,
+        f"{kind} push failed for {run.branch}; remote checkpoint was not updated.",
+    )
+    logger.warning("%s push failed for Run branch %s", kind, run.branch)
+    return False

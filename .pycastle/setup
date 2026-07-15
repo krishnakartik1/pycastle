@@ -3,4 +3,5 @@
 set -euo pipefail
 python3 -m venv --system-site-packages .pycastle/venv
 source .pycastle/venv/bin/activate
-pip install -e ".[dev]" || pip install -e .
+export UV_PROJECT_ENVIRONMENT=.pycastle/venv
+uv sync --all-extras

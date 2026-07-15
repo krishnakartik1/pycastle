@@ -21,7 +21,9 @@ from pycastle.graph import (
     PhaseGraph,
     PhaseResult,
     build,
+    build_run,
     load_graph,
+    load_run,
     phase,
 )
 from pycastle.models import RuntimeResult, Telemetry
@@ -86,6 +88,29 @@ def test_builder_assembles_phases_keyed_by_name_with_explicit_start() -> None:
     assert list(built.phases) == ["plan", "do"]
     assert built.phases["plan"].on_success == "do"
     assert built.phases["do"].on_success is DONE
+
+
+def test_run_definition_requires_item_and_allows_optional_run_graphs() -> None:
+    item = build(start="item", phases=[phase("item", "item.md")])
+    after = build(start="report", phases=[phase("report", "report.md")])
+
+    definition = build_run(item=item, after=after)
+
+    assert definition.item is item
+    assert definition.before is None
+    assert definition.after is after
+
+
+def test_load_run_rejects_the_superseded_standalone_graph(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, phase\n"
+        "graph = build(start='item', phases=[phase('item', 'item.md')])\n"
+    )
+
+    with pytest.raises(TypeError, match="module-level `run` RunDefinition"):
+        load_run(fixture)
 
 
 def test_phase_edges_default_to_terminals() -> None:
