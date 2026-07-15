@@ -31,3 +31,16 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
 
     assert "ready-for-agent" in readme
     assert "gh issue edit" in readme
+
+
+def test_readme_documents_codex_host_black_workaround() -> None:
+    readme = README.read_text()
+    prose = " ".join(readme.split())
+
+    assert "Codex Runtime with the host Sandbox" in prose
+    assert "black --check ." in readme
+    assert "--sandbox docker" in readme
+    assert "one file per Black process" in prose
+    assert "--workers 1" in readme
+    assert "does not avoid the hang" in prose
+    assert "Gate remains authoritative" in prose
