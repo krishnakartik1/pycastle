@@ -147,6 +147,8 @@ class GitHubIssueSource(IssueSource):
             ],
             **options,
         )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub ready-Item listing failed")
         raw = (result.stdout or "").strip()
         if not raw:
             return []
@@ -198,6 +200,8 @@ class GitHubIssueSource(IssueSource):
             capture=True,
             timeout=timeout,
         )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub ready-Item metadata listing failed")
         raw = (result.stdout or "").strip()
         if not raw:
             return []

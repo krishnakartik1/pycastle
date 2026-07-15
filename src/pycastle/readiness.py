@@ -606,6 +606,17 @@ class DefaultReadinessAdapter:
         )
 
     def check_base_branch(self, config: ReadinessConfiguration) -> CheckResult:
+        facts = {
+            "selected": config.base_branch,
+            "github_default": config.github_default_branch,
+        }
+        if not config.github_default_branch:
+            return CheckResult(
+                Status.FAIL,
+                "GitHub default base branch could not be resolved.",
+                facts,
+                "Verify GitHub repository access and retry.",
+            )
         result = self._run(
             [
                 "git",
@@ -615,10 +626,6 @@ class DefaultReadinessAdapter:
                 f"refs/heads/{config.base_branch}",
             ]
         )
-        facts = {
-            "selected": config.base_branch,
-            "github_default": config.github_default_branch,
-        }
         return (
             CheckResult(Status.PASS, "Selected base branch exists on origin.", facts)
             if self._ok(result)
@@ -956,6 +963,8 @@ test -w "$workspace_file"
     def eligible_items(
         self, config: ReadinessConfiguration
     ) -> list[EligibleItem | IssueRef]:
+        if not config.assignee:
+            raise ValueError("GitHub assignee could not be resolved")
         source = GitHubIssueSource(config.repository, runner=self.runner)
         issues = (
             source.list_ready(timeout=SHORT_TIMEOUT)

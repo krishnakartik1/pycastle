@@ -154,6 +154,23 @@ def test_github_repository_requires_matching_identity(tmp_path: Path) -> None:
     assert result.status is Status.FAIL
 
 
+def test_base_branch_fails_when_github_default_could_not_be_resolved(
+    tmp_path: Path,
+) -> None:
+    config = ReadinessConfiguration(
+        **{**configuration().__dict__, "github_default_branch": None}
+    )
+
+    result = DefaultReadinessAdapter(
+        tmp_path,
+        tmp_path,
+        runner=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    ).check_base_branch(config)
+
+    assert result.status is Status.FAIL
+    assert "default" in result.summary.lower()
+
+
 def test_doctor_and_run_share_readiness_arguments_and_defaults() -> None:
     parser = cli.build_parser()
     doctor = parser.parse_args(["doctor"])
@@ -1065,6 +1082,50 @@ def test_run_maps_only_zero_eligible_items_to_noop_success(
     args = cli.build_parser().parse_args(["run", "--runtime", "stub"])
     args.sandbox = "host"
     assert cli._cmd_run(args) == 0
+
+
+@pytest.mark.parametrize(
+    ("assignee", "list_returncode"),
+    [
+        ("", 0),  # Failed `@me` resolution must not look like zero matching Items.
+        ("octocat", 1),  # Failed `gh issue list` must not look like an empty list.
+    ],
+)
+def test_external_item_resolution_failures_are_not_empty_batch_noops(
+    tmp_path: Path,
+    assignee: str,
+    list_returncode: int,
+) -> None:
+    config = ReadinessConfiguration(
+        **{**configuration().__dict__, "assignee": assignee}
+    )
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            list_returncode,
+            "[]" if list_returncode == 0 else "",
+            "GitHub query failed" if list_returncode else "",
+        )
+
+    adapter = DefaultReadinessAdapter(
+        tmp_path,
+        tmp_path,
+        runner=runner,
+        include_item_content=True,
+    )
+    report = evaluate_readiness(
+        config,
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
+            eligible_items=adapter.eligible_items,
+        ),
+    )
+    eligible = next(check for check in report.checks if check.id == "eligible_items")
+
+    assert eligible.status is Status.FAIL
+    assert eligible.facts.get("count") is None
+    assert not cli._run_can_preserve_empty_batch_noop(report)
 
 
 @pytest.mark.parametrize(
