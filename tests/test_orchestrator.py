@@ -363,6 +363,7 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -563,22 +564,22 @@ def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
         gate_paths.append(cwd)
         return orchestrator.GateOutcome(True, "green", exit_code=0)
 
-    with patch("pycastle.orchestrator.select_batch", return_value=selected_batch):
-        outcome = orchestrator.run_batch(
-            runtime=Runtime(),
-            issue_source=source,
-            fixture_dir=fixture,
-            repo="owner/repo",
-            base_branch="main",
-            assignee="krishna",
-            run_id="frozen",
-            iterations=2,
-            workspace=tmp_path,
-            worktree_root=tmp_path / "wt",
-            runner=runner,
-            gate_check=gate,
-            setup=setup,
-        )
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        selected=selected_batch,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="frozen",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        gate_check=gate,
+        setup=setup,
+    )
 
     assert events[:3] == [
         ("setup", run_worktree),
@@ -587,7 +588,7 @@ def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
     ]
     assert [number for number, inherited, _prompt in item_starts] == [101, 103]
     assert all(inherited for _number, inherited, _prompt in item_starts)
-    assert source.list_ready.call_count == 1
+    source.list_ready.assert_not_called()
     assert gate_paths[-1] == run_worktree
     assert outcome.completed == [101, 103]
     assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
@@ -832,6 +833,7 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -853,6 +855,32 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     assert (fixture / "runs" / "before-human" / "run.log").is_file()
     assert not _calls_containing(runner, "git", "branch", "pycastle/issue-")
     assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_empty_supplied_batch_is_side_effect_free(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    source = MagicMock()
+    runner = MagicMock()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=(),
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="empty",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.selected == []
+    assert not (tmp_path / "wt").exists()
+    assert not (fixture / "runs").exists()
+    source.list_ready.assert_not_called()
+    runner.assert_not_called()
 
 
 def test_all_human_items_stop_before_second_run_setup_gate_or_publication(
@@ -883,6 +911,7 @@ def test_all_human_items_stop_before_second_run_setup_gate_or_publication(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=issues[:2],
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -986,6 +1015,7 @@ def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -1047,6 +1077,7 @@ def test_red_run_gate_keeps_pull_request_draft(tmp_path: Path) -> None:
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1132,6 +1163,7 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1201,6 +1233,7 @@ def test_second_run_setup_cleanup_failure_still_publishes_durable_work(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1256,6 +1289,7 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1309,6 +1343,7 @@ def test_draft_creation_os_error_retains_pushed_branch_and_run_records(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1368,6 +1403,7 @@ def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
@@ -1406,6 +1442,7 @@ def test_interrupt_during_after_run_opens_no_pull_request(tmp_path: Path) -> Non
         orchestrator.run_batch(
             runtime=Runtime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -1512,6 +1549,7 @@ def test_ready_transition_failure_keeps_publication_success_distinct(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1563,6 +1601,7 @@ def test_verbose_run_binds_a_per_issue_transcript_sink(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1597,6 +1636,7 @@ def test_non_verbose_run_does_not_bind_a_transcript_sink(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1629,6 +1669,7 @@ def test_batch_works_up_to_n_issues_into_one_pr(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=issues[:2],
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1668,6 +1709,7 @@ def test_per_run_branch_and_worktrees_leave_main_checkout_untouched(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1723,6 +1765,7 @@ def test_successful_branches_merge_and_one_pr_is_opened(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1767,6 +1810,7 @@ def test_each_successful_issue_merge_checkpoints_the_run_branch(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1809,6 +1853,7 @@ def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1861,6 +1906,7 @@ def test_incremental_push_os_error_is_logged_without_aborting_run(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1916,6 +1962,7 @@ def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -1963,6 +2010,7 @@ def test_merge_conflict_marks_for_human_and_run_continues(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2023,6 +2071,7 @@ def test_merge_conflict_on_the_first_issue_still_runs_the_rest(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2074,6 +2123,7 @@ def test_empty_diff_routes_to_human_no_phantom_success(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2120,6 +2170,7 @@ def test_empty_diff_on_only_issue_opens_no_pull_request(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2184,6 +2235,7 @@ def test_run_worktree_add_failure_raises_and_works_no_issue(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2225,6 +2277,7 @@ def test_run_branch_failure_aborts_before_worktree_add(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2267,6 +2320,7 @@ def test_issue_branch_failure_releases_issue_before_worktree_add(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2308,6 +2362,7 @@ def test_issue_worktree_add_failure_releases_issue_and_aborts_run(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -2436,6 +2491,7 @@ def test_telemetry_and_run_log_are_written_into_the_fixture(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2481,6 +2537,7 @@ def test_batch_is_a_noop_when_no_issue_is_ready(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2520,6 +2577,7 @@ def test_worktrees_are_cleaned_up_after_the_run(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2554,6 +2612,7 @@ def test_worktrees_are_cleaned_up_even_when_an_issue_is_skipped(
     orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2646,6 +2705,7 @@ def test_default_run_completes_plan_implement_review_in_order(
     outcome = orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2684,6 +2744,7 @@ def test_review_changes_are_committed_before_the_merge(
     orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2727,6 +2788,7 @@ def test_full_run_interleaves_phases_then_commit_then_merge(
     outcome = orchestrator.run_batch(
         runtime=_TimelineRuntime(timeline),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2809,6 +2871,7 @@ def test_plan_crash_routes_to_human_and_run_continues(
     outcome = orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -2868,6 +2931,7 @@ def test_cancellation_during_before_run_setup_retains_records_without_remote_sta
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -2908,6 +2972,7 @@ def test_cancellation_during_after_run_preserves_completed_item_checkpoint(
         orchestrator.run_batch(
             runtime=Runtime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -2942,6 +3007,7 @@ def test_cancellation_as_claim_returns_releases_only_that_item(tmp_path: Path) -
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -2977,6 +3043,7 @@ def test_interrupt_after_item_settles_does_not_release_completed_item(
         orchestrator.run_batch(
             runtime=StubRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture,
             repo="owner/repo",
             base_branch="main",
@@ -3010,6 +3077,7 @@ def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -3066,6 +3134,7 @@ def test_interrupt_restores_only_the_in_flight_issue(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -3111,6 +3180,7 @@ def test_interrupt_cleanup_still_releases_when_worktree_removal_errors(
         orchestrator.run_batch(
             runtime=_InterruptingRuntime(),
             issue_source=source,
+            selected=source.list_ready(),
             fixture_dir=fixture_dir,
             repo="owner/repo",
             base_branch="main",
@@ -3181,6 +3251,7 @@ def test_interrupt_after_all_issues_complete_is_a_clean_run(
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",
@@ -3363,6 +3434,7 @@ def test_issue_context_reaches_every_phase_prompt(
     orchestrator.run_batch(
         runtime=runtime,
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=three_phase_fixture_dir,
         repo="owner/repo",
         base_branch="main",

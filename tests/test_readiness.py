@@ -6,10 +6,12 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from pycastle import cli, sandbox
+from pycastle.models import IssueRef
 from pycastle.readiness import (
     CHECK_IDS,
     CheckResult,
@@ -1063,3 +1065,88 @@ def test_run_maps_only_zero_eligible_items_to_noop_success(
     args = cli.build_parser().parse_args(["run", "--runtime", "stub"])
     args.sandbox = "host"
     assert cli._cmd_run(args) == 0
+
+
+def test_readiness_freezes_full_items_but_reports_only_safe_metadata() -> None:
+    item = IssueRef(
+        number=7,
+        title="Seven",
+        body="private body",
+        assignees=["octocat"],
+    )
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
+            eligible_items=lambda _configuration: [item],
+        ),
+    )
+
+    item.body = "mutated"
+    item.assignees.append("someone")
+
+    assert report.eligible_items == (EligibleItem(7, "Seven"),)
+    assert report.selected_items[0].body == "private body"
+    assert report.selected_items[0].assignees == ["octocat"]
+    document = json.loads(render_json(report))
+    assert document["eligible_items"] == [{"number": 7, "title": "Seven"}]
+    assert "selected_items" not in document
+
+
+def test_run_main_does_not_use_legacy_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "check_required_commands",
+        lambda _commands: pytest.fail("Run bypassed the readiness evaluator"),
+    )
+    monkeypatch.setattr(cli, "_cmd_run", lambda _args: 23)
+
+    assert cli.main(["run", "--runtime", "stub", "--sandbox", "host"]) == 23
+
+
+def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def snapshot(number: int) -> object:
+        return evaluate_readiness(
+            configuration(),
+            ReadinessDependencies(
+                probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
+                eligible_items=lambda _configuration: [
+                    IssueRef(number=number, title=f"Item {number}")
+                ],
+            ),
+        )
+
+    evaluations = MagicMock(side_effect=[snapshot(1), snapshot(2)])
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", evaluations)
+    monkeypatch.setattr(cli, "_build_runtime", MagicMock())
+    monkeypatch.setattr(cli, "make_fixture_gate_check", MagicMock())
+    monkeypatch.setattr(cli, "make_fixture_setup", MagicMock())
+    monkeypatch.setattr(cli, "GitHubIssueSource", MagicMock())
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "current")
+    run_loop = MagicMock()
+    run_loop.return_value = MagicMock(
+        selected=[2],
+        issues=[],
+        completed=[],
+        pr_opened=True,
+        succeeded=True,
+        run_id="current",
+    )
+    monkeypatch.setattr(cli, "run_loop", run_loop)
+
+    doctor_args = cli.build_parser().parse_args(
+        ["doctor", "--runtime", "stub", "--sandbox", "host"]
+    )
+    run_args = cli.build_parser().parse_args(
+        ["run", "--runtime", "stub", "--sandbox", "host"]
+    )
+
+    assert cli._cmd_doctor(doctor_args) == 0
+    assert cli._cmd_run(run_args) == 0
+    assert evaluations.call_count == 2
+    selected = run_loop.call_args.kwargs["selected"]
+    assert [item.number for item in selected] == [2]

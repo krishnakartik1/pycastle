@@ -20,6 +20,7 @@ from .commands import command_exists, run_cmd
 from .compatibility import check_fixture_compatibility
 from .graph import PhaseGraph, RunDefinition, Terminal, load_run
 from .issues import GitHubIssueSource, select_batch
+from .models import IssueRef
 
 SCHEMA_VERSION = 1
 SHORT_TIMEOUT = 15.0
@@ -152,10 +153,14 @@ class ReadinessReport:
     configuration: ReadinessConfiguration
     checks: tuple[ReadinessCheck, ...]
     eligible_items: tuple[EligibleItem, ...]
+    # Run-only data. Renderers deliberately expose only ``eligible_items``.
+    selected_items: tuple[IssueRef, ...] = field(
+        default_factory=tuple, repr=False, compare=False
+    )
 
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
-ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem]]
+ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem | IssueRef]]
 Progress = Callable[[str, str, Status | None], None]
 
 
@@ -191,6 +196,7 @@ def evaluate_readiness(
     checks: list[ReadinessCheck] = []
     outcomes: dict[str, Status] = {}
     items: list[EligibleItem] = []
+    selected_items: tuple[IssueRef, ...] = ()
     for check_id in CHECK_IDS:
         if progress is not None:
             progress("start", check_id, None)
@@ -216,7 +222,18 @@ def evaluate_readiness(
                 loaded_items = dependencies.eligible_items(configuration)
                 if not isinstance(loaded_items, list):
                     raise TypeError("Eligible Item metadata must be a list")
-                items = sorted(_safe_eligible_item(item) for item in loaded_items)
+                safe_items: list[EligibleItem] = []
+                full_items: list[IssueRef] = []
+                for item in loaded_items:
+                    safe_items.append(_safe_eligible_item(item))
+                    if isinstance(item, IssueRef):
+                        full_items.append(item.model_copy(deep=True))
+                order = sorted(
+                    range(len(safe_items)), key=lambda index: safe_items[index]
+                )
+                items = [safe_items[index] for index in order]
+                if len(full_items) == len(loaded_items):
+                    selected_items = tuple(full_items[index] for index in order)
                 result = (
                     CheckResult(
                         Status.PASS,
@@ -281,6 +298,7 @@ def evaluate_readiness(
         configuration,
         tuple(checks),
         tuple(items),
+        selected_items,
     )
 
 
@@ -307,7 +325,7 @@ def _bounded_text(value: object, limit: int) -> str:
 
 def _safe_eligible_item(item: object) -> EligibleItem:
     """Validate and bound Issue metadata before it enters a report."""
-    if not isinstance(item, EligibleItem):
+    if not isinstance(item, EligibleItem | IssueRef):
         raise TypeError("Eligible Item metadata has an invalid shape")
     if (
         not isinstance(item.number, int)
@@ -454,6 +472,7 @@ class DefaultReadinessAdapter:
         runner: Callable[..., Any] = run_cmd,
         exists: Callable[[str], bool] = command_exists,
         image_flag: str | None = None,
+        include_item_content: bool = False,
         stream_image_build: bool = False,
         cleanup_reporter: Callable[[str], None] | None = None,
     ) -> None:
@@ -462,6 +481,7 @@ class DefaultReadinessAdapter:
         self.runner = runner
         self.exists = exists
         self.image_flag = image_flag
+        self.include_item_content = include_item_content
         self.stream_image_build = stream_image_build
         self.cleanup_reporter = cleanup_reporter
         self._docker_workspace: Path | None = None
@@ -933,15 +953,23 @@ test -w "$workspace_file"
             )
         )
 
-    def eligible_items(self, config: ReadinessConfiguration) -> list[EligibleItem]:
+    def eligible_items(
+        self, config: ReadinessConfiguration
+    ) -> list[EligibleItem | IssueRef]:
         source = GitHubIssueSource(config.repository, runner=self.runner)
-        issues = source.list_ready_metadata(timeout=SHORT_TIMEOUT)
+        issues = (
+            source.list_ready(timeout=SHORT_TIMEOUT)
+            if self.include_item_content
+            else source.list_ready_metadata(timeout=SHORT_TIMEOUT)
+        )
         selected = select_batch(
             issues,
             assignee=config.assignee,
             include_unassigned=config.include_unassigned,
             limit=config.item_limit,
         )
+        if self.include_item_content:
+            return selected
         return [EligibleItem(issue.number, issue.title) for issue in selected]
 
     def dependencies(self) -> ReadinessDependencies:

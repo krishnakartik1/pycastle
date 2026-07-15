@@ -92,7 +92,7 @@ class IssueSource(ABC):
     """Lists, claims, and labels work items behind a stable interface."""
 
     @abstractmethod
-    def list_ready(self) -> list[IssueRef]:
+    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
         """Return the open work items ready for an agent."""
 
     @abstractmethod
@@ -124,8 +124,11 @@ class GitHubIssueSource(IssueSource):
         self.human_label = human_label
         self._run = runner
 
-    def list_ready(self) -> list[IssueRef]:
+    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
         """Return open issues carrying the ready label."""
+        options: dict[str, Any] = {"capture": True}
+        if timeout is not None:
+            options["timeout"] = timeout
         result = self._run(
             [
                 "gh",
@@ -142,7 +145,7 @@ class GitHubIssueSource(IssueSource):
                 "--json",
                 "number,title,body,labels,assignees,comments",
             ],
-            capture=True,
+            **options,
         )
         raw = (result.stdout or "").strip()
         if not raw:

@@ -408,6 +408,7 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
         FIXTURE_DIR,
         Path.cwd(),
         image_flag=args.image,
+        include_item_content=args.command == "run",
         # Human Doctor may show a first build's progress. Run and JSON keep
         # child output captured so stdout remains a single report document.
         stream_image_build=args.command == "doctor" and not args.json,
@@ -473,25 +474,32 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if image is None:  # Defensive: a ready Docker report always has an image.
             raise PreflightError("No Agent image was resolved.")
         runtime = _build_runtime(
-            args.runtime, args.sandbox, workspace, image=image, verbose=args.verbose
+            configuration.runtime,
+            configuration.sandbox,
+            workspace,
+            image=image,
+            verbose=args.verbose,
         )
         gate_check = make_fixture_gate_check(
             FIXTURE_DIR,
             sandbox="docker",
             image=image,
-            runtime_name=args.runtime,
+            runtime_name=configuration.runtime,
             workspace=workspace,
         )
         setup = make_fixture_setup(
             FIXTURE_DIR,
             sandbox="docker",
             image=image,
-            runtime_name=args.runtime,
+            runtime_name=configuration.runtime,
             workspace=workspace,
         )
     else:
         runtime = _build_runtime(
-            args.runtime, args.sandbox, workspace, verbose=args.verbose
+            configuration.runtime,
+            configuration.sandbox,
+            workspace,
+            verbose=args.verbose,
         )
         gate_check = make_fixture_gate_check(FIXTURE_DIR)
         setup = make_fixture_setup(FIXTURE_DIR)
@@ -503,13 +511,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     outcome = run_loop(
         runtime=runtime,
         issue_source=issue_source,
+        selected=report.selected_items,
         fixture_dir=FIXTURE_DIR,
         repo=repo,
         base_branch=base_branch,
         assignee=assignee,
         run_id=_make_run_id(),
-        iterations=args.iterations,
-        include_unassigned=args.include_unassigned,
+        iterations=configuration.item_limit,
+        include_unassigned=configuration.include_unassigned,
         gate_check=gate_check,
         setup=setup,
         verbose=args.verbose,
@@ -744,7 +753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "sandbox":
         required.append("docker")
     try:
-        if args.command != "doctor":
+        if args.command not in {"doctor", "run"}:
             check_required_commands(required)
         if args.command == "doctor":
             return _cmd_doctor(args)

@@ -645,6 +645,7 @@ def test_run_works_one_issue_end_to_end_via_claude(
     outcome = orchestrator.run_batch(
         runtime=make_runtime("claude"),
         issue_source=source,
+        selected=source.list_ready(),
         fixture_dir=fixture_dir,
         repo="owner/repo",
         base_branch="main",

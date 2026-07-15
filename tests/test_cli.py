@@ -425,7 +425,7 @@ def test_main_fails_fast_when_preflight_fails(
         raise PreflightError("Required command(s) not found on PATH: gh")
 
     monkeypatch.setattr(cli, "check_required_commands", boom)
-    assert main(["run", "--runtime", "stub"]) == 1
+    assert main(["init", "--sandbox", "host"]) == 1
 
 
 def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -865,14 +865,10 @@ def test_run_falls_back_to_host_for_empty_or_garbage_marker(
         assert getattr(runtime, "argv_wrapper", None) is None
 
 
-def test_run_marker_docker_requires_docker_in_preflight(
+def test_run_marker_docker_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A docker marker (no flag) makes preflight require docker, not the agent CLI.
-
-    Resolution happens before preflight, so the required-command set matches
-    where the run will actually execute.
-    """
+    """Run delegates the resolved Docker command inventory to readiness."""
     _write_marker(tmp_path, "docker\n")
     monkeypatch.chdir(tmp_path)
 
@@ -886,8 +882,7 @@ def test_run_marker_docker_requires_docker_in_preflight(
 
     main(["run", "--runtime", "claude"])
 
-    assert "docker" in seen["commands"]
-    assert "claude" not in seen["commands"]
+    assert "commands" not in seen
 
 
 def test_resolve_sandbox_prefers_explicit_flag(
@@ -911,7 +906,7 @@ def test_resolve_sandbox_reads_marker_when_flag_absent(
     assert cli._resolve_sandbox(None) == "docker"
 
 
-def test_run_host_codex_requires_codex_in_preflight(
+def test_run_host_codex_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, list[str]] = {}
@@ -924,12 +919,10 @@ def test_run_host_codex_requires_codex_in_preflight(
 
     main(["run", "--sandbox", "host", "--runtime", "codex"])
 
-    # The host codex path needs the codex CLI on PATH, not docker.
-    assert "codex" in seen["commands"]
-    assert "docker" not in seen["commands"]
+    assert "commands" not in seen
 
 
-def test_run_docker_requires_docker_in_preflight(
+def test_run_docker_skips_legacy_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, list[str]] = {}
@@ -942,9 +935,7 @@ def test_run_docker_requires_docker_in_preflight(
 
     main(["run", "--sandbox", "docker", "--runtime", "claude"])
 
-    assert "docker" in seen["commands"]
-    # The host claude binary is not required when the agent runs in Docker.
-    assert "claude" not in seen["commands"]
+    assert "commands" not in seen
 
 
 def test_build_runtime_docker_codex_builds_a_sandboxed_runtime(

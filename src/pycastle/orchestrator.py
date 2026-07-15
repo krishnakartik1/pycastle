@@ -50,7 +50,7 @@ from .graph import (
     WalkResult,
     load_run,
 )
-from .issues import IssueSource, select_batch
+from .issues import IssueSource
 from .models import IssueRef
 from .runtime import AgentCrashError, CodexRuntime, Runtime
 
@@ -1368,6 +1368,7 @@ def run_batch(
     *,
     runtime: Runtime,
     issue_source: IssueSource,
+    selected: Sequence[IssueRef],
     fixture_dir: Path,
     repo: str,
     base_branch: str,
@@ -1385,8 +1386,7 @@ def run_batch(
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
-    Selection is a pure function behind the Issue source boundary
-    (:func:`~pycastle.issues.select_batch`). A per-run branch is cut in its own
+    ``selected`` is the ordered batch frozen by readiness. A per-run branch is cut in its own
     worktree so the main checkout stays put; each selected issue is then worked
     in its own worktree off the run branch and, on a clean merge, folded into the
     run branch. One pull request is opened for the run, closing every issue that
@@ -1410,6 +1410,18 @@ def run_batch(
     default, so a normal run writes no transcript log and behaves exactly as
     before.
     """
+    # Copy again at the orchestration boundary so callers cannot mutate the
+    # active membership, order, or Item content during project execution.
+    selected = tuple(issue.model_copy(deep=True) for issue in selected)
+    run_branch = f"pycastle/run-{run_id}"
+    outcome = RunOutcome(
+        run_id=run_id,
+        run_branch=run_branch,
+        selected=[issue.number for issue in selected],
+    )
+    if not selected:
+        return outcome
+
     gate_check = gate_check or _gates_always_pass
     setup = setup or (lambda _worktree: None)
     workspace = workspace or Path.cwd()
@@ -1419,30 +1431,6 @@ def run_batch(
     # Import once: Runtime edits to the fixture are proposed changes and cannot
     # rewrite the active Run definition or weaken its graphs.
     run_definition: RunDefinition = load_run(fixture_dir)
-
-    issues = issue_source.list_ready()
-    # Snapshot the ordered selection before any project-owned Run phase executes.
-    # A tuple of deep copies makes the lifecycle invariant explicit: fixture
-    # edits, Issue source changes, and in-process Runtime behavior cannot mutate,
-    # add, remove, or reorder the active batch after selection.
-    selected = tuple(
-        issue.model_copy(deep=True)
-        for issue in select_batch(
-            issues,
-            assignee=assignee,
-            include_unassigned=include_unassigned,
-            limit=iterations,
-        )
-    )
-    run_branch = f"pycastle/run-{run_id}"
-    outcome = RunOutcome(
-        run_id=run_id,
-        run_branch=run_branch,
-        selected=[issue.number for issue in selected],
-    )
-    if not selected:
-        _append_log(fixture_dir, run_id, "No ready issues to work.")
-        return outcome
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
