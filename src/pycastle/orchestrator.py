@@ -1498,7 +1498,12 @@ def run_batch(
             outcome.succeeded = False
             outcome.stopping_point = "Run report validation"
             publication_error = report_error
-        outcome.pr_opened, published, outcome.pr_ready = _open_pull_request(
+        (
+            outcome.pr_opened,
+            published,
+            outcome.pr_ready,
+            final_push_succeeded,
+        ) = _open_pull_request(
             repo=repo,
             base_branch=base_branch,
             run_branch=run_branch,
@@ -1515,7 +1520,10 @@ def run_batch(
             successful=outcome.succeeded,
             stopping_point=outcome.stopping_point,
         )
-        if outcome.succeeded and not published:
+        if not final_push_succeeded:
+            outcome.succeeded = False
+            outcome.stopping_point = "Final push"
+        elif outcome.succeeded and not published:
             outcome.succeeded = False
             outcome.stopping_point = "Run report publication"
         elif outcome.succeeded and not outcome.pr_ready:
@@ -1545,7 +1553,7 @@ def _open_pull_request(
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool]:
     """Final-push, draft-create, report, then ready a successful Run PR."""
     if not _push_run_branch(
         run_branch=run_branch,
@@ -1555,7 +1563,7 @@ def _open_pull_request(
         runner=runner,
         final=True,
     ):
-        return False, False, False
+        return False, False, False, False
     closes = "\n".join(f"- Closes #{number}" for number in completed)
     body = (
         f"Automated PyCastle run {run_id} completing {len(completed)} issue(s).\n\n"
@@ -1612,7 +1620,7 @@ def _open_pull_request(
         f"Pull request {'opened' if opened else 'failed'} for {run_branch}",
     )
     if not opened:
-        return False, False, False
+        return False, False, False, True
 
     if pr_number is None:
         view = runner(
@@ -1703,7 +1711,7 @@ def _open_pull_request(
         _append_log(
             fixture_dir, run_id, "Run report publication failed; PR remains draft."
         )
-        return True, False, False
+        return True, False, False, True
     ready_succeeded = False
     if successful:
         ready = runner(
@@ -1716,7 +1724,7 @@ def _open_pull_request(
             )
         else:
             ready_succeeded = True
-    return True, True, ready_succeeded
+    return True, True, ready_succeeded, True
 
 
 def _push_run_branch(

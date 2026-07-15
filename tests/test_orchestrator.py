@@ -408,7 +408,7 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
         publication_error=None,
         successful=True,
         stopping_point=None,
-    ) == (True, True, True)
+    ) == (True, True, True, True)
     repeat_calls = [call.args[0] for call in repeat_runner.call_args_list]
     assert not any(call[:3] == ["gh", "pr", "create"] for call in repeat_calls)
     assert repeat_calls[1][repeat_calls[1].index("--head") + 1] == (
@@ -841,7 +841,19 @@ def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
 
     assert outcome.completed == [2, 4]
     assert outcome.pr_opened is True
+    assert outcome.pr_ready is True
+    assert outcome.succeeded is True
     assert push_count == 3
+    pushes = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:2] == ["git", "push"]
+    ]
+    assert pushes == [
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+    ]
     assert (
         "Durability push failed"
         in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
@@ -887,8 +899,9 @@ def test_incremental_push_os_error_is_logged_without_aborting_run(
     )
 
 
-def test_failed_final_push_prevents_pull_request_creation(
-    fixture_dir: Path, tmp_path: Path
+@pytest.mark.parametrize("gate_passed", [True, False])
+def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
+    fixture_dir: Path, tmp_path: Path, gate_passed: bool
 ) -> None:
     issue = IssueRef(number=2, title="First", assignees=["krishna"])
     source = MagicMock()
@@ -905,6 +918,17 @@ def test_failed_final_push_prevents_pull_request_creation(
         return base_runner(argv, **kwargs)
 
     runner = MagicMock(side_effect=side_effect)
+
+    def check_gate(cwd: Path) -> orchestrator.GateOutcome:
+        passed = True if cwd.name.startswith("issue-") else gate_passed
+        return orchestrator.GateOutcome(
+            passed,
+            "gate output",
+            exit_code=0 if passed else 1,
+            duration_seconds=0.1,
+            command=".pycastle/gate",
+        )
+
     outcome = orchestrator.run_batch(
         runtime=StubRuntime(),
         issue_source=source,
@@ -916,10 +940,16 @@ def test_failed_final_push_prevents_pull_request_creation(
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
         runner=runner,
+        gate_check=check_gate,
     )
 
     assert outcome.pr_opened is False
+    assert outcome.pr_ready is False
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Final push"
     assert not _calls_containing(runner, "gh", "pr", "create")
+    assert not _calls_containing(runner, "git", "branch", "-D", outcome.run_branch)
+    assert (fixture_dir / "runs" / "20260613-101500" / "run.log").exists()
     assert (
         "Final push failed"
         in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
