@@ -195,7 +195,7 @@ def evaluate_readiness(
             result.status,
             result.summary[:500],
             dict(result.facts),
-            result.remediation,
+            result.remediation[:500] if result.remediation else None,
         )
         checks.append(check)
         outcomes[check_id] = result.status

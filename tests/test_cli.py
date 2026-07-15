@@ -13,7 +13,65 @@ from pycastle import cli
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
 from pycastle.preflight import PreflightError
+from pycastle.readiness import (
+    CHECK_IDS,
+    EligibleItem,
+    ReadinessCheck,
+    ReadinessConfiguration,
+    ReadinessReport,
+    Status,
+)
 from pycastle.upgrade import FixtureMigration
+
+
+@pytest.fixture(autouse=True)
+def ready_run_preflight(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep legacy Run wiring tests focused below the readiness boundary."""
+    if request.node.name.startswith(
+        (
+            "test_incompatible_run",
+            "test_run_directs",
+            "test_run_docker_exits_nonzero_on_blank_image",
+            "test_run_docker_exits_nonzero_when_build_fails",
+        )
+    ):
+        return
+
+    def ready(args: object) -> ReadinessReport:
+        sandbox_kind = cli._resolve_sandbox(args.sandbox)
+        image = None
+        if sandbox_kind == "docker":
+            dockerfile = cli.FIXTURE_DIR / cli.DOCKERFILE_NAME
+            image = args.image or (
+                cli.sandbox.image_tag_for_dockerfile(dockerfile.read_text())
+                if dockerfile.is_file()
+                else cli.sandbox.DEFAULT_IMAGE
+            )
+        configuration = ReadinessConfiguration(
+            repository="owner/repo",
+            base_branch="main",
+            github_default_branch="main",
+            runtime=args.runtime,
+            sandbox=sandbox_kind,
+            agent_image=image,
+            assignee="krishna",
+            include_unassigned=args.include_unassigned,
+            item_limit=args.iterations,
+        )
+        return ReadinessReport(
+            schema_version=1,
+            ready=True,
+            runner_version="0.1.0",
+            configuration=configuration,
+            checks=tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            eligible_items=(EligibleItem(1, "One"),),
+        )
+
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", ready)
 
 
 def test_version_flag_reports_built_package_version(
@@ -579,25 +637,13 @@ def test_run_docker_builds_docker_gate_check(
     assert call["image"] == captured["runtime_image"]
 
 
-def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
+def test_run_does_not_repeat_doctor_gate_toolchain_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:resolved")
     events: list[str] = []
-
-    def fake_gate_preflight(fixture_dir: Path, **kwargs: object) -> None:
-        events.append("gate-preflight")
-        assert fixture_dir == cli.FIXTURE_DIR
-        assert kwargs == {
-            "image": "agent:resolved",
-            "runtime_name": "claude",
-            "workspace": tmp_path,
-        }
-
-    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fake_gate_preflight)
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
@@ -619,54 +665,7 @@ def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
 
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
-    assert events == ["gate-preflight", "resolve-repo", "run-loop"]
-
-
-def test_run_docker_gate_toolchain_failure_aborts_before_issue_work(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:bad")
-
-    def fail_preflight(*_args: object, **_kwargs: object) -> None:
-        raise PreflightError("gate toolchain missing")
-
-    monkeypatch.setattr(cli, "check_docker_gate_toolchain", fail_preflight)
-    monkeypatch.setattr(
-        cli,
-        "_resolve_repo",
-        lambda: pytest.fail("repo resolution must not start after failed preflight"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run_loop",
-        lambda **_kwargs: pytest.fail("phase graph must not start after preflight"),
-    )
-
-    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
-
-
-def test_run_host_does_not_preflight_docker_gate_toolchain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
-    monkeypatch.setattr(
-        cli,
-        "check_docker_gate_toolchain",
-        lambda *_args, **_kwargs: pytest.fail("host run must not launch docker"),
-    )
-    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
-    monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
-    monkeypatch.setattr(cli, "_resolve_assignee", lambda _login: "krishna")
-    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
-    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
-    )
-    monkeypatch.setattr(cli, "run_loop", lambda **_kwargs: MagicMock(issues=[]))
-
-    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+    assert events == ["run-loop"]
 
 
 def _write_marker(tmp_path: Path, value: str) -> None:
@@ -1265,9 +1264,9 @@ def test_run_docker_exits_nonzero_on_blank_image(
 
     monkeypatch.setattr(cli, "run_cmd", runner)
 
-    assert (
-        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""]) == 1
-    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run", "--sandbox", "docker", "--runtime", "claude", "--image", ""])
+    assert exc_info.value.code == 2
 
 
 def test_resolve_agent_image_builds_when_tag_absent(

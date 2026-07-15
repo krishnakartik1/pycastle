@@ -20,6 +20,14 @@ import pytest
 from pycastle import cli, orchestrator, sandbox
 from pycastle.cli import main
 from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
+from pycastle.readiness import (
+    CHECK_IDS,
+    EligibleItem,
+    ReadinessCheck,
+    ReadinessConfiguration,
+    ReadinessReport,
+    Status,
+)
 from pycastle.runtime import AgentCrashError
 
 HANDOFF_REL = orchestrator.HANDOFF_DOC
@@ -892,6 +900,22 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     project fixture rather than leaving the always-pass default in place (#14).
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_cli_readiness",
+        lambda _args: ReadinessReport(
+            1,
+            True,
+            "0.1.0",
+            ReadinessConfiguration(
+                "owner/repo", "main", "main", "stub", "host", None, "krishna", False, 1
+            ),
+            tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            (EligibleItem(1, "One"),),
+        ),
+    )
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
     monkeypatch.setattr(cli, "_resolve_base_branch", lambda: "main")
     monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
