@@ -1078,29 +1078,54 @@ def test_red_run_gate_keeps_pull_request_draft(tmp_path: Path) -> None:
     )
 
 
-def test_second_run_setup_failure_skips_gate_and_keeps_draft(
-    fixture_dir: Path, tmp_path: Path
+def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
+    tmp_path: Path,
 ) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, after=True)
     source = MagicMock()
     source.list_ready.return_value = [
         IssueRef(number=1, title="First", assignees=["krishna"])
     ]
     run_setup_count = 0
     gate_paths: list[Path] = []
+    after_visits: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                after_visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
 
     def setup(cwd: Path) -> None:
         nonlocal run_setup_count
         if cwd.name.startswith("run-"):
             run_setup_count += 1
             if run_setup_count == 2:
+                (cwd / "tracked.txt").write_text("incomplete setup\n")
+                nested = cwd / "untracked" / "partial.txt"
+                nested.parent.mkdir()
+                nested.write_text("discard me\n")
                 raise orchestrator.SetupError("broken")
 
     def gate(cwd: Path) -> orchestrator.GateOutcome:
         gate_paths.append(cwd)
         return orchestrator.GateOutcome(True, "green")
 
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        cwd = Path(str(kwargs.get("cwd", tmp_path)))
+        if argv[:3] == ["git", "reset", "--hard"]:
+            (cwd / "tracked.txt").unlink(missing_ok=True)
+        if argv[:3] == ["git", "clean", "-fd"]:
+            partial = cwd / "untracked" / "partial.txt"
+            partial.unlink(missing_ok=True)
+            partial.parent.rmdir()
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
@@ -1109,7 +1134,7 @@ def test_second_run_setup_failure_skips_gate_and_keeps_draft(
         run_id="setup-failure",
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=runner,
         gate_check=gate,
         setup=setup,
     )
@@ -1117,16 +1142,37 @@ def test_second_run_setup_failure_skips_gate_and_keeps_draft(
     assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
     assert outcome.stopping_point == "after-Run Setup"
     assert all(not path.name.startswith("run-") for path in gate_paths)
+    assert after_visits == []
+    assert _calls_containing(runner, "git", "reset", "--hard", "HEAD")
+    assert _calls_containing(runner, "git", "clean", "-fd")
+    comment_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    comment = comment_call[comment_call.index("--body") + 1]
+    assert "Completed Items: #1" in comment
+    assert "Run Gate: not run" in comment
+    assert "Stopping point: after-Run Setup" in comment
 
 
 def test_handled_item_infrastructure_failure_stops_frozen_remainder(
-    fixture_dir: Path, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
+    fixture_dir = _scoped_fixture(tmp_path, after=True)
     issues = [
         IssueRef(number=n, title=f"Item {n}", assignees=["krishna"]) for n in (1, 2, 3)
     ]
     source = MagicMock()
     source.list_ready.return_value = issues
+    after_visits: list[str] = []
+    gate_paths: list[Path] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                after_visits.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
 
     def setup(cwd: Path) -> None:
         if cwd.name == "issue-2":
@@ -1134,7 +1180,7 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
 
     runner = _git_aware_runner()
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=Runtime(),
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
@@ -1146,6 +1192,9 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
         worktree_root=tmp_path / "wt",
         runner=runner,
         setup=setup,
+        gate_check=lambda cwd: (
+            gate_paths.append(cwd) or orchestrator.GateOutcome(True, "green")
+        ),
     )
 
     assert outcome.completed == [1]
@@ -1153,7 +1202,10 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
     assert outcome.stopping_point == "Item #2 infrastructure failure: offline"
     source.release.assert_called_once_with(2)
     assert [call.args[0] for call in source.claim.call_args_list] == [1, 2]
-    assert outcome.pr_opened and not outcome.pr_ready
+    source.mark_for_human.assert_not_called()
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert after_visits == []
+    assert all(not path.name.startswith("run-") for path in gate_paths)
 
     comment_call = next(
         call.args[0]
@@ -1163,6 +1215,45 @@ def test_handled_item_infrastructure_failure_stops_frozen_remainder(
     comment = comment_call[comment_call.index("--body") + 1]
     assert "Completed Items: #1" in comment
     assert "Skipped Items: #2, #3" in comment
+
+
+def test_draft_creation_os_error_retains_pushed_branch_and_run_records(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "create"]:
+            raise OSError("GitHub unavailable")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="no-pr",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == [1]
+    assert not outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "Pull request publication"
+    assert _calls_containing(runner, "git", "push", "origin", "pycastle/run-no-pr")
+    assert not _calls_containing(runner, "gh", "pr", "comment")
+    assert not _calls_containing(runner, "gh", "pr", "ready")
+    log = (fixture_dir / "runs" / "no-pr" / "run.log").read_text()
+    assert "pushed branch origin/pycastle/run-no-pr" in log
+    assert "retained records" in log
 
 
 @pytest.mark.parametrize(

@@ -1323,6 +1323,21 @@ def _walk_run_graph(
     return executor.execute(graph, cwd=run.worktree, phase_runner=run_phase)
 
 
+def _discard_incomplete_run_scope(run: RunContext) -> None:
+    """Restore the Run worktree to its last committed durable checkpoint."""
+    commands = (
+        ["git", "reset", "--hard", "HEAD"],
+        ["git", "clean", "-fd"],
+        ["git", "clean", "-fdX", "--", RUN_REVIEW, RUN_REPORT],
+    )
+    for argv in commands:
+        result = run.runner(argv, capture=True, cwd=run.worktree)
+        if getattr(result, "returncode", 1) != 0:
+            raise RunCheckpointError(
+                f"could not discard incomplete Run scope ({' '.join(argv)})"
+            )
+
+
 def _harvest_report(run: RunContext) -> tuple[str | None, str | None]:
     """Retain and validate the optional authored Run report without truncation."""
     source = run.worktree / RUN_REPORT
@@ -1569,6 +1584,7 @@ def run_batch(
                 outcome.succeeded = False
                 outcome.stopping_point = "after-Run Setup"
             _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
+            _discard_incomplete_run_scope(run)
         except RunCheckpointError as exc:
             outcome.succeeded = False
             outcome.stopping_point = f"after-Run checkpoint: {exc}"
@@ -1693,30 +1709,46 @@ def _open_pull_request(
         return PublicationOutcome(final_push_succeeded=True)
     pr = existing
     if pr_number is None:
-        pr = run.runner(
-            [
-                "gh",
-                "pr",
-                "create",
-                "-R",
-                repo,
-                "--base",
-                base_branch,
-                "--head",
-                run.branch,
-                "--title",
-                f"pycastle: run {run.run_id}",
-                "--body",
-                body,
-                "--draft",
-            ],
-            capture=True,
-        )
+        try:
+            pr = run.runner(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "-R",
+                    repo,
+                    "--base",
+                    base_branch,
+                    "--head",
+                    run.branch,
+                    "--title",
+                    f"pycastle: run {run.run_id}",
+                    "--body",
+                    body,
+                    "--draft",
+                ],
+                capture=True,
+            )
+        except OSError as exc:
+            records = _telemetry_dir(run.fixture_dir, run.run_id)
+            _append_log(
+                run.fixture_dir,
+                run.run_id,
+                f"Pull request creation failed ({exc}); pushed branch origin/"
+                f"{run.branch} and retained records at {records}.",
+            )
+            return PublicationOutcome(final_push_succeeded=True)
     opened = getattr(pr, "returncode", 1) == 0
     _append_log(
         run.fixture_dir,
         run.run_id,
-        f"Pull request {'opened' if opened else 'failed'} for {run.branch}",
+        (
+            f"Pull request opened for {run.branch}"
+            if opened
+            else f"Pull request creation failed; pushed branch origin/{run.branch} "
+            f"and retained records at "
+            f"{_telemetry_dir(run.fixture_dir, run.run_id)}."
+        ),
     )
     if not opened:
         return PublicationOutcome(final_push_succeeded=True)
