@@ -12,6 +12,7 @@ from packaging.version import Version
 from pycastle import cli
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
+from pycastle.orchestrator import RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
     CHECK_IDS,
@@ -254,6 +255,7 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
     def fake_run_loop(*, run_id: str, **_kwargs: object) -> MagicMock:
         captured["run_id"] = run_id
         outcome = MagicMock()
+        outcome.selected = []
         outcome.issues = []
         return outcome
 
@@ -261,6 +263,37 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
 
     assert main(["run", "--runtime", "stub"]) == 0
     assert captured["run_id"] == "20260613-101500"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            RunOutcome(run_id="empty", run_branch="pycastle/run-empty", selected=[]),
+            0,
+        ),
+        (
+            RunOutcome(
+                run_id="before-human",
+                run_branch="pycastle/run-before-human",
+                selected=[107],
+                succeeded=False,
+                stopping_point="before-Run HUMAN",
+            ),
+            1,
+        ),
+    ],
+)
+def test_run_exit_code_distinguishes_empty_selection_from_before_run_human(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: RunOutcome,
+    expected: int,
+) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: MagicMock())
+    monkeypatch.setattr(cli, "run_loop", lambda **_kwargs: outcome)
+
+    assert main(["run", "--runtime", "stub"]) == expected
 
 
 def test_parses_run_sandbox_docker() -> None:

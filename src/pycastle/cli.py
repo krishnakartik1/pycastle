@@ -498,7 +498,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         setup=setup,
         verbose=args.verbose,
     )
-    if not outcome.issues:
+    if not outcome.selected:
         logger.info("Nothing to do.")
         return 0
     logger.info(

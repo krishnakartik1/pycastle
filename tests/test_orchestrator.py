@@ -823,6 +823,8 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
             if phase == "before":
+                (cwd / "tracked.txt").write_text("incomplete")
+                (cwd / "untracked.txt").write_text("discard me")
                 raise AgentCrashError("human", phase=phase, exit_code=1)
             return super().run(prompt, cwd=cwd, phase=phase)
 
@@ -841,9 +843,93 @@ def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> 
     )
 
     assert not outcome.succeeded
+    assert outcome.selected == [1]
+    assert outcome.issues == []
     assert outcome.stopping_point == "before-Run HUMAN"
     source.claim.assert_not_called()
+    source.mark_for_human.assert_not_called()
+    assert _calls_containing(runner, "git", "reset", "--hard", "HEAD")
+    assert _calls_containing(runner, "git", "clean", "-fd")
+    assert (fixture / "runs" / "before-human" / "run.log").is_file()
+    assert not _calls_containing(runner, "git", "branch", "pycastle/issue-")
     assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_all_human_items_stop_before_second_run_setup_gate_or_publication(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, before=True, after=True)
+    issues = [
+        IssueRef(number=1, title="First", assignees=["krishna"]),
+        IssueRef(number=2, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    phases: list[tuple[str, str]] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            phases.append((phase, cwd.name))
+            if phase == "before":
+                (cwd / "preparation.txt").write_text("prepared")
+                return super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "implement":
+                raise AgentCrashError("human", phase=phase, exit_code=1)
+            raise AssertionError(f"unexpected phase {phase}")
+
+    setup_paths: list[Path] = []
+    gate_paths: list[Path] = []
+    runner = _git_aware_runner()
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="all-human",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        setup=setup_paths.append,
+        gate_check=lambda cwd: (
+            gate_paths.append(cwd) or orchestrator.GateOutcome(True, "green")
+        ),
+    )
+
+    assert outcome.selected == [1, 2]
+    assert outcome.completed == []
+    assert outcome.skipped == [1, 2]
+    assert not outcome.pr_opened
+    assert phases == [
+        ("before", "run-all-human"),
+        ("implement", "issue-1"),
+        ("implement", "issue-1"),
+        ("implement", "issue-1"),
+        ("implement", "issue-2"),
+        ("implement", "issue-2"),
+        ("implement", "issue-2"),
+    ]
+    assert [path.name for path in setup_paths] == [
+        "run-all-human",
+        "issue-1",
+        "issue-2",
+    ]
+    assert gate_paths == []
+    assert source.claim.call_count == 2
+    assert source.mark_for_human.call_count == 2
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    removed = [
+        call.args[0][3]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "worktree", "remove"]
+    ]
+    assert removed == [
+        str(tmp_path / "wt" / "issue-1"),
+        str(tmp_path / "wt" / "issue-2"),
+        str(tmp_path / "wt" / "run-all-human"),
+    ]
 
 
 def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
@@ -2224,8 +2310,11 @@ def test_batch_is_a_noop_when_no_issue_is_ready(
     source.list_ready.return_value = []
     runner = MagicMock(side_effect=_ok)
 
+    setup = MagicMock()
+    gate = MagicMock()
+    runtime = MagicMock(spec=StubRuntime)
     outcome = orchestrator.run_batch(
-        runtime=StubRuntime(),
+        runtime=runtime,
         issue_source=source,
         fixture_dir=fixture_dir,
         repo="owner/repo",
@@ -2236,13 +2325,21 @@ def test_batch_is_a_noop_when_no_issue_is_ready(
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
         runner=runner,
+        setup=setup,
+        gate_check=gate,
     )
 
+    assert outcome.selected == []
     assert outcome.issues == []
     assert outcome.completed == []
     assert outcome.pr_opened is False
+    assert outcome.succeeded is True
     source.claim.assert_not_called()
+    setup.assert_not_called()
+    gate.assert_not_called()
+    runtime.run.assert_not_called()
     # No branches, worktrees, or PRs when there is nothing to do.
+    assert not _calls_containing(runner, "git", "branch")
     assert not _calls_containing(runner, "git", "worktree", "add")
     assert not _calls_containing(runner, "gh", "pr", "create")
 
