@@ -32,7 +32,7 @@ import logging
 import re
 import signal
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1153,7 +1153,7 @@ RUN_REPORT_LIMIT = 65_536
 
 
 def render_run_context(
-    run_id: str, selected: list[IssueRef], outcomes: list[IssueOutcome]
+    run_id: str, selected: Sequence[IssueRef], outcomes: Sequence[IssueOutcome]
 ) -> str:
     """Render the bounded factual envelope supplied to each Run phase."""
     outcome_by_number = {o.issue.number: o for o in outcomes}
@@ -1331,11 +1331,12 @@ def run_batch(
 
     issues = issue_source.list_ready()
     # Snapshot the ordered selection before any project-owned Run phase executes.
-    # A tuple makes the lifecycle invariant explicit: fixture edits, Issue source
-    # changes, and in-process Runtime behavior cannot add, remove, or reorder the
-    # active batch after its factual prompt envelope has been prepared.
+    # A tuple of deep copies makes the lifecycle invariant explicit: fixture
+    # edits, Issue source changes, and in-process Runtime behavior cannot mutate,
+    # add, remove, or reorder the active batch after selection.
     selected = tuple(
-        select_batch(
+        issue.model_copy(deep=True)
+        for issue in select_batch(
             issues,
             assignee=assignee,
             include_unassigned=include_unassigned,
@@ -1552,7 +1553,7 @@ def _open_pull_request(
     run_worktree: Path,
     fixture_dir: Path,
     runner: Runner,
-    selected: list[IssueRef],
+    selected: Sequence[IssueRef],
     skipped: list[int],
     gate: GateOutcome | None,
     report: str | None,

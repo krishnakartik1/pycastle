@@ -469,6 +469,8 @@ def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
                 )
                 source.list_ready.return_value = [issues[2]]
                 selected_batch[:] = [issues[2]]
+                issues[1].number = 999
+                issues[1].title = "Mutated after selection"
             elif phase == "prepare":
                 assert (cwd / "inventory.txt").is_file()
                 (cwd / "prepared.txt").write_text("prepared\n")
