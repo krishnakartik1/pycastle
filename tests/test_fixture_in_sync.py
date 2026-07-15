@@ -169,12 +169,22 @@ def test_exempt_files_are_real_fixture_paths(tmp_path: Path) -> None:
 
 def test_committed_setup_syncs_pycastle_from_uv_lockfile() -> None:
     """PyCastle's project-owned Setup keeps its uv-locked environment pinned."""
-    setup = _repo_root() / FIXTURE_DIRNAME / "setup"
-    contents = setup.read_text()
+    repo = _repo_root()
+    setup = repo / FIXTURE_DIRNAME / "setup"
+    commands = [
+        line
+        for line in setup.read_text().splitlines()
+        if line and not line.startswith("#")
+    ]
 
-    assert "export UV_PROJECT_ENVIRONMENT=.pycastle/venv" in contents
-    assert "uv sync --all-extras" in contents
-    assert "pip install" not in contents
+    assert (repo / "uv.lock").is_file()
+    assert commands == [
+        "set -euo pipefail",
+        "python3 -m venv --system-site-packages .pycastle/venv",
+        "source .pycastle/venv/bin/activate",
+        "export UV_PROJECT_ENVIRONMENT=.pycastle/venv",
+        "uv sync --all-extras",
+    ]
     assert stat.S_IMODE(setup.stat().st_mode) == 0o755
 
 
