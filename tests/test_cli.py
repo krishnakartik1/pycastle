@@ -208,6 +208,36 @@ def test_parses_sandbox_setup() -> None:
 def test_parses_init() -> None:
     args = build_parser().parse_args(["init"])
     assert args.command == "init"
+    assert args.sandbox is None
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("", "host"),
+        ("host", "host"),
+        ("H", "host"),
+        (" d ", "docker"),
+        ("DOCKER", "docker"),
+        ("invalid", "host"),
+    ],
+)
+def test_prompt_sandbox_resolves_interactive_answers(
+    monkeypatch: pytest.MonkeyPatch, answer: str, expected: str
+) -> None:
+    """The prompt preserves its Docker aliases and host-first default."""
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+
+    assert cli._prompt_sandbox() == expected
+
+
+def test_prompt_sandbox_treats_eof_as_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closed stdin resolves directly to host without leaking EOFError."""
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
+
+    assert cli._prompt_sandbox() == "host"
 
 
 @pytest.mark.parametrize("sandbox", ["host", "docker"])
@@ -288,8 +318,8 @@ def test_init_scaffolds_the_chosen_sandbox(
 ) -> None:
     """``pycastle init`` prompts host/docker and scaffolds the matching fixture.
 
-    The interactive prompt is stubbed (it is not unit-tested); we assert the
-    answer is threaded into the scaffolder and a fixture is written into cwd.
+    The interactive prompt is stubbed so this test can focus on threading the
+    answer into the scaffolder and writing a fixture into cwd.
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)

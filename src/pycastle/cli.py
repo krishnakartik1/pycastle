@@ -7,6 +7,7 @@ import datetime
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from . import __version__, sandbox
 from .commands import run_cmd
@@ -25,7 +26,12 @@ from .preflight import (
     check_required_commands,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
-from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
+from .scaffold import (
+    FixtureExistsError,
+    SandboxChoice,
+    read_sandbox,
+    scaffold_fixture,
+)
 from .upgrade import FixtureUpgradeError, upgrade_fixture
 
 logger = logging.getLogger("pycastle")
@@ -487,13 +493,13 @@ def _setup_codex(image: str) -> int:
     return 0
 
 
-def _prompt_sandbox() -> str:
+def _prompt_sandbox() -> SandboxChoice:
     """Ask whether execution is host-first or Docker-first; default to host.
 
     The default is host-first because it needs no Docker image build to run the
     scaffolded fixture. An empty answer (Enter) takes the default; ``docker``
-    (or ``d``) picks Docker-first. This interactive prompt is not unit-tested;
-    the scaffolding it drives is.
+    (or ``d``) picks Docker-first. End-of-file is treated like an empty answer
+    so non-interactive callers retain the host default.
     """
     try:
         answer = (
@@ -512,9 +518,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
     ``.pycastle/`` so a project's prompts, gate, and graph shape are never
     silently replaced.
     """
-    choice = args.sandbox if args.sandbox is not None else _prompt_sandbox()
+    choice = (
+        cast(SandboxChoice, args.sandbox)
+        if args.sandbox is not None
+        else _prompt_sandbox()
+    )
     try:
-        written = scaffold_fixture(Path.cwd(), sandbox=choice)  # type: ignore[arg-type]
+        written = scaffold_fixture(Path.cwd(), sandbox=choice)
     except FixtureExistsError as exc:
         logger.error("%s", exc)
         return 1
