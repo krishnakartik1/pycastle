@@ -100,6 +100,8 @@ keeps their branches intact.
 
 - `pycastle --version` — print the normalized installed PyCastle release.
 - `pycastle init` — scaffold the `.pycastle/` project fixture described above.
+- `pycastle upgrade` — transactionally apply bundled forward migrations to an
+  initialized Project fixture, leaving the result as an unstaged diff to review.
 - `pycastle run -i N --runtime claude` — work up to `N` ready issues; the
   default is one. Use `--include-unassigned` to include unassigned issues.
 - `pycastle run --sandbox docker --runtime codex` — override the recorded
@@ -121,6 +123,32 @@ project's real checks, and `.pycastle/main.py` to add phases or redirect their
 success and failure transitions. Every phase and the gate runs in the selected
 sandbox; orchestration such as `git`, `gh`, worktree management, and image
 building stays on the host.
+
+## Upgrade a Project fixture
+
+Choose a PyCastle release tag, reinstall that exact runner, and then explicitly
+migrate each initialized repository. For example, for `v0.1.0`:
+
+```bash
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.0
+cd /path/to/initialized/repository
+pycastle upgrade
+```
+
+The equivalent `pipx` workflow is:
+
+```bash
+pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.0
+cd /path/to/initialized/repository
+pycastle upgrade
+```
+
+Run `pycastle upgrade` once in every initialized repository. It applies only
+bundled runner/fixture contract migrations; it does not synchronize newer
+scaffold templates or overwrite project-owned improvements. The command refuses
+a dirty worktree and leaves a successful migration as an unstaged diff for you
+to inspect. PyCastle performs no self-update or update discovery, and it does
+not create a commit, branch, pull request, or merge authorization.
 
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
 agent image. An unchanged recipe reuses its content-addressed image; editing the

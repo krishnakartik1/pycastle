@@ -26,6 +26,7 @@ from .preflight import (
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import FixtureExistsError, read_sandbox, scaffold_fixture
+from .upgrade import FixtureUpgradeError, upgrade_fixture
 
 logger = logging.getLogger("pycastle")
 
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
+    sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
     sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
 
     sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
@@ -513,6 +515,26 @@ def _cmd_init(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_upgrade() -> int:
+    """Migrate the Project fixture and leave a reviewable unstaged diff."""
+    result = upgrade_fixture(Path.cwd())
+    if result.changed:
+        detail = ", ".join(result.applied_versions) or "already-corrected targets"
+        logger.info(
+            "Upgraded the Project fixture from %s to %s (migrations: %s).",
+            result.fixture_version,
+            result.runner_version,
+            detail,
+        )
+    else:
+        logger.info(
+            "Project fixture %s is compatible with PyCastle %s; no migration applies.",
+            result.fixture_version,
+            result.runner_version,
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, run preflight, and dispatch the chosen command."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -539,13 +561,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_run(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "upgrade":
+            return _cmd_upgrade()
         if args.command == "prune":
             return _cmd_prune()
         if args.command == "sandbox":
             if args.sandbox_command == "build":
                 return _cmd_sandbox_build(args)
             return _cmd_sandbox_setup(args)
-    except (FixtureCompatibilityError, PreflightError, PruneError) as exc:
+    except (
+        FixtureCompatibilityError,
+        FixtureUpgradeError,
+        PreflightError,
+        PruneError,
+    ) as exc:
         # Covers both preflight (missing commands) and a failed on-demand image
         # build, which raises PreflightError rather than running a missing image.
         logger.error("%s", exc)

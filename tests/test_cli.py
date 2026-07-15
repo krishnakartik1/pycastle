@@ -10,8 +10,10 @@ import pytest
 from packaging.version import Version
 
 from pycastle import cli
+from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
 from pycastle.preflight import PreflightError
+from pycastle.upgrade import FixtureMigration
 
 
 def test_version_flag_reports_built_package_version(
@@ -53,6 +55,36 @@ def test_incompatible_run_stops_before_any_run_side_effect(
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
     touched.assert_not_called()
     assert diagnostic in caplog.text
+
+
+def test_run_directs_to_upgrade_when_registered_migration_applies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    (fixture / "version").write_text("0.0.1\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(
+        fixture_migrations,
+        "MIGRATIONS",
+        (
+            FixtureMigration(
+                "0.1.0",
+                lambda _path: False,
+                lambda _path: None,
+                lambda _path: True,
+            ),
+        ),
+    )
+    side_effect = MagicMock(side_effect=AssertionError("Run side effect started"))
+    monkeypatch.setattr(cli, "_resolve_repo", side_effect)
+
+    assert main(["run", "--runtime", "stub"]) == 1
+    side_effect.assert_not_called()
+    assert "pycastle upgrade" in caplog.text
 
 
 def test_parses_run_arguments() -> None:
@@ -176,6 +208,19 @@ def test_parses_sandbox_setup() -> None:
 def test_parses_init() -> None:
     args = build_parser().parse_args(["init"])
     assert args.command == "init"
+
+
+def test_parses_and_dispatches_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    upgraded = MagicMock()
+    upgraded.changed = False
+    upgraded.fixture_version = "1.0"
+    upgraded.runner_version = "1.0"
+    monkeypatch.setattr(cli, "upgrade_fixture", MagicMock(return_value=upgraded))
+
+    assert build_parser().parse_args(["upgrade"]).command == "upgrade"
+    assert main(["upgrade"]) == 0
+    cli.upgrade_fixture.assert_called_once_with(Path.cwd())
 
 
 def test_main_fails_fast_when_preflight_fails(
