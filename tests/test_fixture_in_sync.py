@@ -35,6 +35,7 @@ whatever the running loop leaves behind.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -164,6 +165,17 @@ def test_exempt_files_are_real_fixture_paths(tmp_path: Path) -> None:
         f"_EXEMPT_FROM_BYTES names paths the scaffolder no longer writes: "
         f"{sorted(stale)}"
     )
+
+
+def test_committed_setup_syncs_pycastle_from_uv_lockfile() -> None:
+    """PyCastle's project-owned Setup keeps its uv-locked environment pinned."""
+    setup = _repo_root() / FIXTURE_DIRNAME / "setup"
+    contents = setup.read_text()
+
+    assert "export UV_PROJECT_ENVIRONMENT=.pycastle/venv" in contents
+    assert "uv sync --all-extras" in contents
+    assert "pip install" not in contents
+    assert stat.S_IMODE(setup.stat().st_mode) == 0o755
 
 
 def test_guard_catches_byte_drift(tmp_path: Path) -> None:
