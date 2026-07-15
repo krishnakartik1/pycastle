@@ -429,7 +429,7 @@ class RunOutcome:
         return [o.issue.number for o in self.issues if o.merged]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RunContext:
     """Host-side identity and command boundary for one active Run worktree."""
 
@@ -438,6 +438,14 @@ class RunContext:
     worktree: Path
     fixture_dir: Path
     runner: Runner
+    remote_checkpoint_succeeded: bool = False
+
+
+@dataclass
+class CancellationState:
+    """Mutable ownership state inspected by the Run cancellation boundary."""
+
+    in_flight: IssueRef | None = None
 
 
 @dataclass(frozen=True)
@@ -645,39 +653,68 @@ def _sigint_as_keyboard_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGINT, previous)
 
 
-def _cleanup_interrupted(
+def _cleanup_cancelled(
     *,
-    issue: IssueRef,
+    issue: IssueRef | None,
     issue_source: IssueSource,
     worktree_root: Path,
     workspace: Path,
     run: RunContext,
 ) -> None:
-    """Tear down an interrupted run: remove worktrees, restore the ready state.
+    """Best-effort cancellation cleanup with a factual recovery summary."""
+    manual_cleanup: list[Path] = []
+    worktrees = ([worktree_root / f"issue-{issue.number}"] if issue else []) + [
+        run.worktree
+    ]
+    for worktree in worktrees:
+        failed = False
+        for argv in (
+            ["git", "worktree", "remove", str(worktree), "--force"],
+            ["git", "worktree", "prune"],
+        ):
+            try:
+                result = run.runner(argv, capture=True, cwd=workspace)
+                failed = failed or getattr(result, "returncode", 1) != 0
+            except BaseException:  # cleanup must never replace the interruption
+                failed = True
+                logger.exception("Cancellation cleanup command failed for %s", worktree)
+        if failed:
+            manual_cleanup.append(worktree)
 
-    Called when an interrupt (SIGINT/``KeyboardInterrupt``) or any exception
-    escapes while ``issue`` is in flight. It removes that issue's worktree and
-    the run worktree so no orphaned worktrees are left, then releases the issue
-    back to ``ready-for-agent`` so it is not stuck claimed. Cleanup is
-    best-effort: a failure removing one worktree must not stop the release, so
-    each step is guarded and logged rather than allowed to mask the interrupt.
-    """
-    issue_worktree = worktree_root / f"issue-{issue.number}"
-    for worktree in (issue_worktree, run.worktree):
+    release_failure = False
+    if issue is not None:
         try:
-            cleanup_worktree(worktree, runner=run.runner, cwd=workspace)
-        except Exception:  # noqa: BLE001 - best-effort teardown, never re-raise here
-            logger.exception("Failed to remove worktree %s during interrupt", worktree)
-    try:
-        issue_source.release(issue.number)
-    except Exception:  # noqa: BLE001 - best-effort restore, never mask the interrupt
-        logger.exception("Failed to restore ready state on #%s", issue.number)
-    _append_log(
-        run.fixture_dir,
-        run.run_id,
-        f"Run interrupted while working #{issue.number}; "
-        "worktrees removed and issue released to ready-for-agent.",
+            issue_source.release(issue.number)
+        except BaseException:  # release is independent best-effort cleanup
+            release_failure = True
+            logger.exception("Failed to release in-flight Item #%s", issue.number)
+
+    records = _telemetry_dir(run.fixture_dir, run.run_id)
+    recovery = (
+        f"Remote checkpoint: origin/{run.branch}."
+        if run.remote_checkpoint_succeeded
+        else "No remote checkpoint survived."
     )
+    cleanup = (
+        "Cleanup completed."
+        if not manual_cleanup
+        else "Manual worktree cleanup required: "
+        + ", ".join(str(path) for path in manual_cleanup)
+        + "."
+    )
+    release = (
+        f" In-flight Item #{issue.number} could not be released."
+        if issue is not None and release_failure
+        else (f" In-flight Item #{issue.number} released." if issue is not None else "")
+    )
+    summary = (
+        f"Run cancelled; no pull request opened. {recovery} "
+        f"Retained records: {records}. {cleanup}{release}"
+    )
+    try:
+        _append_log(run.fixture_dir, run.run_id, summary)
+    except BaseException:  # reporting is best-effort and cannot mask cancellation
+        logger.exception("Could not persist cancellation recovery summary: %s", summary)
 
 
 _HANDOFF_PROMPT = (
@@ -948,6 +985,7 @@ def _work_issue(
     gate_check: GateCheck,
     setup: Setup,
     item_graph: PhaseGraph,
+    cancellation: CancellationState | None = None,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
@@ -977,6 +1015,8 @@ def _work_issue(
     runner = run.runner
     branch = issue_branch_name(issue)
     issue_source.claim(issue.number, assignee=assignee)
+    if cancellation is not None:
+        cancellation.in_flight = issue
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
     # The gate sink is built unconditionally — a failing gate surfaces its output
@@ -1032,6 +1072,8 @@ def _work_issue(
             run_id,
             f"#{issue.number} reached the HUMAN terminal; marked ready-for-human.",
         )
+        if cancellation is not None:
+            cancellation.in_flight = None
         cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
         return IssueOutcome(issue=issue, branch=branch, merged=False)
@@ -1069,6 +1111,8 @@ def _work_issue(
             run_id,
             f"#{issue.number} produced no changes; marked ready-for-human.",
         )
+        if cancellation is not None:
+            cancellation.in_flight = None
         cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
         runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
         return IssueOutcome(issue=issue, branch=branch, merged=False)
@@ -1091,6 +1135,12 @@ def _work_issue(
         # The merge is the durability boundary: push it before cleaning up the
         # item worktree so the remote checkpoint follows the fold immediately.
         _push_run_branch(run=run, final=False)
+
+    # The Item outcome and its durability attempt are complete.  Clear ownership
+    # before local cleanup so an interrupt at the return boundary cannot release
+    # an Item whose outcome is already durable.
+    if cancellation is not None:
+        cancellation.in_flight = None
 
     cleanup_worktree(issue_worktree, runner=runner, cwd=workspace)
     runner(["git", "branch", "-D", branch], capture=True, cwd=workspace)
@@ -1382,23 +1432,26 @@ def run_batch(
         f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
     )
 
+    cancellation = CancellationState()
     try:
-        setup(run_worktree)
-        if run_definition.before is not None:
-            before = _walk_run_graph(
-                run_definition.before,
-                runtime=runtime,
-                run=run,
-                context=render_run_context(run_id, selected, []),
-            )
-        else:
-            before = None
+        with _sigint_as_keyboard_interrupt():
+            setup(run_worktree)
+            if run_definition.before is not None:
+                before = _walk_run_graph(
+                    run_definition.before,
+                    runtime=runtime,
+                    run=run,
+                    context=render_run_context(run_id, selected, []),
+                )
+            else:
+                before = None
     except KeyboardInterrupt:
-        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-        _append_log(
-            fixture_dir,
-            run_id,
-            f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+        _cleanup_cancelled(
+            issue=cancellation.in_flight,
+            issue_source=issue_source,
+            worktree_root=worktree_root,
+            workspace=workspace,
+            run=run,
         )
         raise
     except SetupError as exc:
@@ -1421,11 +1474,9 @@ def run_batch(
     # Track the issue currently in flight so an interrupt (SIGINT) or any
     # exception mid-issue can clean up that issue's worktree and restore its
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
-    in_flight: IssueRef | None = None
     with _sigint_as_keyboard_interrupt():
         try:
             for issue in selected:
-                in_flight = issue
                 try:
                     item_outcome = _work_issue(
                         issue,
@@ -1439,6 +1490,7 @@ def run_batch(
                         gate_check=gate_check,
                         setup=setup,
                         item_graph=run_definition.item,
+                        cancellation=cancellation,
                         verbose=verbose,
                     )
                 except Exception as exc:  # handled infrastructure boundary
@@ -1448,8 +1500,8 @@ def run_batch(
                         cwd=workspace,
                     )
                     issue_source.release(issue.number)
+                    cancellation.in_flight = None
                     if not outcome.completed:
-                        in_flight = None
                         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
                         raise
                     outcome.succeeded = False
@@ -1457,22 +1509,16 @@ def run_batch(
                         f"Item #{issue.number} infrastructure failure: {exc}"
                     )
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
-                    in_flight = None
                     break
                 outcome.issues.append(item_outcome)
-                in_flight = None
-        except BaseException:
-            # An interrupt or unexpected error mid-issue: leave no orphaned
-            # worktrees and no stuck-claimed issue, then re-raise so the caller
-            # sees the cancellation.
-            if in_flight is not None:
-                _cleanup_interrupted(
-                    issue=in_flight,
-                    issue_source=issue_source,
-                    worktree_root=worktree_root,
-                    workspace=workspace,
-                    run=run,
-                )
+        except KeyboardInterrupt:
+            _cleanup_cancelled(
+                issue=cancellation.in_flight,
+                issue_source=issue_source,
+                worktree_root=worktree_root,
+                workspace=workspace,
+                run=run,
+            )
             raise
 
     completed = outcome.completed
@@ -1480,25 +1526,28 @@ def run_batch(
         run_gate: GateOutcome | None = None
         publication_error: str | None = None
         try:
-            if outcome.succeeded:
-                setup(run_worktree)
-                if run_definition.after is not None:
-                    after = _walk_run_graph(
-                        run_definition.after,
-                        runtime=runtime,
-                        run=run,
-                        context=render_run_context(run_id, selected, outcome.issues),
+            with _sigint_as_keyboard_interrupt():
+                if outcome.succeeded:
+                    setup(run_worktree)
+                    if run_definition.after is not None:
+                        after = _walk_run_graph(
+                            run_definition.after,
+                            runtime=runtime,
+                            run=run,
+                            context=render_run_context(
+                                run_id, selected, outcome.issues
+                            ),
+                        )
+                        if after.terminal is HUMAN:
+                            outcome.succeeded = False
+                            outcome.stopping_point = "after-Run HUMAN"
+                    run_gate = gate_check(run_worktree)
+                    (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
+                        run_gate.output
                     )
-                    if after.terminal is HUMAN:
+                    if not run_gate.passed:
                         outcome.succeeded = False
-                        outcome.stopping_point = "after-Run HUMAN"
-                run_gate = gate_check(run_worktree)
-                (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
-                    run_gate.output
-                )
-                if not run_gate.passed:
-                    outcome.succeeded = False
-                    outcome.stopping_point = "Run Gate"
+                        outcome.stopping_point = "Run Gate"
         except SetupError as exc:
             if outcome.succeeded:
                 outcome.succeeded = False
@@ -1509,11 +1558,12 @@ def run_batch(
             outcome.stopping_point = f"after-Run checkpoint: {exc}"
             _append_log(fixture_dir, run_id, outcome.stopping_point)
         except KeyboardInterrupt:
-            cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-            _append_log(
-                fixture_dir,
-                run_id,
-                f"Run cancelled; no pull request opened. Surviving branch: {run_branch}",
+            _cleanup_cancelled(
+                issue=cancellation.in_flight,
+                issue_source=issue_source,
+                worktree_root=worktree_root,
+                workspace=workspace,
+                run=run,
             )
             raise
         report, report_error = _harvest_report(run)
@@ -1835,6 +1885,8 @@ def _push_run_branch(
         logger.warning("Could not push Run branch %s: %s", run.branch, exc)
 
     if succeeded:
+        if not final:
+            run.remote_checkpoint_succeeded = True
         _append_log(run.fixture_dir, run.run_id, f"Pushed Run checkpoint {run.branch}")
         return True
 

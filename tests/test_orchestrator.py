@@ -2493,6 +2493,114 @@ class _InterruptingRuntime:
         raise KeyboardInterrupt
 
 
+def test_cancellation_during_before_run_setup_retains_records_without_remote_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="before-setup-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+            setup=lambda _worktree: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+    source.claim.assert_not_called()
+    source.release.assert_not_called()
+    records = fixture / "runs" / "before-setup-cancel"
+    assert records.is_dir()
+    log = (records / "run.log").read_text()
+    assert "No remote checkpoint survived" in log
+    assert f"Retained records: {records}" in log
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_cancellation_during_after_run_preserves_completed_item_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    issue = IssueRef(number=2, title="Completed", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    runner = _git_aware_runner()
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                raise KeyboardInterrupt
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="after-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_not_called()
+    source.mark_for_human.assert_not_called()
+    log = (fixture / "runs" / "after-cancel" / "run.log").read_text()
+    assert "Remote checkpoint: origin/pycastle/run-after-cancel" in log
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    assert not _calls_containing(runner, "gh", "pr", "ready")
+
+
+def test_interrupt_after_item_settles_does_not_release_completed_item(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issue = IssueRef(number=2, title="Completed", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+
+    def interrupt_on_item_cleanup(argv: list[str], **kwargs: object) -> object:
+        if argv[:4] == ["git", "worktree", "remove", str(tmp_path / "wt" / "issue-2")]:
+            raise KeyboardInterrupt
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=interrupt_on_item_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="settled-boundary",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.release.assert_not_called()
+    assert _calls_containing(
+        runner, "git", "push", "origin", "pycastle/run-settled-boundary"
+    )
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
 def test_interrupt_mid_issue_cleans_worktrees_and_restores_ready_state(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -2627,6 +2735,40 @@ def test_interrupt_cleanup_still_releases_when_worktree_removal_errors(
     assert raised
     # A failed worktree removal did not stop the restore: the issue is released.
     source.release.assert_called_once_with(2)
+    log = (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    assert f"Manual worktree cleanup required: {tmp_path / 'wt' / 'issue-2'}" in log
+    assert str(tmp_path / "wt" / "run-20260613-101500") in log
+
+
+def test_cancellation_cleanup_reports_nonzero_results_and_release_failure(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="Interrupted", assignees=["krishna"])
+    source = MagicMock()
+    source.release.side_effect = RuntimeError("GitHub unavailable")
+    runner = MagicMock(return_value=MagicMock(returncode=1))
+    run = orchestrator.RunContext(
+        run_id="cleanup-failure",
+        branch="pycastle/run-cleanup-failure",
+        worktree=tmp_path / "wt" / "run-cleanup-failure",
+        fixture_dir=fixture_dir,
+        runner=runner,
+    )
+
+    orchestrator._cleanup_cancelled(
+        issue=issue,
+        issue_source=source,
+        worktree_root=tmp_path / "wt",
+        workspace=tmp_path,
+        run=run,
+    )
+
+    source.release.assert_called_once_with(2)
+    assert runner.call_count == 4
+    log = (fixture_dir / "runs" / "cleanup-failure" / "run.log").read_text()
+    assert str(tmp_path / "wt" / "issue-2") in log
+    assert str(run.worktree) in log
+    assert "In-flight Item #2 could not be released" in log
 
 
 def test_interrupt_after_all_issues_complete_is_a_clean_run(
