@@ -1014,9 +1014,14 @@ def _work_issue(
     run_branch = run.branch
     runner = run.runner
     branch = issue_branch_name(issue)
-    issue_source.claim(issue.number, assignee=assignee)
+    # Record ownership before calling the external Issue source.  A claim can
+    # complete remotely and then surface ``KeyboardInterrupt`` locally, so
+    # recording it afterwards leaves a cancellation race where the Item stays
+    # claimed.  ``release`` is the existing idempotent recovery operation for
+    # claim failures as well as interruptions.
     if cancellation is not None:
         cancellation.in_flight = issue
+    issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
     # The gate sink is built unconditionally — a failing gate surfaces its output

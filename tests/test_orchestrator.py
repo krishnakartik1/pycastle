@@ -2565,6 +2565,37 @@ def test_cancellation_during_after_run_preserves_completed_item_checkpoint(
     assert not _calls_containing(runner, "gh", "pr", "ready")
 
 
+def test_cancellation_as_claim_returns_releases_only_that_item(tmp_path: Path) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    issues = [
+        IssueRef(number=2, title="Claimed", assignees=["krishna"]),
+        IssueRef(number=4, title="Untouched", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    source.claim.side_effect = KeyboardInterrupt
+    runner = _git_aware_runner()
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=StubRuntime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="claim-cancel",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    source.claim.assert_called_once_with(2, assignee="krishna")
+    source.release.assert_called_once_with(2)
+    source.mark_for_human.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
 def test_interrupt_after_item_settles_does_not_release_completed_item(
     tmp_path: Path,
 ) -> None:
