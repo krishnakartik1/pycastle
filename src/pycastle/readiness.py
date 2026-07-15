@@ -165,7 +165,10 @@ def evaluate_readiness(
                     )
                 )
             except (
+                AttributeError,
+                KeyError,
                 OSError,
+                TypeError,
                 ValueError,
                 json.JSONDecodeError,
                 subprocess.TimeoutExpired,

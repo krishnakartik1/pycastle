@@ -314,6 +314,33 @@ def test_zero_items_is_a_failure_with_actionable_remediation() -> None:
     assert report.ready is False
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        AttributeError("Item metadata is not an object"),
+        KeyError("number"),
+        TypeError("Item metadata has an invalid shape"),
+    ],
+)
+def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
+    def invalid_items(_configuration: ReadinessConfiguration) -> list[EligibleItem]:
+        raise error
+
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
+            eligible_items=invalid_items,
+        ),
+    )
+
+    check = report.checks[-1]
+    assert check.id == "eligible_items"
+    assert check.status is Status.FAIL
+    assert report.eligible_items == ()
+    assert report.ready is False
+
+
 def test_child_diagnostics_are_not_retained_in_report() -> None:
     secret = "ghp_super_secret raw gate output"
     report = evaluate_readiness(
