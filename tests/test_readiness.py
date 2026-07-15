@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -310,6 +311,8 @@ def test_docker_probes_share_isolated_workspace_and_runtime_conventions(
         disposable = adapter._docker_workspace
         assert disposable is not None and disposable.exists()
         assert (disposable / "gate").read_text() == (fixture / "gate").read_text()
+        assert stat.S_IMODE(disposable.stat().st_mode) == 0o777
+        assert stat.S_IMODE((disposable / "gate").stat().st_mode) == 0o755
 
     assert image.status is Status.PASS
     assert gate.status is Status.PASS
@@ -435,6 +438,20 @@ def test_docker_authentication_uses_resolved_image_and_canonical_auth_volume(
     assert kwargs == {"cwd": tmp_path, "capture": True, "timeout": 15.0}
     other = "codex" if runtime == "claude" else "claude"
     assert sandbox.auth_volume(other) not in call
+
+
+def test_unknown_runtime_authentication_fails_without_running_command(
+    tmp_path: Path,
+) -> None:
+    runner = DockerRecordingRunner()
+    config = docker_configuration(runtime="unknown")
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path, runner=runner)
+
+    result = adapter.check_runtime_authentication(config)
+
+    assert result.status is Status.FAIL
+    assert result.summary == "The selected Runtime has no authentication convention."
+    assert runner.calls == []
 
 
 def test_missing_gate_runs_nothing_and_creates_no_disposable_workspace(

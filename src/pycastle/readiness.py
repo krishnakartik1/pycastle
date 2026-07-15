@@ -351,6 +351,11 @@ class DefaultReadinessAdapter:
             self._docker_workspace = Path(
                 tempfile.mkdtemp(prefix="pycastle-doctor-")
             ).resolve()
+            # Docker always runs as the canonical ``node`` user, whose uid may
+            # differ from the host caller that owns this directory. This path
+            # holds no repository or credential data, so allow that user to
+            # traverse and write the disposable bind mount.
+            self._docker_workspace.chmod(0o777)
         return self._docker_workspace
 
     def _run(self, argv: list[str], *, timeout: float = SHORT_TIMEOUT) -> Any:
@@ -630,7 +635,14 @@ test -w "$workspace_file"
             return CheckResult(
                 Status.NOT_APPLICABLE, "Stub Runtime needs no authentication."
             )
-        argv = list(sandbox.RUNTIME_CONFIG[config.runtime].status_args)
+        runtime_config = sandbox.RUNTIME_CONFIG.get(config.runtime)
+        if runtime_config is None:
+            return CheckResult(
+                Status.FAIL,
+                "The selected Runtime has no authentication convention.",
+                remediation="Select Claude, Codex, or the Stub Runtime.",
+            )
+        argv = list(runtime_config.status_args)
         if config.sandbox == "docker":
             argv = sandbox.build_status_command(
                 config.runtime, image=config.agent_image or sandbox.DEFAULT_IMAGE
@@ -662,7 +674,8 @@ test -w "$workspace_file"
             workspace = self._readiness_workspace()
             disposable_gate = workspace / "gate"
             shutil.copy2(gate, disposable_gate)
-            disposable_gate.chmod(disposable_gate.stat().st_mode | 0o100)
+            # The canonical container user may not share the host owner's uid.
+            disposable_gate.chmod(0o755)
             argv = [str(disposable_gate), "--check-tools"]
             argv = sandbox.build_run_command(
                 config.runtime,
