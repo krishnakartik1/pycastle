@@ -550,13 +550,23 @@ class DefaultReadinessAdapter:
         result = self._run(
             ["gh", "repo", "view", config.repository, "--json", "nameWithOwner"]
         )
+        identity = ""
+        if self._ok(result):
+            document = json.loads(getattr(result, "stdout", "") or "{}")
+            if isinstance(document, dict):
+                value = document.get("nameWithOwner")
+                identity = value if isinstance(value, str) else ""
+        matches = (
+            bool(config.repository)
+            and identity.casefold() == config.repository.casefold()
+        )
         return (
             CheckResult(
                 Status.PASS,
                 "GitHub repository identity is reachable.",
                 {"repository": config.repository},
             )
-            if self._ok(result)
+            if matches
             else CheckResult(
                 Status.FAIL,
                 "GitHub repository identity is not reachable.",
@@ -630,7 +640,10 @@ class DefaultReadinessAdapter:
 
 
 def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> None:
-    prompts = (fixture_dir / "prompts").resolve()
+    prompt_root = fixture_dir / "prompts"
+    if prompt_root.is_symlink() or not prompt_root.is_dir():
+        raise ValueError("Invalid prompts directory")
+    prompts = prompt_root.resolve()
     for scope, graph in (
         ("before", definition.before),
         ("item", definition.item),
@@ -644,8 +657,14 @@ def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> No
             for target in (phase.on_success, phase.on_failure):
                 if not isinstance(target, Terminal) and target not in graph.phases:
                     raise ValueError(f"Invalid edge in {scope} graph")
-            path = (prompts / phase.prompt).resolve()
-            if prompts not in path.parents or not path.is_file() or path.is_symlink():
+            candidate = prompts / phase.prompt
+            path = candidate.resolve()
+            relative_parts = candidate.relative_to(prompts).parts
+            has_symlink = any(
+                (prompts.joinpath(*relative_parts[:index])).is_symlink()
+                for index in range(1, len(relative_parts) + 1)
+            )
+            if prompts not in path.parents or not path.is_file() or has_symlink:
                 raise ValueError(f"Invalid prompt path in {scope} graph")
     for name in ("setup", "gate"):
         path = fixture_dir / name
