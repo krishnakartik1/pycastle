@@ -561,7 +561,9 @@ def _run_transcript_sink(
 
     def _sink(phase: str, tag: str, text: str) -> None:
         with path.open("a") as handle:
-            handle.write(f"[{scope}] [{phase}] [{tag}] {text}\n")
+            lines = text.splitlines() or [""]
+            for line in lines:
+                handle.write(f"[{scope}] [{phase}] [{tag}] {line}\n")
 
     return _sink
 
@@ -1281,6 +1283,7 @@ def _checkpoint_run_phase(
     scope: str = "Run",
 ) -> None:
     """Commit a successful Run phase when dirty and attempt a durability push."""
+    argv: Sequence[str]
     try:
         add_argv = [
             "git",
@@ -1291,6 +1294,7 @@ def _checkpoint_run_phase(
             f":(exclude,top){RUN_REVIEW}",
             f":(exclude,top){RUN_REPORT}",
         ]
+        argv = add_argv
         staged = run.runner(
             add_argv,
             capture=True,
@@ -1303,6 +1307,7 @@ def _checkpoint_run_phase(
             raise RunCheckpointError(detail)
 
         diff_argv = ["git", "diff", "--cached", "--quiet"]
+        argv = diff_argv
         dirty = run.runner(
             diff_argv,
             capture=True,
@@ -1321,6 +1326,7 @@ def _checkpoint_run_phase(
                 "-m",
                 f"chore: checkpoint Run phase {phase.name}",
             ]
+            argv = commit_argv
             committed = run.runner(
                 commit_argv,
                 capture=True,
@@ -1336,7 +1342,10 @@ def _checkpoint_run_phase(
                 )
                 raise RunCheckpointError(detail)
     except OSError as exc:
-        raise RunCheckpointError(f"checkpoint failed for {phase.name}: {exc}") from exc
+        detail = _record_host_command_exception(
+            run, scope=scope, phase=phase.name, argv=argv, exc=exc
+        )
+        raise RunCheckpointError(detail) from exc
 
     _push_run_branch(run=run, final=False)
 
@@ -1405,6 +1414,31 @@ def _record_host_command_failure(
             f"exit code: {getattr(result, 'returncode', None)!r}",
             f"stdout: {getattr(result, 'stdout', None)!r}",
             f"stderr: {getattr(result, 'stderr', None)!r}",
+        )
+    )
+    logger.error("%s", detail)
+    sink = _run_transcript_sink(run.fixture_dir, run.run_id, scope)
+    for line in detail.splitlines():
+        sink(phase, "HOST-COMMAND", line)
+    return detail
+
+
+def _record_host_command_exception(
+    run: RunContext,
+    *,
+    scope: str,
+    phase: str,
+    argv: Sequence[str],
+    exc: OSError,
+) -> str:
+    """Surface command identity when a boundary command cannot be launched."""
+    detail = "\n".join(
+        (
+            "Host command could not be launched",
+            f"argv: {json.dumps(list(argv))}",
+            "exit code: unavailable",
+            "stdout: unavailable",
+            f"stderr: {str(exc)!r}",
         )
     )
     logger.error("%s", detail)

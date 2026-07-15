@@ -1606,6 +1606,22 @@ def test_run_transcript_sink_interleaves_scoped_phase_lines(
     ]
 
 
+def test_run_transcript_sink_tags_multiline_and_empty_chunks(
+    fixture_dir: Path,
+) -> None:
+    sink = orchestrator._run_transcript_sink(fixture_dir, "edge-chunks", "after-Run")
+
+    sink("review", "OUTPUT", "first\nsecond")
+    sink("report", "THINKING", "")
+
+    path = fixture_dir / "runs" / "edge-chunks" / "run-phase-transcript.log"
+    assert path.read_text().splitlines() == [
+        "[after-Run] [review] [OUTPUT] first",
+        "[after-Run] [review] [OUTPUT] second",
+        "[after-Run] [report] [THINKING] ",
+    ]
+
+
 def test_run_phase_telemetry_appends_scoped_records(fixture_dir: Path) -> None:
     before = orchestrator.PhaseResult(
         phase="review",
@@ -1822,6 +1838,57 @@ def test_failed_after_run_checkpoint_retains_transcript_and_git_diagnostics(
     assert "stderr: 'fatal: distinctive add error'" in transcript
     assert "output-after" not in (run_dir / "issue-2-transcript.log").read_text()
     assert "fatal: distinctive add error" in caplog.text
+
+
+def test_after_run_checkpoint_launch_error_retains_command_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    issue = IssueRef(number=2, title="Launch evidence", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    after_finished = False
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            nonlocal after_finished
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            after_finished = phase == "after"
+            return result
+
+    base_runner = _git_aware_runner()
+
+    def fail_after_add(argv: list[str], **kwargs: object) -> object:
+        if after_finished and argv[:2] == ["git", "add"]:
+            raise OSError("git executable vanished")
+        return base_runner(argv, **kwargs)
+
+    with caplog.at_level("ERROR"):
+        outcome = orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="launch-failure",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=MagicMock(side_effect=fail_after_add),
+            verbose=True,
+        )
+
+    assert outcome.stopping_point is not None
+    assert outcome.stopping_point.startswith("after-Run checkpoint:")
+    transcript = (
+        fixture / "runs" / "launch-failure" / "run-phase-transcript.log"
+    ).read_text()
+    assert 'argv: ["git", "add", "-A"' in transcript
+    assert "exit code: unavailable" in transcript
+    assert "stdout: unavailable" in transcript
+    assert "stderr: 'git executable vanished'" in transcript
+    assert "git executable vanished" in caplog.text
 
 
 def test_batch_works_up_to_n_issues_into_one_pr(
