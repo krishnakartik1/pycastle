@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -155,6 +156,7 @@ class ReadinessReport:
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
 ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem]]
+Progress = Callable[[str, str, Status | None], None]
 
 
 @dataclass(frozen=True)
@@ -180,13 +182,18 @@ _PREREQUISITES: dict[str, tuple[str, ...]] = {
 
 
 def evaluate_readiness(
-    configuration: ReadinessConfiguration, dependencies: ReadinessDependencies
+    configuration: ReadinessConfiguration,
+    dependencies: ReadinessDependencies,
+    *,
+    progress: Progress | None = None,
 ) -> ReadinessReport:
     """Evaluate every independent check and block only true dependants."""
     checks: list[ReadinessCheck] = []
     outcomes: dict[str, Status] = {}
     items: list[EligibleItem] = []
     for check_id in CHECK_IDS:
+        if progress is not None:
+            progress("start", check_id, None)
         failed = [
             prerequisite
             for prerequisite in _PREREQUISITES.get(check_id, ())
@@ -206,7 +213,10 @@ def evaluate_readiness(
             )
         elif check_id == "eligible_items":
             try:
-                items = sorted(dependencies.eligible_items(configuration))
+                items = sorted(
+                    EligibleItem(item.number, _bounded_text(item.title, 200))
+                    for item in dependencies.eligible_items(configuration)
+                )
                 result = (
                     CheckResult(
                         Status.PASS,
@@ -253,12 +263,14 @@ def evaluate_readiness(
         check = ReadinessCheck(
             check_id,
             result.status,
-            result.summary[:500],
-            dict(result.facts),
-            result.remediation[:500] if result.remediation else None,
+            _bounded_text(result.summary, 500),
+            _safe_facts(check_id, result.facts),
+            _bounded_text(result.remediation, 500) if result.remediation else None,
         )
         checks.append(check)
         outcomes[check_id] = result.status
+        if progress is not None:
+            progress("complete", check_id, result.status)
     ready = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
     return ReadinessReport(
         SCHEMA_VERSION,
@@ -270,12 +282,83 @@ def evaluate_readiness(
     )
 
 
+_FACT_KEYS: dict[str, dict[str, str]] = {
+    "required_commands": {"commands": "list", "missing": "list"},
+    "base_branch": {"selected": "text", "github_default": "optional_text"},
+    "fixture_compatibility": {
+        "fixture_version": "optional_text",
+        "runner_version": "text",
+    },
+    "sandbox": {"sandbox": "text"},
+    "agent_image": {"image": "text"},
+    "runtime": {"version": "text"},
+    "workflow_labels": {"missing": "list"},
+    "eligible_items": {"count": "integer"},
+}
+
+
+def _bounded_text(value: object, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable())[:limit]
+
+
+def _safe_fact_text(value: object, limit: int) -> str:
+    bounded = _bounded_text(value, limit)
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._()+/@:-"
+    )
+    return bounded if bounded and all(char in allowed for char in bounded) else ""
+
+
+def _safe_facts(check_id: str, facts: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(facts, Mapping):
+        return {}
+    if "prerequisites" in facts:
+        values = facts["prerequisites"]
+        if isinstance(values, list):
+            allowed = set(_PREREQUISITES.get(check_id, ()))
+            return {
+                "prerequisites": [
+                    value
+                    for value in values
+                    if isinstance(value, str) and value in allowed
+                ]
+            }
+        return {}
+    safe: dict[str, Any] = {}
+    for key, kind in _FACT_KEYS.get(check_id, {}).items():
+        value = facts.get(key)
+        if kind == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            safe[key] = max(0, min(value, 10_000))
+        elif kind == "optional_text" and value is None:
+            safe[key] = None
+        elif kind in {"text", "optional_text"} and isinstance(value, str):
+            bounded = _safe_fact_text(value, 200)
+            if bounded:
+                safe[key] = bounded
+        elif kind == "list" and isinstance(value, list | tuple):
+            safe[key] = [
+                bounded
+                for item in value[:20]
+                if isinstance(item, str) and (bounded := _safe_fact_text(item, 100))
+            ]
+    return safe
+
+
 def report_document(report: ReadinessReport) -> dict[str, Any]:
+    configuration = asdict(report.configuration)
+    configuration = {
+        key: (
+            _safe_configuration_value(key, value) if isinstance(value, str) else value
+        )
+        for key, value in configuration.items()
+    }
     return {
         "schema_version": report.schema_version,
         "ready": report.ready,
         "runner_version": report.runner_version,
-        "configuration": asdict(report.configuration),
+        "configuration": configuration,
         "checks": [
             {
                 "id": check.id,
@@ -290,6 +373,23 @@ def report_document(report: ReadinessReport) -> dict[str, Any]:
     }
 
 
+def _safe_configuration_value(key: str, value: str) -> str:
+    bounded = _safe_fact_text(value, 200)
+    if not bounded:
+        return ""
+    patterns = {
+        "repository": r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+        "base_branch": r"[A-Za-z0-9][A-Za-z0-9._/-]*",
+        "github_default_branch": r"[A-Za-z0-9][A-Za-z0-9._/-]*",
+        "runtime": r"(?:stub|claude|codex)",
+        "sandbox": r"(?:host|docker)",
+        "assignee": r"(?:@me|[A-Za-z0-9-]+)",
+        "agent_image": r"[A-Za-z0-9][A-Za-z0-9._/@:-]*",
+    }
+    pattern = patterns.get(key)
+    return bounded if pattern is not None and re.fullmatch(pattern, bounded) else ""
+
+
 def render_json(report: ReadinessReport) -> str:
     return json.dumps(
         report_document(report), separators=(",", ":"), ensure_ascii=False
@@ -297,11 +397,24 @@ def render_json(report: ReadinessReport) -> str:
 
 
 def render_human(report: ReadinessReport) -> str:
+    repository = _safe_configuration_value(
+        "repository", report.configuration.repository
+    )
+    base_branch = _safe_configuration_value(
+        "base_branch", report.configuration.base_branch
+    )
+    github_default = (
+        _safe_configuration_value(
+            "github_default_branch", report.configuration.github_default_branch
+        )
+        if report.configuration.github_default_branch
+        else ""
+    )
     lines = [
         f"PyCastle Doctor: {'ready' if report.ready else 'not ready'}",
-        f"Repository: {report.configuration.repository}",
-        f"Base branch: {report.configuration.base_branch} "
-        f"(GitHub default: {report.configuration.github_default_branch or 'unknown'})",
+        f"Repository: {repository}",
+        f"Base branch: {base_branch} "
+        f"(GitHub default: {github_default or 'unknown'})",
     ]
     for check in report.checks:
         label = check.status.value.replace("_", " ")
@@ -325,6 +438,7 @@ class DefaultReadinessAdapter:
         exists: Callable[[str], bool] = command_exists,
         image_flag: str | None = None,
         stream_image_build: bool = False,
+        cleanup_reporter: Callable[[str], None] | None = None,
     ) -> None:
         self.fixture_dir = fixture_dir
         self.workspace = workspace
@@ -332,6 +446,7 @@ class DefaultReadinessAdapter:
         self.exists = exists
         self.image_flag = image_flag
         self.stream_image_build = stream_image_build
+        self.cleanup_reporter = cleanup_reporter
         self._docker_workspace: Path | None = None
 
     def __enter__(self) -> DefaultReadinessAdapter:
@@ -343,8 +458,13 @@ class DefaultReadinessAdapter:
     def close(self) -> None:
         """Remove Doctor's disposable Docker workspace, if one was created."""
         if self._docker_workspace is not None:
-            shutil.rmtree(self._docker_workspace, ignore_errors=True)
-            self._docker_workspace = None
+            try:
+                shutil.rmtree(self._docker_workspace)
+            except OSError:
+                if self.cleanup_reporter is not None:
+                    self.cleanup_reporter("Doctor cleanup could not complete.")
+            finally:
+                self._docker_workspace = None
 
     def _readiness_workspace(self) -> Path:
         if self._docker_workspace is None:
@@ -617,11 +737,21 @@ test -w "$workspace_file"
         try:
             result = self._run(argv)
         except subprocess.TimeoutExpired:
-            return CheckResult(Status.PASS, "Runtime is present and launchable.")
+            return CheckResult(
+                Status.FAIL,
+                "Runtime launch timed out.",
+                remediation="Verify the selected Runtime is responsive and retry Doctor.",
+            )
         except OSError:
             return CheckResult(
                 Status.FAIL,
                 "Runtime is not launchable.",
+                remediation="Install or repair the selected Runtime.",
+            )
+        if not self._ok(result):
+            return CheckResult(
+                Status.FAIL,
+                "Runtime launch failed.",
                 remediation="Install or repair the selected Runtime.",
             )
         version = self._safe_version(result)

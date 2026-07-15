@@ -382,6 +382,26 @@ def test_disposable_workspace_is_cleaned_when_probe_raises(tmp_path: Path) -> No
     assert not disposable.exists()
 
 
+def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    diagnostics: list[str] = []
+    adapter = DefaultReadinessAdapter(
+        tmp_path, tmp_path, cleanup_reporter=diagnostics.append
+    )
+    disposable = adapter._readiness_workspace()
+    monkeypatch.setattr(
+        "pycastle.readiness.shutil.rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("credential path")),
+    )
+
+    adapter.close()
+
+    assert diagnostics == ["Doctor cleanup could not complete."]
+    assert str(disposable) not in diagnostics[0]
+    assert adapter._docker_workspace is None
+
+
 @pytest.mark.parametrize(
     ("stream_build", "expected_capture"), [(True, False), (False, True)]
 )
@@ -611,7 +631,7 @@ def test_host_runtime_authentication_failure_never_reports_child_output(
 )
 @pytest.mark.parametrize(
     ("returncode", "stdout"),
-    [(1, "unsupported"), (0, "line one\nline two"), (0, "x" * 101)],
+    [(0, "line one\nline two"), (0, "x" * 101)],
 )
 def test_host_runtime_version_unavailable_does_not_fail_readiness(
     tmp_path: Path,
@@ -830,6 +850,104 @@ def test_probe_text_is_bounded() -> None:
     assert len(report.checks[0].summary) == 500
     assert report.checks[0].remediation is not None
     assert len(report.checks[0].remediation) == 500
+
+
+def test_runtime_timeout_is_a_failure_and_blocks_only_authentication(
+    tmp_path: Path,
+) -> None:
+    argv = ("codex", "--version")
+    adapter = DefaultReadinessAdapter(
+        tmp_path,
+        tmp_path,
+        runner=ScriptedRuntimeRunner(
+            {argv: subprocess.TimeoutExpired(argv, 15, output="credential=secret")}
+        ),
+    )
+
+    result = adapter.check_runtime(runtime_configuration("codex"))
+
+    assert result.status is Status.FAIL
+    assert "secret" not in repr(result)
+
+
+def test_report_drops_unknown_and_oversized_facts() -> None:
+    secret = "credential=do-not-report"
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda check_id, _configuration: CheckResult(
+                Status.PASS,
+                "Ready",
+                {
+                    "raw_output": secret,
+                    "version": "v" * 1000,
+                    "commands": ["git", secret],
+                    "missing": ["gh"],
+                },
+            ),
+            eligible_items=lambda _configuration: [EligibleItem(1, "Safe")],
+        ),
+    )
+
+    rendered = render_json(report)
+    assert secret not in rendered
+    assert "raw_output" not in rendered
+    assert len(rendered) < 20_000
+
+
+def test_report_rejects_hostile_resolved_configuration_values() -> None:
+    secret = "credential=do-not-report"
+    config = ReadinessConfiguration(
+        **{
+            **configuration().__dict__,
+            "repository": secret,
+            "base_branch": "main\x1b[2J" + secret,
+            "assignee": secret,
+        }
+    )
+    report = evaluate_readiness(
+        config,
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+
+    assert secret not in render_json(report)
+    assert secret not in render_human(report)
+
+
+def test_keyboard_interrupt_stops_evaluation_without_a_partial_report() -> None:
+    calls: list[str] = []
+
+    def probe(check_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        calls.append(check_id)
+        if check_id == "working_tree":
+            raise KeyboardInterrupt
+        return CheckResult(Status.PASS, "Ready")
+
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_readiness(
+            configuration(),
+            ReadinessDependencies(probe=probe, eligible_items=lambda _config: []),
+        )
+
+    assert calls == ["required_commands", "git_repository", "working_tree"]
+
+
+def test_progress_is_concise_and_deterministically_ordered() -> None:
+    events: list[tuple[str, str, Status | None]] = []
+    evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+        progress=lambda *event: events.append(event),
+    )
+
+    assert events[::2] == [("start", check_id, None) for check_id in CHECK_IDS]
+    assert [event[1] for event in events[1::2]] == list(CHECK_IDS)
 
 
 @pytest.mark.parametrize("limit", ["0", "-1"])

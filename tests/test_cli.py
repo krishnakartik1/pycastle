@@ -437,6 +437,18 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch) -> None:
     dispatched.assert_called_once()
 
 
+def test_doctor_interrupt_emits_no_report_and_exits_130(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli, "_evaluate_cli_readiness", MagicMock(side_effect=KeyboardInterrupt)
+    )
+
+    assert main(["doctor", "--json"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_init_scaffolds_the_chosen_sandbox(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

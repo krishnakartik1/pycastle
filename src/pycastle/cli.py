@@ -6,6 +6,7 @@ import argparse
 import datetime
 import logging
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -398,6 +399,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
     """Resolve and evaluate the readiness configuration used by Doctor and Run."""
     configuration = _readiness_configuration(args)
+    cleanup_reporter = (
+        (lambda message: print(message, file=sys.stderr))
+        if args.command == "doctor"
+        else None
+    )
     with DefaultReadinessAdapter(
         FIXTURE_DIR,
         Path.cwd(),
@@ -405,8 +411,23 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
         # Human Doctor may show a first build's progress. Run and JSON keep
         # child output captured so stdout remains a single report document.
         stream_image_build=args.command == "doctor" and not args.json,
+        cleanup_reporter=cleanup_reporter,
     ) as adapter:
-        return evaluate_readiness(configuration, adapter.dependencies())
+        progress = None
+        if args.command == "doctor" and args.json:
+
+            def report_progress(
+                event: str, check_id: str, status: Status | None
+            ) -> None:
+                print(
+                    f"Doctor {check_id}: {status.value if status else event}",
+                    file=sys.stderr,
+                )
+
+            progress = report_progress
+        return evaluate_readiness(
+            configuration, adapter.dependencies(), progress=progress
+        )
 
 
 def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
