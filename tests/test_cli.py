@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from packaging.version import Version
 
 from pycastle import cli
 from pycastle.cli import build_parser, main
@@ -19,12 +21,28 @@ def test_version_flag_reports_built_package_version(
         build_parser().parse_args(["--version"])
 
     assert excinfo.value.code == 0
-    assert capsys.readouterr().out == "pycastle 0.1.0\n"
+    assert capsys.readouterr().out == f"pycastle {Version(version('pycastle'))}\n"
 
 
+@pytest.mark.parametrize(
+    ("marker", "diagnostic"),
+    [
+        (None, "Invalid Project fixture"),
+        ("not-a-version\n", "Invalid Project fixture"),
+        ("9999\n", "Unsupported downgrade"),
+    ],
+)
 def test_incompatible_run_stops_before_any_run_side_effect(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    marker: str | None,
+    diagnostic: str,
 ) -> None:
+    if marker is not None:
+        fixture = tmp_path / ".pycastle"
+        fixture.mkdir()
+        (fixture / "version").write_text(marker)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     touched = MagicMock(side_effect=AssertionError("Run side effect started"))
@@ -34,6 +52,7 @@ def test_incompatible_run_stops_before_any_run_side_effect(
 
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
     touched.assert_not_called()
+    assert diagnostic in caplog.text
 
 
 def test_parses_run_arguments() -> None:

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import __version__
+from .compatibility import VERSION_MARKER
 
 logger = logging.getLogger("pycastle")
 
@@ -429,7 +430,7 @@ def _fixture_files(
         "gate": _GATE,
         "setup": setup,
         SANDBOX_MARKER: f"{sandbox}\n",
-        "version": f"{__version__}\n",
+        VERSION_MARKER: f"{__version__}\n",
         "Dockerfile": _dockerfile(python=python),
         ".gitignore": _GITIGNORE,
         "prompts/plan.md": _PLAN_MD,
