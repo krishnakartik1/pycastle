@@ -31,6 +31,9 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
 
     assert "ready-for-agent" in readme
     assert "gh issue edit" in readme
+    assert "pycastle init --sandbox host" in readme
+    assert "pycastle init --sandbox docker" in readme
+    assert "end-of-file" in readme.lower()
 
 
 def test_readme_documents_codex_host_black_workaround() -> None:

@@ -210,6 +210,47 @@ def test_parses_init() -> None:
     assert args.command == "init"
 
 
+@pytest.mark.parametrize("sandbox", ["host", "docker"])
+def test_init_sandbox_flag_scaffolds_without_reading_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: str
+) -> None:
+    """An explicit init Sandbox is scriptable and skips the prompt."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "builtins.input",
+        MagicMock(side_effect=AssertionError("init unexpectedly read stdin")),
+    )
+
+    assert main(["init", "--sandbox", sandbox]) == 0
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == sandbox
+
+
+def test_init_with_closed_stdin_defaults_to_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """EOF at the interactive prompt behaves like an empty host-first answer."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
+
+    assert main(["init"]) == 0
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
+
+
+def test_invalid_init_sandbox_is_rejected_before_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Argparse rejects an invalid Sandbox before init can create its fixture."""
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["init", "--sandbox", "cloud"])
+
+    assert excinfo.value.code == 2
+    assert not (tmp_path / ".pycastle").exists()
+
+
 def test_parses_and_dispatches_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     upgraded = MagicMock()

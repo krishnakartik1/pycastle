@@ -44,7 +44,10 @@ pycastle init
 
 `init` asks whether phases should run on the host or in Docker, records that
 default, and creates `.pycastle/` without overwriting an existing fixture. The
-fixture contains all of the project-owned behavior:
+choice can be scripted with `pycastle init --sandbox host` or
+`pycastle init --sandbox docker`, which skips the prompt. If standard input is
+unavailable and the prompt reaches end-of-file, `init` uses the host default.
+The fixture contains all of the project-owned behavior:
 
 - `.pycastle/main.py` — the executable phase graph and its transitions.
 - `.pycastle/prompts/` — instructions for the plan, implement, and review phases.
@@ -99,7 +102,8 @@ keeps their branches intact.
 ## Commands
 
 - `pycastle --version` — print the normalized installed PyCastle release.
-- `pycastle init` — scaffold the `.pycastle/` project fixture described above.
+- `pycastle init [--sandbox {host,docker}]` — scaffold the `.pycastle/` Project
+  fixture described above, optionally without prompting.
 - `pycastle upgrade` — transactionally apply bundled forward migrations to an
   initialized Project fixture, leaving the result as an unstaged diff to review.
 - `pycastle run -i N --runtime claude` — work up to `N` ready issues; the

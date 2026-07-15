@@ -46,7 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="Scaffold a .pycastle/ Project fixture into this repo")
+    init_parser = sub.add_parser(
+        "init", help="Scaffold a .pycastle/ Project fixture into this repo"
+    )
+    init_parser.add_argument(
+        "--sandbox",
+        choices=("host", "docker"),
+        default=None,
+        help=(
+            "Default Sandbox recorded in the Project fixture. When omitted, "
+            "init prompts; an empty answer or unavailable stdin defaults to host."
+        ),
+    )
     sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
     sub.add_parser("prune", help="Delete run branches whose PRs are no longer open")
 
@@ -484,18 +495,24 @@ def _prompt_sandbox() -> str:
     (or ``d``) picks Docker-first. This interactive prompt is not unit-tested;
     the scaffolding it drives is.
     """
-    answer = input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
+    try:
+        answer = (
+            input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
+        )
+    except EOFError:
+        answer = ""
     return "docker" if answer in {"docker", "d"} else "host"
 
 
-def _cmd_init(_args: argparse.Namespace) -> int:
+def _cmd_init(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle init``: scaffold the Project fixture into the cwd.
 
-    Prompts for host-first vs Docker-first, then writes the fixture to match.
-    Refuses to clobber an existing ``.pycastle/`` so a project's prompts, gate,
-    and graph shape are never silently replaced.
+    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts for
+    host-first vs Docker-first when omitted. Refuses to clobber an existing
+    ``.pycastle/`` so a project's prompts, gate, and graph shape are never
+    silently replaced.
     """
-    choice = _prompt_sandbox()
+    choice = args.sandbox if args.sandbox is not None else _prompt_sandbox()
     try:
         written = scaffold_fixture(Path.cwd(), sandbox=choice)  # type: ignore[arg-type]
     except FixtureExistsError as exc:
