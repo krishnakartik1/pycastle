@@ -250,29 +250,67 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     (fixture / "main.py").write_text(
         "from pycastle.graph import build, build_run, phase\n"
         "run = build_run(item=build(start='implement', phases=[phase('implement', 'item.md')]), "
-        "after=build(start='review', phases=[phase('review', 'review.md', on_success='report'), phase('report', 'report.md')]))\n"
+        "after=build(start='integrated-review', phases=[phase('integrated-review', 'review.md')]))\n"
     )
-    for name in ("item.md", "review.md", "report.md"):
+    for name in ("item.md", "review.md"):
         (fixture / "prompts" / name).write_text(name)
-    issue = IssueRef(number=86, title="Integrated review", assignees=["krishna"])
+    issue = IssueRef(number=101, title="Integrated review", assignees=["krishna"])
     source = MagicMock()
     source.list_ready.return_value = [issue]
-    timeline: list[str] = []
+    timeline: list[tuple[str, Path | None]] = []
+    run_worktree = tmp_path / "wt" / "run-run-101"
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
-            timeline.append(phase)
+            timeline.append((phase, cwd))
             result = super().run(prompt, cwd=cwd, phase=phase)
-            if phase == "report":
-                (cwd / ".pycastle").mkdir(exist_ok=True)
-                (cwd / orchestrator.RUN_REPORT).write_text(
-                    "Verified integrated evidence.\n"
-                )
+            if phase == "integrated-review":
+                (cwd / "integrated-review.txt").write_text("reviewed\n")
             return result
 
-    def gate(_cwd: Path) -> orchestrator.GateOutcome:
-        timeline.append("run-gate")
-        return orchestrator.GateOutcome(True, "secret raw output", exit_code=0)
+    def setup(cwd: Path) -> None:
+        timeline.append(("setup", cwd))
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        timeline.append(("gate", cwd))
+        return orchestrator.GateOutcome(
+            True,
+            "secret raw output",
+            exit_code=0,
+            duration_seconds=1.25,
+            command=".pycastle/gate --all",
+        )
+
+    base_runner = _git_aware_runner()
+    publication_calls: list[list[str]] = []
+
+    def external_boundary(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "diff", "--cached"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="")
+        if argv[:3] == ["git", "commit", "-m"] and "Run phase" in argv[3]:
+            timeline.append(("checkpoint", Path(str(kwargs["cwd"]))))
+        if argv[:3] == ["gh", "pr", "list"]:
+            publication_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        if argv[:3] == ["gh", "pr", "create"]:
+            publication_calls.append(argv)
+            timeline.append(("draft", None))
+            return _ok()
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="314\n")
+        if argv[:2] == ["gh", "api"]:
+            publication_calls.append(argv)
+            if "--paginate" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="[]")
+            timeline.append(("comment", None))
+            return _ok()
+        if argv[:3] == ["gh", "pr", "ready"]:
+            publication_calls.append(argv)
+            timeline.append(("ready", None))
+            return _ok()
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=external_boundary)
 
     outcome = orchestrator.run_batch(
         runtime=Runtime(),
@@ -281,18 +319,108 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
         repo="owner/repo",
         base_branch="main",
         assignee="krishna",
-        run_id="run-86",
+        run_id="run-101",
         workspace=tmp_path,
         worktree_root=tmp_path / "wt",
-        runner=_git_aware_runner(),
+        runner=runner,
         gate_check=gate,
+        setup=setup,
     )
 
-    assert timeline == ["implement", "run-gate", "review", "report", "run-gate"]
+    item_worktree = tmp_path / "wt" / "issue-101"
+    assert timeline == [
+        ("setup", run_worktree),
+        ("setup", item_worktree),
+        ("implement", item_worktree),
+        ("gate", item_worktree),
+        ("setup", run_worktree),
+        ("integrated-review", run_worktree),
+        ("checkpoint", run_worktree),
+        ("gate", run_worktree),
+        ("draft", None),
+        ("comment", None),
+        ("ready", None),
+    ]
     assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
-    assert (
-        fixture / "runs" / "run-86" / "run-report.md"
-    ).read_text() == "Verified integrated evidence.\n"
+    assert (run_worktree / "integrated-review.txt").read_text() == "reviewed\n"
+
+    run_phase_commits = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "commit", "-m"]
+        and "Run phase" in call.args[0][3]
+    ]
+    assert run_phase_commits == [
+        ["git", "commit", "-m", "chore: checkpoint Run phase integrated-review"]
+    ]
+    assert any(
+        call[:3] == ["gh", "pr", "list"]
+        and call[call.index("--head") + 1] == "pycastle/run-run-101"
+        for call in publication_calls
+    )
+    comment_call = next(call for call in publication_calls if "--method" in call)
+    comment = comment_call[comment_call.index("-f") + 1]
+    assert comment_call[comment_call.index("--method") + 1] == "POST"
+    assert "<!-- pycastle-run-report:run-101 -->" in comment
+    assert "`.pycastle/gate --all` — PASS (exit 0, 1.25s)" in comment
+    assert "secret raw output" not in comment
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    draft_index = next(
+        i for i, call in enumerate(calls) if call[:3] == ["gh", "pr", "create"]
+    )
+    final_push_index = max(
+        i
+        for i, call in enumerate(calls[:draft_index])
+        if call[:3] == ["git", "push", "-u"]
+    )
+    assert final_push_index < draft_index
+
+    repeat_runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout='[{"number":314}]'),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    '[{"id":2718,"body":"'
+                    '<!-- pycastle-run-report:run-101 --> previous"}]'
+                ),
+            ),
+            _ok(),
+            _ok(),
+        ]
+    )
+    assert orchestrator._open_pull_request(
+        repo="owner/repo",
+        base_branch="main",
+        run_branch="pycastle/run-run-101",
+        run_id="run-101",
+        completed=[101],
+        run_worktree=run_worktree,
+        fixture_dir=fixture,
+        runner=repeat_runner,
+        selected=[issue],
+        skipped=[],
+        gate=gate(run_worktree),
+        report=None,
+        publication_error=None,
+        successful=True,
+        stopping_point=None,
+    ) == (True, True, True)
+    repeat_calls = [call.args[0] for call in repeat_runner.call_args_list]
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in repeat_calls)
+    assert repeat_calls[1][repeat_calls[1].index("--head") + 1] == (
+        "pycastle/run-run-101"
+    )
+    assert repeat_calls[3][:5] == [
+        "gh",
+        "api",
+        "--method",
+        "PATCH",
+        "repos/owner/repo/issues/comments/2718",
+    ]
 
 
 @pytest.mark.parametrize("size", [0, orchestrator.RUN_REPORT_LIMIT])
