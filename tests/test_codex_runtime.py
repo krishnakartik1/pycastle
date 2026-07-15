@@ -857,6 +857,8 @@ def test_run_works_one_issue_end_to_end_via_codex(
         # mocked agent's work is treated as a real change rather than a no-op.
         if argv[:3] == ["git", "diff", "--quiet"]:
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
 
     issue = IssueRef(number=9, title="Wire codex", assignees=["krishna"])
@@ -897,6 +899,8 @@ def test_run_works_one_issue_end_to_end_via_codex_in_docker(
         # mocked agent's work is treated as a real change rather than a no-op.
         if argv[:3] == ["git", "diff", "--quiet"]:
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
 
     issue = IssueRef(number=10, title="Codex in docker", assignees=["krishna"])

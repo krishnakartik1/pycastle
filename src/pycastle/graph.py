@@ -1,14 +1,12 @@
-"""The Phase graph and its declarative Builder API.
+"""Scope-specific phase graphs and the declarative Builder API.
 
-A project describes its workflow in ``.pycastle/main.py`` by assembling a
-:class:`PhaseGraph` from a list of :func:`phase` rows and assigning it to a
-module-level ``graph``. Each phase names its own success and failure
-destinations, so the workflow can branch — implement → review on success,
-implement → handoff (or a human) on failure — rather than running a fixed
-linear list. The executor is a transition *walker*: from ``start`` it runs each
-phase, maps the phase's outcome onto its ``on_success`` / ``on_failure`` edge,
-and follows that edge until it reaches a terminal (:data:`DONE` or
-:data:`HUMAN`). See ADR-0004 for why the API reads as declarative rows.
+A project describes its Run in ``.pycastle/main.py`` by assigning a
+:class:`RunDefinition` to module-level ``run``. The definition wraps one required
+Item phase graph with optional before-Run and after-Run phase graphs. Each graph
+is assembled from :func:`phase` rows whose success and failure destinations are
+explicit, so execution can branch rather than following declaration order. The
+executor walks those transitions until it reaches :data:`DONE` or :data:`HUMAN`.
+See ADR-0004 for the row API and ADR-0008 for the Run definition.
 """
 
 from __future__ import annotations
@@ -80,6 +78,31 @@ class PhaseGraph:
     phases: dict[str, Phase] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RunDefinition:
+    """The project-owned graphs frozen for one Run."""
+
+    item: PhaseGraph
+    before: PhaseGraph | None = None
+    after: PhaseGraph | None = None
+
+
+def build_run(
+    *,
+    item: PhaseGraph,
+    before: PhaseGraph | None = None,
+    after: PhaseGraph | None = None,
+) -> RunDefinition:
+    """Build one complete Run definition from its scope-specific graphs."""
+    if not isinstance(item, PhaseGraph):
+        raise TypeError("item must be a PhaseGraph")
+    if before is not None and not isinstance(before, PhaseGraph):
+        raise TypeError("before must be a PhaseGraph or None")
+    if after is not None and not isinstance(after, PhaseGraph):
+        raise TypeError("after must be a PhaseGraph or None")
+    return RunDefinition(item=item, before=before, after=after)
+
+
 def phase(
     name: str,
     prompt: str,
@@ -132,18 +155,23 @@ def build(*, start: str, phases: list[Phase]) -> PhaseGraph:
     return PhaseGraph(start=start, phases=by_name)
 
 
-def load_graph(fixture_dir: Path) -> PhaseGraph:
-    """Import ``<fixture_dir>/main.py`` and return its module-level ``graph``."""
+def load_run(fixture_dir: Path) -> RunDefinition:
+    """Import ``<fixture_dir>/main.py`` and return its module-level ``run``."""
     main_py = fixture_dir / "main.py"
     spec = importlib.util.spec_from_file_location("pycastle_fixture_main", main_py)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load fixture graph from {main_py}")
+        raise ImportError(f"Cannot load Run definition from {main_py}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    graph = getattr(module, "graph", None)
-    if not isinstance(graph, PhaseGraph):
-        raise TypeError(f"{main_py} must define a module-level `graph` PhaseGraph")
-    return graph
+    run = getattr(module, "run", None)
+    if not isinstance(run, RunDefinition):
+        raise TypeError(f"{main_py} must define a module-level `run` RunDefinition")
+    return run
+
+
+def load_graph(fixture_dir: Path) -> PhaseGraph:
+    """Load the required Item phase graph from the fixture Run definition."""
+    return load_run(fixture_dir).item
 
 
 @dataclass

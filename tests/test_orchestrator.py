@@ -27,7 +27,7 @@ def _calls_containing(runner: MagicMock, *needles: str) -> bool:
     return False
 
 
-def test_prune_run_branches_deletes_only_branches_without_open_prs(
+def test_prune_run_branches_deletes_only_branches_with_closed_or_merged_prs(
     tmp_path: Path,
 ) -> None:
     """Closed/merged PR heads are pruned while open PR heads stay intact (#69)."""
@@ -35,7 +35,11 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
         side_effect=[
             MagicMock(
                 returncode=0,
-                stdout='[{"headRefName":"pycastle/run-open"}]',
+                stdout=(
+                    '[{"headRefName":"pycastle/run-open","state":"OPEN"},'
+                    '{"headRefName":"pycastle/run-merged","state":"MERGED"},'
+                    '{"headRefName":"pycastle/run-closed","state":"CLOSED"}]'
+                ),
             ),
             MagicMock(
                 returncode=0,
@@ -43,6 +47,7 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
                     "aaa\trefs/heads/pycastle/run-open\n"
                     "bbb\trefs/heads/pycastle/run-merged\n"
                     "ccc\trefs/heads/pycastle/run-closed\n"
+                    "ddd\trefs/heads/pycastle/run-recovery\n"
                 ),
             ),
             MagicMock(returncode=0),
@@ -55,10 +60,39 @@ def test_prune_run_branches_deletes_only_branches_without_open_prs(
     )
 
     assert deleted == ["pycastle/run-merged", "pycastle/run-closed"]
-    assert _calls_containing(runner, "--state", "open", "--limit", "10000")
+    assert _calls_containing(runner, "--state", "all", "--limit", "10000")
     assert not _calls_containing(runner, "--delete", "pycastle/run-open")
     assert _calls_containing(runner, "--delete", "pycastle/run-merged")
     assert _calls_containing(runner, "--delete", "pycastle/run-closed")
+    assert not _calls_containing(runner, "--delete", "pycastle/run-recovery")
+
+
+def test_prune_run_branches_include_no_pr_deletes_recovery_branches(
+    tmp_path: Path,
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            MagicMock(
+                returncode=0,
+                stdout='[{"headRefName":"pycastle/run-open","state":"OPEN"}]',
+            ),
+            MagicMock(
+                returncode=0,
+                stdout=(
+                    "aaa\trefs/heads/pycastle/run-open\n"
+                    "bbb\trefs/heads/pycastle/run-recovery\n"
+                ),
+            ),
+            MagicMock(returncode=0),
+        ]
+    )
+
+    deleted = orchestrator.prune_run_branches(
+        repo="owner/repo", runner=runner, cwd=tmp_path, include_no_pr=True
+    )
+
+    assert deleted == ["pycastle/run-recovery"]
+    assert not _calls_containing(runner, "--delete", "pycastle/run-open")
 
 
 def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
@@ -75,7 +109,10 @@ def test_prune_run_branches_aborts_before_deletion_when_open_pr_lookup_fails(
     assert not _calls_containing(runner, "git", "push", "origin", "--delete")
 
 
-@pytest.mark.parametrize("stdout", [None, "", "{}", '[{"headRefName":null}]'])
+@pytest.mark.parametrize(
+    "stdout",
+    [None, "", "{}", '[{"headRefName":null,"state":"OPEN"}]'],
+)
 def test_prune_run_branches_aborts_on_invalid_open_pr_output(
     tmp_path: Path, stdout: str | None
 ) -> None:
@@ -119,7 +156,18 @@ def test_prune_run_branches_aborts_when_remote_branch_lookup_fails(
     assert not _calls_containing(runner, "--delete")
 
 
-@pytest.mark.parametrize("stdout", [None, "malformed ref output"])
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        None,
+        "malformed ref output",
+        "abc\trefs/heads/pycastle/run-\n",
+        (
+            "abc\trefs/heads/pycastle/run-duplicate\n"
+            "abc\trefs/heads/pycastle/run-duplicate\n"
+        ),
+    ],
+)
 def test_prune_run_branches_aborts_on_invalid_remote_branch_output(
     tmp_path: Path, stdout: str | None
 ) -> None:
@@ -140,7 +188,10 @@ def test_prune_run_branches_reports_deletion_failure(tmp_path: Path) -> None:
     branch = "pycastle/run-closed"
     runner = MagicMock(
         side_effect=[
-            MagicMock(returncode=0, stdout="[]"),
+            MagicMock(
+                returncode=0,
+                stdout=('[{"headRefName":"pycastle/run-closed",' '"state":"CLOSED"}]'),
+            ),
             MagicMock(returncode=0, stdout=f"abc\trefs/heads/{branch}\n"),
             MagicMock(returncode=1, stderr="rejected"),
         ]
@@ -186,9 +237,944 @@ def _git_aware_runner(
             number = int(branch.split("-")[1])
             if number in merge_fails_for:
                 return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
         return _ok()
 
     return MagicMock(side_effect=side_effect)
+
+
+def _run_context(
+    *,
+    fixture_dir: Path,
+    worktree: Path,
+    runner: MagicMock,
+    run_id: str = "run-86",
+) -> orchestrator.RunContext:
+    return orchestrator.RunContext(
+        run_id=run_id,
+        branch=f"pycastle/run-{run_id}",
+        worktree=worktree,
+        fixture_dir=fixture_dir,
+        runner=runner,
+    )
+
+
+def _scoped_fixture(
+    tmp_path: Path, *, before: bool = False, after: bool = False
+) -> Path:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    arguments = [
+        "item=build(start='implement', phases=[phase('implement', 'item.md')])"
+    ]
+    if before:
+        arguments.append(
+            "before=build(start='before', phases=[phase('before', 'before.md')])"
+        )
+    if after:
+        arguments.append(
+            "after=build(start='after', phases=[phase('after', 'after.md')])"
+        )
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, build_run, phase\n"
+        f"run = build_run({', '.join(arguments)})\n"
+    )
+    for name in ("item", "before", "after"):
+        (prompts / f"{name}.md").write_text(name)
+    return fixture
+
+
+def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    (fixture / "prompts").mkdir(parents=True)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build, build_run, phase\n"
+        "run = build_run(item=build(start='implement', phases=[phase('implement', 'item.md')]), "
+        "after=build(start='integrated-review', phases=[phase('integrated-review', 'review.md')]))\n"
+    )
+    for name in ("item.md", "review.md"):
+        (fixture / "prompts" / name).write_text(name)
+    issue = IssueRef(number=101, title="Integrated review", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    timeline: list[tuple[str, Path | None]] = []
+    run_worktree = tmp_path / "wt" / "run-run-101"
+    authored_report = "# Integrated report\n\nRepaired and verified.\n"
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            timeline.append((phase, cwd))
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "integrated-review":
+                (cwd / "integrated-review.txt").write_text("reviewed\n")
+                report_path = cwd / orchestrator.RUN_REPORT
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(authored_report)
+            return result
+
+    def setup(cwd: Path) -> None:
+        timeline.append(("setup", cwd))
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        timeline.append(("gate", cwd))
+        return orchestrator.GateOutcome(
+            True,
+            "secret raw output",
+            exit_code=0,
+            duration_seconds=1.25,
+            command=".pycastle/gate --all",
+        )
+
+    base_runner = _git_aware_runner()
+    publication_calls: list[list[str]] = []
+
+    def external_boundary(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "diff", "--cached"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="")
+        if argv[:3] == ["git", "commit", "-m"] and "Run phase" in argv[3]:
+            timeline.append(("checkpoint", Path(str(kwargs["cwd"]))))
+        if argv[:3] == ["gh", "pr", "list"]:
+            publication_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        if argv[:3] == ["gh", "pr", "create"]:
+            publication_calls.append(argv)
+            timeline.append(("draft", None))
+            return _ok()
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="314\n")
+        if argv[:2] == ["gh", "api"]:
+            publication_calls.append(argv)
+            if "--paginate" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="[]")
+            timeline.append(("comment", None))
+            return _ok()
+        if argv[:3] == ["gh", "pr", "ready"]:
+            publication_calls.append(argv)
+            timeline.append(("ready", None))
+            return _ok()
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=external_boundary)
+
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="run-101",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        gate_check=gate,
+        setup=setup,
+    )
+
+    item_worktree = tmp_path / "wt" / "issue-101"
+    assert timeline == [
+        ("setup", run_worktree),
+        ("setup", item_worktree),
+        ("implement", item_worktree),
+        ("gate", item_worktree),
+        ("setup", run_worktree),
+        ("integrated-review", run_worktree),
+        ("checkpoint", run_worktree),
+        ("gate", run_worktree),
+        ("draft", None),
+        ("comment", None),
+        ("ready", None),
+    ]
+    assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
+    assert (run_worktree / "integrated-review.txt").read_text() == "reviewed\n"
+
+    run_phase_commits = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["git", "commit", "-m"]
+        and "Run phase" in call.args[0][3]
+    ]
+    assert run_phase_commits == [
+        ["git", "commit", "-m", "chore: checkpoint Run phase integrated-review"]
+    ]
+    assert any(
+        call[:3] == ["gh", "pr", "list"]
+        and call[call.index("--head") + 1] == "pycastle/run-run-101"
+        for call in publication_calls
+    )
+    comment_call = next(call for call in publication_calls if "--method" in call)
+    comment = comment_call[comment_call.index("-f") + 1]
+    assert comment_call[comment_call.index("--method") + 1] == "POST"
+    assert "<!-- pycastle-run-report:run-101 -->" in comment
+    assert "`.pycastle/gate --all` — PASS (exit 0, 1.25s)" in comment
+    assert "secret raw output" not in comment
+    assert comment.endswith("\n---\n\n" + authored_report)
+    assert (fixture / "runs" / "run-101" / "run-report.md").read_text() == (
+        authored_report
+    )
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    draft_index = next(
+        i for i, call in enumerate(calls) if call[:3] == ["gh", "pr", "create"]
+    )
+    final_push_index = max(
+        i
+        for i, call in enumerate(calls[:draft_index])
+        if call[:3] == ["git", "push", "-u"]
+    )
+    assert final_push_index < draft_index
+
+    repeat_runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout='[{"number":314}]'),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    '[{"id":2718,"body":"'
+                    '<!-- pycastle-run-report:run-101 --> previous"}]'
+                ),
+            ),
+            _ok(),
+            _ok(),
+        ]
+    )
+    assert orchestrator._open_pull_request(
+        repo="owner/repo",
+        base_branch="main",
+        run=_run_context(
+            fixture_dir=fixture,
+            worktree=run_worktree,
+            runner=repeat_runner,
+            run_id="run-101",
+        ),
+        completed=[101],
+        selected=[issue],
+        skipped=[],
+        gate=gate(run_worktree),
+        report=None,
+        publication_error=None,
+        successful=True,
+        stopping_point=None,
+    ) == orchestrator.PublicationOutcome(True, True, True, True)
+    repeat_calls = [call.args[0] for call in repeat_runner.call_args_list]
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in repeat_calls)
+    assert repeat_calls[1][repeat_calls[1].index("--head") + 1] == (
+        "pycastle/run-run-101"
+    )
+    assert repeat_calls[3][:5] == [
+        "gh",
+        "api",
+        "--method",
+        "PATCH",
+        "repos/owner/repo/issues/comments/2718",
+    ]
+
+
+def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
+    tmp_path: Path,
+) -> None:
+    """Preparation is durable, inherited, and cannot reselect the active Run."""
+    fixture = tmp_path / ".pycastle"
+    (fixture / "prompts").mkdir(parents=True)
+    original_main = (
+        "from pycastle.graph import DONE, build, build_run, phase\n"
+        "run = build_run(\n"
+        "    before=build(start='inventory', phases=[\n"
+        "        phase('inventory', 'inventory.md', on_success='prepare'),\n"
+        "        phase('prepare', 'prepare.md', on_success=DONE),\n"
+        "    ]),\n"
+        "    item=build(start='implement', phases=[phase('implement', 'item.md')]),\n"
+        ")\n"
+    )
+    (fixture / "main.py").write_text(original_main)
+    for name in ("inventory.md", "prepare.md", "item.md"):
+        (fixture / "prompts" / name).write_text(name)
+
+    issues = [
+        IssueRef(number=103, title="Second selected", assignees=["krishna"]),
+        IssueRef(number=101, title="First selected", assignees=["krishna"]),
+        IssueRef(number=105, title="Not selected", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    selected_batch = [issues[1], issues[0]]
+    run_worktree = tmp_path / "wt" / "run-frozen"
+    item_starts: list[tuple[int, bool, str]] = []
+    events: list[tuple[str, Path]] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            events.append((phase, cwd))
+            if phase == "inventory":
+                assert prompt.index("#101") < prompt.index("#103")
+                assert "#105" not in prompt
+                (cwd / "inventory.txt").write_text("frozen: 101,103\n")
+                # A proposed fixture edit must not replace the already-loaded
+                # before/Item graphs or alter the selected batch.
+                (fixture / "main.py").write_text(
+                    "raise RuntimeError('next Run only')\n"
+                )
+                source.list_ready.return_value = [issues[2]]
+                selected_batch[:] = [issues[2]]
+                issues[1].number = 999
+                issues[1].title = "Mutated after selection"
+            elif phase == "prepare":
+                assert (cwd / "inventory.txt").is_file()
+                (cwd / "prepared.txt").write_text("prepared\n")
+            elif phase == "implement":
+                number = int(cwd.name.removeprefix("issue-"))
+                item_starts.append((number, (cwd / "prepared.txt").is_file(), prompt))
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    def setup(cwd: Path) -> None:
+        events.append(("setup", cwd))
+
+    base_runner = _git_aware_runner()
+
+    def runner_side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "worktree", "add"] and "issue-" in argv[3]:
+            destination = Path(argv[3])
+            destination.mkdir(parents=True, exist_ok=True)
+            for prepared in ("inventory.txt", "prepared.txt"):
+                (destination / prepared).write_text(
+                    (run_worktree / prepared).read_text()
+                )
+            return _ok()
+        if argv[:3] == ["git", "diff", "--cached"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="103\n")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=runner_side_effect)
+    gate_paths: list[Path] = []
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_paths.append(cwd)
+        return orchestrator.GateOutcome(True, "green", exit_code=0)
+
+    with patch("pycastle.orchestrator.select_batch", return_value=selected_batch):
+        outcome = orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="frozen",
+            iterations=2,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+            gate_check=gate,
+            setup=setup,
+        )
+
+    assert events[:3] == [
+        ("setup", run_worktree),
+        ("inventory", run_worktree),
+        ("prepare", run_worktree),
+    ]
+    assert [number for number, inherited, _prompt in item_starts] == [101, 103]
+    assert all(inherited for _number, inherited, _prompt in item_starts)
+    assert source.list_ready.call_count == 1
+    assert gate_paths[-1] == run_worktree
+    assert outcome.completed == [101, 103]
+    assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    checkpoints = [
+        call[3]
+        for call in calls
+        if call[:3] == ["git", "commit", "-m"] and "Run phase" in call[3]
+    ]
+    assert checkpoints == [
+        "chore: checkpoint Run phase inventory",
+        "chore: checkpoint Run phase prepare",
+    ]
+    first_item_branch = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ["git", "branch"]
+        and call[-1] == "pycastle/run-frozen"
+        and "issue-101" in call[2]
+    )
+    second_checkpoint_push = max(
+        index
+        for index, call in enumerate(calls[:first_item_branch])
+        if call[:3] == ["git", "push", "-u"]
+    )
+    assert second_checkpoint_push < first_item_branch
+
+
+def test_successful_run_phase_with_no_changes_pushes_without_empty_commit(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A successful no-op Run phase remains durable without a fake commit."""
+    run_worktree = tmp_path / "run-worktree"
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout=""),
+            _ok(),
+        ]
+    )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="integrated-review", prompt="review.md"),
+        run=_run_context(
+            fixture_dir=fixture_dir,
+            worktree=run_worktree,
+            runner=runner,
+            run_id="run-101",
+        ),
+    )
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    assert calls == [
+        [
+            "git",
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude,top).pycastle/run-review.md",
+            ":(exclude,top).pycastle/run-report.md",
+        ],
+        ["git", "diff", "--cached", "--quiet"],
+        ["git", "push", "-u", "origin", "pycastle/run-run-101"],
+    ]
+
+
+@pytest.mark.parametrize("failure", ["add", "diff", "commit"])
+def test_run_phase_checkpoint_failure_never_pushes(
+    fixture_dir: Path, tmp_path: Path, failure: str
+) -> None:
+    """A Run checkpoint is not durable until staging and commit both succeed."""
+
+    def side_effect(argv: list[str], **_kwargs: object) -> object:
+        if argv[:2] == ["git", "add"]:
+            return subprocess.CompletedProcess(argv, int(failure == "add"), stdout="")
+        if argv[:3] == ["git", "diff", "--cached"]:
+            code = 2 if failure == "diff" else 1
+            return subprocess.CompletedProcess(argv, code, stdout="")
+        if argv[:2] == ["git", "commit"]:
+            return subprocess.CompletedProcess(
+                argv, int(failure == "commit"), stdout=""
+            )
+        return _ok()
+
+    runner = MagicMock(side_effect=side_effect)
+    with pytest.raises(orchestrator.RunCheckpointError):
+        orchestrator._checkpoint_run_phase(
+            orchestrator.Phase(name="integrated-review", prompt="review.md"),
+            run=_run_context(
+                fixture_dir=fixture_dir,
+                worktree=tmp_path / "run-worktree",
+                runner=runner,
+            ),
+        )
+
+    assert not _calls_containing(runner, "git", "push")
+
+
+def test_failed_run_phase_removes_ignored_scratch_artifacts(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """Resetting a red Run phase also removes its ignored review/report files."""
+    worktree = tmp_path / "run-worktree"
+    worktree.mkdir()
+    (fixture_dir / "prompts" / "run.md").write_text("Run phase")
+
+    class FailingRuntime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            for path in (orchestrator.RUN_REVIEW, orchestrator.RUN_REPORT):
+                target = cwd / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("partial")
+            raise AgentCrashError("red", phase=phase, exit_code=1)
+
+    def side_effect(argv: list[str], **_kwargs: object) -> object:
+        if argv[:3] == ["git", "clean", "-fdX"]:
+            for path in argv[4:]:
+                (worktree / path).unlink(missing_ok=True)
+        return _ok()
+
+    runner = MagicMock(side_effect=side_effect)
+    graph = orchestrator.PhaseGraph(
+        start="review",
+        phases={
+            "review": orchestrator.Phase(name="review", prompt="run.md"),
+        },
+    )
+
+    result = orchestrator._walk_run_graph(
+        graph,
+        runtime=FailingRuntime(),
+        run=_run_context(
+            fixture_dir=fixture_dir,
+            worktree=worktree,
+            runner=runner,
+        ),
+        context="Run context",
+    )
+
+    assert result.terminal is orchestrator.HUMAN
+    assert not (worktree / orchestrator.RUN_REVIEW).exists()
+    assert not (worktree / orchestrator.RUN_REPORT).exists()
+    assert _calls_containing(
+        runner,
+        "git",
+        "clean",
+        "-fdX",
+        orchestrator.RUN_REVIEW,
+        orchestrator.RUN_REPORT,
+    )
+
+
+def _publish_with_runner(
+    *, runner: MagicMock, fixture_dir: Path, worktree: Path
+) -> orchestrator.PublicationOutcome:
+    return orchestrator._open_pull_request(
+        repo="owner/repo",
+        base_branch="main",
+        run=_run_context(
+            fixture_dir=fixture_dir,
+            worktree=worktree,
+            runner=runner,
+        ),
+        completed=[86],
+        selected=[IssueRef(number=86, title="Run phases")],
+        skipped=[],
+        gate=None,
+        report=None,
+        publication_error=None,
+        successful=True,
+        stopping_point=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, "[]"), (0, ""), (0, "{"), (0, "{}")],
+)
+def test_unknown_pr_lookup_never_creates_a_duplicate(
+    fixture_dir: Path, tmp_path: Path, returncode: int, stdout: str
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], returncode, stdout=stdout),
+        ]
+    )
+
+    outcome = _publish_with_runner(
+        runner=runner, fixture_dir=fixture_dir, worktree=tmp_path
+    )
+
+    assert outcome == orchestrator.PublicationOutcome(final_push_succeeded=True)
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, "[]"), (0, ""), (0, "{"), (0, "{}")],
+)
+def test_unknown_report_comment_lookup_never_posts_a_duplicate(
+    fixture_dir: Path, tmp_path: Path, returncode: int, stdout: str
+) -> None:
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout='[{"number":86}]'),
+            subprocess.CompletedProcess([], returncode, stdout=stdout),
+        ]
+    )
+
+    outcome = _publish_with_runner(
+        runner=runner, fixture_dir=fixture_dir, worktree=tmp_path
+    )
+
+    assert outcome == orchestrator.PublicationOutcome(
+        pr_opened=True,
+        final_push_succeeded=True,
+    )
+    calls = [call.args[0] for call in runner.call_args_list]
+    assert not any("--method" in call for call in calls)
+
+
+def test_before_run_human_stops_before_claim_or_pull_request(tmp_path: Path) -> None:
+    fixture = _scoped_fixture(tmp_path, before=True)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "before":
+                raise AgentCrashError("human", phase=phase, exit_code=1)
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    runner = _git_aware_runner()
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="before-human",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert not outcome.succeeded
+    assert outcome.stopping_point == "before-Run HUMAN"
+    source.claim.assert_not_called()
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_after_run_human_runs_gate_and_keeps_pull_request_draft(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                raise AgentCrashError("human", phase=phase, exit_code=1)
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    gate_paths: list[Path] = []
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_paths.append(cwd)
+        return orchestrator.GateOutcome(True, "green")
+
+    runner = _git_aware_runner()
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="after-human",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        gate_check=gate,
+    )
+
+    assert outcome.completed == [1]
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "after-Run HUMAN"
+    assert gate_paths[-1].name == "run-after-human"
+
+
+def test_red_run_gate_keeps_pull_request_draft(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        is_run = cwd.name.startswith("run-")
+        return orchestrator.GateOutcome(not is_run, "red" if is_run else "green")
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="red-gate",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        gate_check=gate,
+    )
+
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "Run Gate"
+
+
+def test_second_run_setup_failure_skips_gate_and_keeps_draft(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+    run_setup_count = 0
+    gate_paths: list[Path] = []
+
+    def setup(cwd: Path) -> None:
+        nonlocal run_setup_count
+        if cwd.name.startswith("run-"):
+            run_setup_count += 1
+            if run_setup_count == 2:
+                raise orchestrator.SetupError("broken")
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_paths.append(cwd)
+        return orchestrator.GateOutcome(True, "green")
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="setup-failure",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        gate_check=gate,
+        setup=setup,
+    )
+
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert outcome.stopping_point == "after-Run Setup"
+    assert all(not path.name.startswith("run-") for path in gate_paths)
+
+
+def test_handled_item_infrastructure_failure_stops_frozen_remainder(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=n, title=f"Item {n}", assignees=["krishna"]) for n in (1, 2, 3)
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+
+    def setup(cwd: Path) -> None:
+        if cwd.name == "issue-2":
+            raise RuntimeError("offline")
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="infra-failure",
+        iterations=3,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        setup=setup,
+    )
+
+    assert outcome.completed == [1]
+    assert outcome.stopping_point == "Item #2 infrastructure failure: offline"
+    source.release.assert_called_once_with(2)
+    assert [call.args[0] for call in source.claim.call_args_list] == [1, 2]
+    assert outcome.pr_opened and not outcome.pr_ready
+
+
+def test_invalid_run_report_is_visible_and_keeps_pull_request_draft(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                report = cwd / orchestrator.RUN_REPORT
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_bytes(b"\xff")
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    bodies: list[str] = []
+    base_runner = _git_aware_runner()
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "comment"]:
+            bodies.append(argv[argv.index("--body") + 1])
+        return base_runner(argv, **kwargs)
+
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="invalid-report",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=MagicMock(side_effect=side_effect),
+    )
+
+    assert outcome.stopping_point == "Run report validation"
+    assert outcome.pr_opened and not outcome.pr_ready and not outcome.succeeded
+    assert "Run report is not valid UTF-8" in bodies[0]
+
+
+def test_interrupt_during_after_run_opens_no_pull_request(tmp_path: Path) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    source = MagicMock()
+    source.list_ready.return_value = [
+        IssueRef(number=1, title="First", assignees=["krishna"])
+    ]
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            if phase == "after":
+                raise KeyboardInterrupt
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    runner = _git_aware_runner()
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="after-interrupt",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+        )
+
+    assert not _calls_containing(runner, "gh", "pr", "create")
+    assert not _calls_containing(
+        runner, "git", "branch", "-D", "pycastle/run-after-interrupt"
+    )
+
+
+@pytest.mark.parametrize("size", [0, orchestrator.RUN_REPORT_LIMIT])
+def test_harvest_report_accepts_boundary_sizes(tmp_path: Path, size: int) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    (worktree / ".pycastle").mkdir(parents=True)
+    (worktree / orchestrator.RUN_REPORT).write_bytes(b"x" * size)
+
+    report, error = orchestrator._harvest_report(
+        _run_context(fixture_dir=fixture, worktree=worktree, runner=MagicMock())
+    )
+
+    assert report == "x" * size
+    assert error is None
+
+
+def test_harvest_report_accepts_missing_optional_report(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    report, error = orchestrator._harvest_report(
+        _run_context(fixture_dir=fixture, worktree=worktree, runner=MagicMock())
+    )
+
+    assert report is None
+    assert error is None
+    assert not (fixture / "runs" / "run-86" / "run-report.md").exists()
+
+
+def test_harvest_report_rejects_one_byte_over_limit_without_truncating(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    (worktree / ".pycastle").mkdir(parents=True)
+    raw = b"x" * (orchestrator.RUN_REPORT_LIMIT + 1)
+    (worktree / orchestrator.RUN_REPORT).write_bytes(raw)
+
+    report, error = orchestrator._harvest_report(
+        _run_context(fixture_dir=fixture, worktree=worktree, runner=MagicMock())
+    )
+
+    assert report is None
+    assert error == (
+        f"Run report exceeds the {orchestrator.RUN_REPORT_LIMIT}-byte "
+        "publication limit."
+    )
+    assert (fixture / "runs" / "run-86" / "run-report.md").read_bytes() == raw
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "broken-symlink"])
+def test_harvest_report_rejects_non_regular_files(tmp_path: Path, kind: str) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    report_path = worktree / orchestrator.RUN_REPORT
+    report_path.parent.mkdir(parents=True)
+    if kind == "directory":
+        report_path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "outside.md"
+        target.write_text("must not be published")
+        report_path.symlink_to(target)
+    else:
+        report_path.symlink_to(tmp_path / "missing.md")
+
+    report, error = orchestrator._harvest_report(
+        _run_context(fixture_dir=fixture, worktree=worktree, runner=MagicMock())
+    )
+
+    assert report is None
+    assert error == "Run report must be a regular file."
+    assert not (fixture / "runs" / "run-86" / "run-report.md").exists()
+
+
+def test_ready_transition_failure_keeps_publication_success_distinct(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=86, title="Integrated review", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+
+    def fail_ready(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "ready"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="not ready")
+        return base_runner(argv, **kwargs)
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="run-86",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=MagicMock(side_effect=fail_ready),
+    )
+
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Pull request ready transition"
 
 
 def test_transcript_sink_interleaves_tagged_lines(
@@ -416,6 +1402,197 @@ def test_successful_branches_merge_and_one_pr_is_opened(
     assert outcome.pr_opened is True
 
 
+def test_each_successful_issue_merge_checkpoints_the_run_branch(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    runner = _git_aware_runner()
+
+    orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    events = [call.args[0] for call in runner.call_args_list]
+    merges = [i for i, argv in enumerate(events) if argv[:2] == ["git", "merge"]]
+    pushes = [i for i, argv in enumerate(events) if argv[:2] == ["git", "push"]]
+    assert len(pushes) == 3  # two durability checkpoints plus finalization
+    assert merges[0] < pushes[0] < merges[1] < pushes[1] < pushes[2]
+
+
+def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issues = [
+        IssueRef(number=2, title="First", assignees=["krishna"]),
+        IssueRef(number=4, title="Second", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 1:
+                return subprocess.CompletedProcess(argv, 1, stdout="offline")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        iterations=2,
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == [2, 4]
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is True
+    assert outcome.succeeded is True
+    assert push_count == 3
+    pushes = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:2] == ["git", "push"]
+    ]
+    assert pushes == [
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+    ]
+    assert (
+        "Durability push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
+
+
+def test_incremental_push_os_error_is_logged_without_aborting_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="First", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 1:
+                raise OSError("origin is unreachable")
+        return base_runner(argv, **kwargs)
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=MagicMock(side_effect=side_effect),
+    )
+
+    assert outcome.completed == [2]
+    assert outcome.pr_opened is True
+    assert push_count == 2
+    assert (
+        "Durability push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
+
+
+@pytest.mark.parametrize("gate_passed", [True, False])
+@pytest.mark.parametrize("failure_kind", ["nonzero", "os-error"])
+def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
+    fixture_dir: Path, tmp_path: Path, gate_passed: bool, failure_kind: str
+) -> None:
+    issue = IssueRef(number=2, title="First", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 2:
+                if failure_kind == "os-error":
+                    raise OSError("origin is unreachable")
+                return subprocess.CompletedProcess(argv, 1, stdout="offline")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=side_effect)
+
+    def check_gate(cwd: Path) -> orchestrator.GateOutcome:
+        passed = True if cwd.name.startswith("issue-") else gate_passed
+        return orchestrator.GateOutcome(
+            passed,
+            "gate output",
+            exit_code=0 if passed else 1,
+            duration_seconds=0.1,
+            command=".pycastle/gate",
+        )
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+        gate_check=check_gate,
+    )
+
+    assert outcome.pr_opened is False
+    assert outcome.pr_ready is False
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Final push"
+    calls = [call.args[0] for call in runner.call_args_list]
+    push_indexes = [i for i, call in enumerate(calls) if call[:2] == ["git", "push"]]
+    assert len(push_indexes) == 2
+    assert push_indexes[0] < push_indexes[1]
+    assert not any(call[:2] == ["gh", "pr"] for call in calls)
+    assert not _calls_containing(runner, "git", "branch", "-D", outcome.run_branch)
+    assert (fixture_dir / "runs" / "20260613-101500" / "run.log").exists()
+    assert (
+        "Final push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
+
+
 def test_merge_conflict_marks_for_human_and_run_continues(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -451,6 +1628,16 @@ def test_merge_conflict_marks_for_human_and_run_continues(
     merged = {o.issue.number: o.merged for o in outcome.issues}
     assert merged == {2: True, 4: False, 6: True}
     assert _calls_containing(runner, "git", "merge", "--abort")
+    pushes = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:2] == ["git", "push"]
+    ]
+    assert pushes == [
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+    ]
 
     # The conflicting issue is marked for human handling; the clean ones are not.
     source.mark_for_human.assert_called_once_with(4)

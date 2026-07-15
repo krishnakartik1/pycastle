@@ -59,13 +59,13 @@ def check_fixture_compatibility(
     fixture_dir: Path,
     runner_version: str = __version__,
     *,
-    migration_versions: Iterable[str] = (),
+    migration_versions: Iterable[str] | None = None,
 ) -> FixtureCompatibility:
     """Inspect ``fixture_dir/version`` and return its compatibility outcome.
 
     A migration version denotes the release whose migration upgrades a fixture
-    to that release. The registry is intentionally empty in this ticket, but the
-    parameter fixes the boundary the upgrade implementation will populate.
+    to that release. By default the bundled registry is used; tests and tooling
+    may pass an explicit version sequence at this boundary.
     """
     runner = Version(runner_version)
     marker = fixture_dir / VERSION_MARKER
@@ -93,6 +93,10 @@ def check_fixture_compatibility(
             f"installed PyCastle {runner}. Install PyCastle {fixture} or newer.",
         )
 
+    if migration_versions is None:
+        from .migrations import MIGRATIONS
+
+        migration_versions = (item.target_release for item in MIGRATIONS)
     migrations = sorted(Version(item) for item in migration_versions)
     applicable = [target for target in migrations if fixture < target <= runner]
     if applicable:
@@ -101,7 +105,7 @@ def check_fixture_compatibility(
             runner,
             fixture,
             f"Project fixture {fixture} requires migration to run with PyCastle "
-            f"{runner}. Run `pycastle upgrade` (available in a future release).",
+            f"{runner}. Run `pycastle upgrade`.",
         )
 
     return FixtureCompatibility(
@@ -116,7 +120,7 @@ def require_fixture_compatibility(
     fixture_dir: Path,
     runner_version: str = __version__,
     *,
-    migration_versions: Iterable[str] = (),
+    migration_versions: Iterable[str] | None = None,
 ) -> FixtureCompatibility:
     """Return a compatible result or raise with its actionable diagnostic."""
     result = check_fixture_compatibility(

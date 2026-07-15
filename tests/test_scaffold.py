@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
-from pycastle.graph import DONE, PhaseGraph, load_graph
+from pycastle.graph import DONE, PhaseGraph, load_graph, load_run
 from pycastle.scaffold import (
     _DOCKERFILE,
     _EXTENSION_EMPTY,
@@ -41,6 +41,9 @@ EXPECTED_TREE = {
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
+    "prompts/run-review.md",
+    "prompts/run-repair.md",
+    "prompts/run-report.md",
 }
 
 
@@ -174,6 +177,8 @@ def test_scaffold_gitignore_excludes_runtime_scratch_files(
     assert "/plan.md" in gitignore
     assert "/issue.md" in gitignore
     assert "/plan-issue-*.md" in gitignore
+    assert "/run-review.md" in gitignore
+    assert "/run-report.md" in gitignore
 
 
 def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> None:
@@ -200,7 +205,15 @@ def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> No
 
     # The exact scratch files a run drops into .pycastle/ (a phase's plan, a
     # retried attempt's handoff, an issue scratch).
-    for name in ("handoff.md", "plan.md", "issue.md", "plan-issue-19.md"):
+    scratch = (
+        "handoff.md",
+        "plan.md",
+        "issue.md",
+        "plan-issue-19.md",
+        "run-review.md",
+        "run-report.md",
+    )
+    for name in scratch:
         (fixture / name).write_text(f"stray {name}\n")
 
     subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
@@ -213,7 +226,7 @@ def test_scaffolded_gitignore_keeps_scratch_out_of_git_add(tmp_path: Path) -> No
     ).stdout.splitlines()
 
     # None of the scratch strays were staged...
-    for name in ("handoff.md", "plan.md", "issue.md", "plan-issue-19.md"):
+    for name in scratch:
         assert f".pycastle/{name}" not in tracked
     # ...but the tracked prompt of the same basename still is (anchoring holds).
     assert ".pycastle/prompts/plan.md" in tracked
@@ -327,7 +340,7 @@ def test_scaffolded_main_uses_the_declarative_builder_api(tmp_path: Path) -> Non
     assert "phase(" in main_py
     assert "DONE" in main_py
     assert "HUMAN" in main_py
-    assert "graph = build(" in main_py
+    assert "run = build_run(" in main_py
 
 
 def test_scaffolded_main_loads_as_a_valid_phase_graph(tmp_path: Path) -> None:
@@ -335,7 +348,11 @@ def test_scaffolded_main_loads_as_a_valid_phase_graph(tmp_path: Path) -> None:
     scaffold_fixture(tmp_path, sandbox="host")
     fixture_dir = tmp_path / ".pycastle"
 
-    graph = load_graph(fixture_dir)
+    definition = load_run(fixture_dir)
+    assert definition.before is None
+    assert definition.after is not None
+    assert list(definition.after.phases) == ["run-review", "run-repair", "run-report"]
+    graph = definition.item
     assert isinstance(graph, PhaseGraph)
 
     # The conservative default flow: plan → implement → review → DONE.
@@ -348,6 +365,21 @@ def test_scaffolded_main_loads_as_a_valid_phase_graph(tmp_path: Path) -> None:
     # Every named prompt file the graph references was actually scaffolded.
     for ph in graph.phases.values():
         assert (fixture_dir / "prompts" / ph.prompt).is_file()
+
+
+def test_scaffolded_prompts_define_the_scratch_handoffs(tmp_path: Path) -> None:
+    """Fresh prompts name the files that carry state between fresh calls."""
+    scaffold_fixture(tmp_path, sandbox="host")
+    prompts = tmp_path / ".pycastle" / "prompts"
+
+    assert "Read `.pycastle/plan.md`" in (prompts / "implement.md").read_text()
+    assert "`.pycastle/run-review.md`" in (prompts / "run-review.md").read_text()
+    repair = (prompts / "run-repair.md").read_text()
+    assert "Read `.pycastle/run-review.md`" in repair
+    assert "When there are no findings, make no changes" in repair
+    report = (prompts / "run-report.md").read_text()
+    assert "Inspect the repaired integrated diff" in report
+    assert "`.pycastle/run-report.md`" in report
 
 
 def test_scaffolded_graph_walks_to_done_end_to_end(tmp_path: Path) -> None:
@@ -374,6 +406,73 @@ def test_scaffolded_graph_walks_to_done_end_to_end(tmp_path: Path) -> None:
 
     assert visited == ["plan", "implement", "review"]
     assert walk.terminal is DONE
+
+
+def test_scaffolded_after_run_graph_reviews_repairs_and_reports(tmp_path: Path) -> None:
+    """The fresh fixture's phases exchange scratch state in the declared order."""
+    from pycastle.graph import GraphExecutor, Phase, PhaseResult
+
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture_dir = tmp_path / ".pycastle"
+    graph = load_run(fixture_dir).after
+    assert graph is not None
+
+    visited: list[str] = []
+
+    def run_phase(ph: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        visited.append(ph.name)
+        if ph.name == "run-review":
+            (fixture_dir / "run-review.md").write_text("Repair integrated.txt\n")
+        elif ph.name == "run-repair":
+            assert (fixture_dir / "run-review.md").read_text() == (
+                "Repair integrated.txt\n"
+            )
+            (tmp_path / "integrated.txt").write_text("repaired\n")
+        elif ph.name == "run-report":
+            assert (tmp_path / "integrated.txt").read_text() == "repaired\n"
+            (fixture_dir / "run-report.md").write_text("# Repaired batch\n")
+        return True, []
+
+    walk = GraphExecutor(runtime=object(), fixture_dir=fixture_dir).execute(
+        graph, cwd=tmp_path, phase_runner=run_phase
+    )
+
+    assert visited == ["run-review", "run-repair", "run-report"]
+    assert walk.terminal is DONE
+    assert (fixture_dir / "run-report.md").read_text() == "# Repaired batch\n"
+
+
+def test_scaffolded_after_run_graph_handles_no_findings_without_repairs(
+    tmp_path: Path,
+) -> None:
+    """The default after-Run path can report an already-clean integrated state."""
+    from pycastle.graph import GraphExecutor, Phase, PhaseResult
+
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture_dir = tmp_path / ".pycastle"
+    integrated = tmp_path / "integrated.txt"
+    integrated.write_text("already clean\n")
+    graph = load_run(fixture_dir).after
+    assert graph is not None
+
+    def run_phase(ph: Phase, _extra: str | None) -> tuple[bool, list[PhaseResult]]:
+        if ph.name == "run-review":
+            (fixture_dir / "run-review.md").write_text("No findings\n")
+        elif ph.name == "run-repair":
+            assert (fixture_dir / "run-review.md").read_text() == "No findings\n"
+            assert integrated.read_text() == "already clean\n"
+        elif ph.name == "run-report":
+            assert integrated.read_text() == "already clean\n"
+            (fixture_dir / "run-report.md").write_text("# Clean batch\n")
+        return True, []
+
+    walk = GraphExecutor(runtime=object(), fixture_dir=fixture_dir).execute(
+        graph, cwd=tmp_path, phase_runner=run_phase
+    )
+
+    assert walk.terminal is DONE
+    assert integrated.read_text() == "already clean\n"
+    assert (fixture_dir / "run-report.md").read_text() == "# Clean batch\n"
 
 
 # --------------------------------------------------------------------------- #

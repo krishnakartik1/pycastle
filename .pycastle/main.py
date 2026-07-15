@@ -15,13 +15,24 @@ change the workflow -- add phases, repoint edges, or model handoff as its own
 node.
 """
 
-from pycastle.graph import DONE, HUMAN, build, phase
+from pycastle.graph import DONE, HUMAN, build, build_run, phase
 
-graph = build(
-    start="plan",
-    phases=[
-        phase("plan", "plan.md", on_success="implement", on_failure=HUMAN),
-        phase("implement", "implement.md", on_success="review", on_failure=HUMAN),
-        phase("review", "review.md", on_success=DONE, on_failure=HUMAN),
-    ],
+run = build_run(
+    before=None,
+    item=build(
+        start="plan",
+        phases=[
+            phase("plan", "plan.md", on_success="implement", on_failure=HUMAN),
+            phase("implement", "implement.md", on_success="review", on_failure=HUMAN),
+            phase("review", "review.md", on_success=DONE, on_failure=HUMAN),
+        ],
+    ),
+    after=build(
+        start="run-review",
+        phases=[
+            phase("run-review", "run-review.md", on_success="run-repair"),
+            phase("run-repair", "run-repair.md", on_success="run-report"),
+            phase("run-report", "run-report.md"),
+        ],
+    ),
 )

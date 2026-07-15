@@ -10,8 +10,10 @@ import pytest
 from packaging.version import Version
 
 from pycastle import cli
+from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
 from pycastle.preflight import PreflightError
+from pycastle.upgrade import FixtureMigration
 
 
 def test_version_flag_reports_built_package_version(
@@ -53,6 +55,36 @@ def test_incompatible_run_stops_before_any_run_side_effect(
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
     touched.assert_not_called()
     assert diagnostic in caplog.text
+
+
+def test_run_directs_to_upgrade_when_registered_migration_applies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    (fixture / "version").write_text("0.0.1\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(
+        fixture_migrations,
+        "MIGRATIONS",
+        (
+            FixtureMigration(
+                "0.1.0",
+                lambda _path: False,
+                lambda _path: None,
+                lambda _path: True,
+            ),
+        ),
+    )
+    side_effect = MagicMock(side_effect=AssertionError("Run side effect started"))
+    monkeypatch.setattr(cli, "_resolve_repo", side_effect)
+
+    assert main(["run", "--runtime", "stub"]) == 1
+    side_effect.assert_not_called()
+    assert "pycastle upgrade" in caplog.text
 
 
 def test_parses_run_arguments() -> None:
@@ -122,7 +154,19 @@ def test_main_dispatches_prune(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "prune_run_branches", prune)
 
     assert main(["prune"]) == 0
-    prune.assert_called_once_with(repo="owner/repo", cwd=Path.cwd())
+    prune.assert_called_once_with(
+        repo="owner/repo", cwd=Path.cwd(), include_no_pr=False
+    )
+
+
+def test_main_dispatches_prune_include_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
+    prune = MagicMock(return_value=[])
+    monkeypatch.setattr(cli, "prune_run_branches", prune)
+
+    assert main(["prune", "--include-no-pr"]) == 0
+    prune.assert_called_once_with(repo="owner/repo", cwd=Path.cwd(), include_no_pr=True)
 
 
 def test_make_run_id_is_a_timestamp_shape() -> None:
@@ -176,6 +220,90 @@ def test_parses_sandbox_setup() -> None:
 def test_parses_init() -> None:
     args = build_parser().parse_args(["init"])
     assert args.command == "init"
+    assert args.sandbox is None
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("", "host"),
+        ("host", "host"),
+        ("H", "host"),
+        (" d ", "docker"),
+        ("DOCKER", "docker"),
+        ("invalid", "host"),
+    ],
+)
+def test_prompt_sandbox_resolves_interactive_answers(
+    monkeypatch: pytest.MonkeyPatch, answer: str, expected: str
+) -> None:
+    """The prompt preserves its Docker aliases and host-first default."""
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+
+    assert cli._prompt_sandbox() == expected
+
+
+def test_prompt_sandbox_treats_eof_as_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closed stdin resolves directly to host without leaking EOFError."""
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
+
+    assert cli._prompt_sandbox() == "host"
+
+
+@pytest.mark.parametrize("sandbox", ["host", "docker"])
+def test_init_sandbox_flag_scaffolds_without_reading_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: str
+) -> None:
+    """An explicit init Sandbox is scriptable and skips the prompt."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "builtins.input",
+        MagicMock(side_effect=AssertionError("init unexpectedly read stdin")),
+    )
+
+    assert main(["init", "--sandbox", sandbox]) == 0
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == sandbox
+
+
+def test_init_with_closed_stdin_defaults_to_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """EOF at the interactive prompt behaves like an empty host-first answer."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
+
+    assert main(["init"]) == 0
+    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
+
+
+def test_invalid_init_sandbox_is_rejected_before_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Argparse rejects an invalid Sandbox before init can create its fixture."""
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["init", "--sandbox", "cloud"])
+
+    assert excinfo.value.code == 2
+    assert not (tmp_path / ".pycastle").exists()
+
+
+def test_parses_and_dispatches_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    upgraded = MagicMock()
+    upgraded.changed = False
+    upgraded.fixture_version = "1.0"
+    upgraded.runner_version = "1.0"
+    monkeypatch.setattr(cli, "upgrade_fixture", MagicMock(return_value=upgraded))
+
+    assert build_parser().parse_args(["upgrade"]).command == "upgrade"
+    assert main(["upgrade"]) == 0
+    cli.upgrade_fixture.assert_called_once_with(Path.cwd())
 
 
 def test_main_fails_fast_when_preflight_fails(
@@ -202,8 +330,8 @@ def test_init_scaffolds_the_chosen_sandbox(
 ) -> None:
     """``pycastle init`` prompts host/docker and scaffolds the matching fixture.
 
-    The interactive prompt is stubbed (it is not unit-tested); we assert the
-    answer is threaded into the scaffolder and a fixture is written into cwd.
+    The interactive prompt is stubbed so this test can focus on threading the
+    answer into the scaffolder and writing a fixture into cwd.
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)
