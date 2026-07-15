@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pycastle import cli
+from pycastle import cli, sandbox
 from pycastle.readiness import (
     CHECK_IDS,
     CheckResult,
@@ -246,7 +246,10 @@ def runtime_configuration(runtime: str) -> ReadinessConfiguration:
 class ScriptedRuntimeRunner:
     def __init__(
         self,
-        responses: dict[tuple[str, ...], subprocess.CompletedProcess[str] | OSError],
+        responses: dict[
+            tuple[str, ...],
+            subprocess.CompletedProcess[str] | OSError | subprocess.TimeoutExpired,
+        ],
     ) -> None:
         self.responses = responses
         self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
@@ -257,7 +260,7 @@ class ScriptedRuntimeRunner:
         call = tuple(argv)
         self.calls.append((call, kwargs))
         response = self.responses[call]
-        if isinstance(response, OSError):
+        if isinstance(response, OSError | subprocess.TimeoutExpired):
             raise response
         return response
 
@@ -410,6 +413,60 @@ def test_host_runtime_version_unavailable_does_not_fail_readiness(
     assert result.facts == {}
     assert authentication.status is Status.PASS
     assert [call for call, _kwargs in runner.calls] == [version_argv, status_argv]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected_facts"),
+    [
+        (None, {}),
+        (b"codex-cli 1.2.3", {}),
+        ("", {}),
+        (" \n\t", {}),
+        ("v" * 100, {"version": "v" * 100}),
+        ("v" * 101, {}),
+        ("version: 1.2.3", {}),
+    ],
+)
+def test_runtime_version_facts_are_bounded_and_allow_listed(
+    tmp_path: Path, stdout: object, expected_facts: dict[str, str]
+) -> None:
+    argv = ("codex", "--version")
+    result = subprocess.CompletedProcess(argv, 0, stdout, "ignored secret")
+    adapter = DefaultReadinessAdapter(
+        tmp_path, tmp_path, runner=ScriptedRuntimeRunner({argv: result})
+    )
+
+    readiness = adapter.check_runtime(runtime_configuration("codex"))
+
+    assert readiness.status is Status.PASS
+    assert readiness.facts == expected_facts
+
+
+@pytest.mark.parametrize("error_kind", ["os_error", "timeout"])
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_runtime_authentication_probe_errors_are_bounded_and_actionable(
+    tmp_path: Path, runtime: str, error_kind: str
+) -> None:
+    argv = tuple(sandbox.RUNTIME_CONFIG[runtime].status_args)
+    secret = "credential=do-not-report"
+    error: OSError | subprocess.TimeoutExpired
+    if error_kind == "os_error":
+        error = OSError(secret)
+    else:
+        error = subprocess.TimeoutExpired(argv, 15.0, output=secret, stderr=secret)
+    adapter = DefaultReadinessAdapter(
+        tmp_path, tmp_path, runner=ScriptedRuntimeRunner({argv: error})
+    )
+
+    result = adapter.check_runtime_authentication(runtime_configuration(runtime))
+
+    assert result.status is Status.FAIL
+    assert result.facts == {}
+    assert result.summary == "Runtime authentication status could not be checked."
+    assert result.remediation == (
+        f"Verify {runtime} and authenticate it in the selected Sandbox."
+    )
+    assert secret not in repr(result)
 
 
 def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
