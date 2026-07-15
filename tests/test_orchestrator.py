@@ -900,8 +900,9 @@ def test_incremental_push_os_error_is_logged_without_aborting_run(
 
 
 @pytest.mark.parametrize("gate_passed", [True, False])
+@pytest.mark.parametrize("failure_kind", ["nonzero", "os-error"])
 def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
-    fixture_dir: Path, tmp_path: Path, gate_passed: bool
+    fixture_dir: Path, tmp_path: Path, gate_passed: bool, failure_kind: str
 ) -> None:
     issue = IssueRef(number=2, title="First", assignees=["krishna"])
     source = MagicMock()
@@ -914,6 +915,8 @@ def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
         if argv[:2] == ["git", "push"]:
             push_count += 1
             if push_count == 2:
+                if failure_kind == "os-error":
+                    raise OSError("origin is unreachable")
                 return subprocess.CompletedProcess(argv, 1, stdout="offline")
         return base_runner(argv, **kwargs)
 
@@ -947,7 +950,11 @@ def test_failed_final_push_prevents_ready_or_draft_pull_request_creation(
     assert outcome.pr_ready is False
     assert outcome.succeeded is False
     assert outcome.stopping_point == "Final push"
-    assert not _calls_containing(runner, "gh", "pr", "create")
+    calls = [call.args[0] for call in runner.call_args_list]
+    push_indexes = [i for i, call in enumerate(calls) if call[:2] == ["git", "push"]]
+    assert len(push_indexes) == 2
+    assert push_indexes[0] < push_indexes[1]
+    assert not any(call[:2] == ["gh", "pr"] for call in calls)
     assert not _calls_containing(runner, "git", "branch", "-D", outcome.run_branch)
     assert (fixture_dir / "runs" / "20260613-101500" / "run.log").exists()
     assert (
