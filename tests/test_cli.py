@@ -12,7 +12,8 @@ from packaging.version import Version
 from pycastle import cli
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
-from pycastle.orchestrator import RunOutcome
+from pycastle.issues import IssueRef
+from pycastle.orchestrator import IssueOutcome, RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
     CHECK_IDS,
@@ -279,6 +280,26 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
                 selected=[107],
                 succeeded=False,
                 stopping_point="before-Run HUMAN",
+            ),
+            1,
+        ),
+        (
+            RunOutcome(
+                run_id="all-skipped",
+                run_branch="pycastle/run-all-skipped",
+                selected=[106, 107],
+                issues=[
+                    IssueOutcome(
+                        issue=IssueRef(number=106, title="Skipped"),
+                        branch="pycastle/issue-106",
+                        merged=False,
+                    ),
+                    IssueOutcome(
+                        issue=IssueRef(number=107, title="Human"),
+                        branch="pycastle/issue-107",
+                        merged=False,
+                    ),
+                ],
             ),
             1,
         ),
