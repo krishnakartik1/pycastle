@@ -33,12 +33,19 @@ EXPECTED_TREE = {
     "gate",
     "setup",
     "sandbox",
+    "version",
     "Dockerfile",
     ".gitignore",
     "prompts/plan.md",
     "prompts/implement.md",
     "prompts/review.md",
 }
+
+
+def test_scaffold_records_normalized_installed_version(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+
+    assert (tmp_path / ".pycastle" / "version").read_text() == "0.1.0\n"
 
 
 @pytest.mark.parametrize(

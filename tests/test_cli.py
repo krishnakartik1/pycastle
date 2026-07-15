@@ -12,6 +12,30 @@ from pycastle.cli import build_parser, main
 from pycastle.preflight import PreflightError
 
 
+def test_version_flag_reports_built_package_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["--version"])
+
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out == "pycastle 0.1.0\n"
+
+
+def test_incompatible_run_stops_before_any_run_side_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    touched = MagicMock(side_effect=AssertionError("Run side effect started"))
+    monkeypatch.setattr(cli, "_resolve_agent_image", touched)
+    monkeypatch.setattr(cli, "_resolve_repo", touched)
+    monkeypatch.setattr(cli, "run_loop", touched)
+
+    assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 1
+    touched.assert_not_called()
+
+
 def test_parses_run_arguments() -> None:
     args = build_parser().parse_args(["run", "-i", "3", "--runtime", "stub"])
     assert args.command == "run"
@@ -234,6 +258,7 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     """
     # No Dockerfile in this cwd, so image resolution falls back to the default
     # tag and never touches docker -- the run stays hermetic.
+    _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
@@ -276,6 +301,7 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     """
     # No Dockerfile in this cwd, so image resolution falls back to the default
     # tag and never touches docker -- the run stays hermetic.
+    _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
@@ -360,6 +386,7 @@ def test_run_docker_builds_docker_gate_check(
     """
     # No Dockerfile here, so image resolution falls back to the default tag and
     # never touches docker -- hermetic.
+    _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
@@ -408,6 +435,7 @@ def test_run_docker_builds_docker_gate_check(
 def test_run_docker_preflights_gate_toolchain_once_before_issue_work(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.setattr(cli, "_resolve_agent_image", lambda *_args: "agent:resolved")
@@ -499,6 +527,13 @@ def _write_marker(tmp_path: Path, value: str) -> None:
     fixture = tmp_path / ".pycastle"
     fixture.mkdir(parents=True, exist_ok=True)
     (fixture / "sandbox").write_text(value)
+    (fixture / "version").write_text("0.1.0\n")
+
+
+def _write_version_marker(tmp_path: Path) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "version").write_text("0.1.0\n")
 
 
 def _mock_run_externals(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -595,6 +630,7 @@ def test_run_falls_back_to_host_when_marker_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """No flag and no marker at all falls back to a host run."""
+    _write_version_marker(tmp_path)
     monkeypatch.chdir(tmp_path)
     captured = _mock_run_externals(monkeypatch)
 
@@ -1015,6 +1051,7 @@ def _write_dockerfile(tmp_path: Path, text: str) -> Path:
     fixture = tmp_path / ".pycastle"
     fixture.mkdir(parents=True, exist_ok=True)
     (fixture / "Dockerfile").write_text(text)
+    (fixture / "version").write_text("0.1.0\n")
     return fixture
 
 

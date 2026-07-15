@@ -9,7 +9,7 @@ description = "A reusable, installable autonomous development loop for any repos
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Krishna Kartik", email = "krishnakartik1@gmail.com" }]
-dependencies = ["pydantic>=2"]
+dependencies = ["packaging>=22", "pydantic>=2"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "black", "pre-commit"]
