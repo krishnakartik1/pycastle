@@ -3,12 +3,15 @@
 import re
 from pathlib import Path
 
+import pytest
 from packaging.version import Version
 
 from pycastle import __version__
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "pycastle" / "SKILL.md"
+RELEASE_LINE = re.compile(r"^PyCastle release: `([^`]*)`$", re.MULTILINE)
+GIT_TAG = re.compile(r"(?:pycastle@|--branch )(?P<tag>v[^\s`]+)")
 
 
 def _skill_text() -> str:
@@ -26,6 +29,21 @@ def _frontmatter(text: str) -> dict[str, str]:
     return entries
 
 
+def _embedded_release(text: str) -> str:
+    """Return the one canonical, stable release embedded in a skill."""
+    matches = RELEASE_LINE.findall(text)
+    if len(matches) != 1:
+        raise ValueError("skill must contain exactly one PyCastle release")
+    release = matches[0]
+    try:
+        parsed = Version(release)
+    except ValueError as error:
+        raise ValueError("skill release must be a valid version") from error
+    if not release or str(parsed) != release or parsed.is_prerelease or parsed.local:
+        raise ValueError("skill release must be a normalized stable version")
+    return release
+
+
 def test_one_portable_pycastle_skill_has_valid_frontmatter() -> None:
     skill_files = list((ROOT / "skills").glob("**/SKILL.md"))
 
@@ -39,12 +57,26 @@ def test_one_portable_pycastle_skill_has_valid_frontmatter() -> None:
 
 def test_skill_release_matches_the_cli_release() -> None:
     text = _skill_text()
-    match = re.search(r"^PyCastle release: `([^`]+)`$", text, re.MULTILINE)
+    release = _embedded_release(text)
 
-    assert match is not None
-    assert str(Version(match.group(1))) == match.group(1)
-    assert match.group(1) == __version__
-    assert f"v{__version__}" in text
+    assert release == __version__
+    assert set(GIT_TAG.findall(text)) == {f"v{release}"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "",
+        "PyCastle release: ``\n",
+        "PyCastle release: `not-a-version`\n",
+        "PyCastle release: `0.1.0rc1`\n",
+        "PyCastle release: `0.1.0+local`\n",
+        "PyCastle release: `0.1.0`\nPyCastle release: `0.1.0`\n",
+    ),
+)
+def test_embedded_release_rejects_missing_empty_or_ambiguous_values(text: str) -> None:
+    with pytest.raises(ValueError, match="release|version"):
+        _embedded_release(text)
 
 
 def test_skill_selects_runtime_and_pins_lifecycle_commands() -> None:
