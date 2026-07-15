@@ -295,6 +295,92 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     ).read_text() == "Verified integrated evidence.\n"
 
 
+@pytest.mark.parametrize("size", [0, orchestrator.RUN_REPORT_LIMIT])
+def test_harvest_report_accepts_boundary_sizes(tmp_path: Path, size: int) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    (worktree / ".pycastle").mkdir(parents=True)
+    (worktree / orchestrator.RUN_REPORT).write_bytes(b"x" * size)
+
+    report, error = orchestrator._harvest_report(fixture, "run-86", worktree)
+
+    assert report == "x" * size
+    assert error is None
+
+
+def test_harvest_report_rejects_one_byte_over_limit_without_truncating(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    (worktree / ".pycastle").mkdir(parents=True)
+    raw = b"x" * (orchestrator.RUN_REPORT_LIMIT + 1)
+    (worktree / orchestrator.RUN_REPORT).write_bytes(raw)
+
+    report, error = orchestrator._harvest_report(fixture, "run-86", worktree)
+
+    assert report is None
+    assert error == (
+        f"Run report exceeds the {orchestrator.RUN_REPORT_LIMIT}-byte "
+        "publication limit."
+    )
+    assert (fixture / "runs" / "run-86" / "run-report.md").read_bytes() == raw
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "broken-symlink"])
+def test_harvest_report_rejects_non_regular_files(tmp_path: Path, kind: str) -> None:
+    fixture = tmp_path / ".pycastle"
+    worktree = tmp_path / "worktree"
+    report_path = worktree / orchestrator.RUN_REPORT
+    report_path.parent.mkdir(parents=True)
+    if kind == "directory":
+        report_path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "outside.md"
+        target.write_text("must not be published")
+        report_path.symlink_to(target)
+    else:
+        report_path.symlink_to(tmp_path / "missing.md")
+
+    report, error = orchestrator._harvest_report(fixture, "run-86", worktree)
+
+    assert report is None
+    assert error == "Run report must be a regular file."
+    assert not (fixture / "runs" / "run-86" / "run-report.md").exists()
+
+
+def test_ready_transition_failure_keeps_publication_success_distinct(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=86, title="Integrated review", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+
+    def fail_ready(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["gh", "pr", "ready"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="not ready")
+        return base_runner(argv, **kwargs)
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="run-86",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=MagicMock(side_effect=fail_ready),
+    )
+
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Pull request ready transition"
+
+
 def test_transcript_sink_interleaves_tagged_lines(
     fixture_dir: Path,
 ) -> None:

@@ -1250,9 +1250,16 @@ def _harvest_report(
 ) -> tuple[str | None, str | None]:
     """Retain and validate the optional authored Run report without truncation."""
     source = run_worktree / RUN_REPORT
+    if source.is_symlink():
+        return None, "Run report must be a regular file."
     if not source.exists():
         return None, None
-    raw = source.read_bytes()
+    if not source.is_file():
+        return None, "Run report must be a regular file."
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        return None, f"Run report could not be read: {exc}."
     retained = _telemetry_dir(fixture_dir, run_id) / "run-report.md"
     retained.write_bytes(raw)
     if len(raw) > RUN_REPORT_LIMIT:
@@ -1511,6 +1518,9 @@ def run_batch(
         if outcome.succeeded and not published:
             outcome.succeeded = False
             outcome.stopping_point = "Run report publication"
+        elif outcome.succeeded and not outcome.pr_ready:
+            outcome.succeeded = False
+            outcome.stopping_point = "Pull request ready transition"
     else:
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
@@ -1706,7 +1716,7 @@ def _open_pull_request(
             )
         else:
             ready_succeeded = True
-    return True, True if not successful else ready_succeeded, ready_succeeded
+    return True, True, ready_succeeded
 
 
 def _push_run_branch(
