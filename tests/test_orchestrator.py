@@ -423,6 +423,145 @@ def test_run_batch_walks_after_graph_runs_gate_and_publishes_draft_first(
     ]
 
 
+def test_before_run_prepares_frozen_batch_for_every_item_and_ready_pr(
+    tmp_path: Path,
+) -> None:
+    """Preparation is durable, inherited, and cannot reselect the active Run."""
+    fixture = tmp_path / ".pycastle"
+    (fixture / "prompts").mkdir(parents=True)
+    original_main = (
+        "from pycastle.graph import DONE, build, build_run, phase\n"
+        "run = build_run(\n"
+        "    before=build(start='inventory', phases=[\n"
+        "        phase('inventory', 'inventory.md', on_success='prepare'),\n"
+        "        phase('prepare', 'prepare.md', on_success=DONE),\n"
+        "    ]),\n"
+        "    item=build(start='implement', phases=[phase('implement', 'item.md')]),\n"
+        ")\n"
+    )
+    (fixture / "main.py").write_text(original_main)
+    for name in ("inventory.md", "prepare.md", "item.md"):
+        (fixture / "prompts" / name).write_text(name)
+
+    issues = [
+        IssueRef(number=103, title="Second selected", assignees=["krishna"]),
+        IssueRef(number=101, title="First selected", assignees=["krishna"]),
+        IssueRef(number=105, title="Not selected", assignees=["krishna"]),
+    ]
+    source = MagicMock()
+    source.list_ready.return_value = issues
+    selected_batch = [issues[1], issues[0]]
+    run_worktree = tmp_path / "wt" / "run-frozen"
+    item_starts: list[tuple[int, bool, str]] = []
+    events: list[tuple[str, Path]] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            events.append((phase, cwd))
+            if phase == "inventory":
+                assert prompt.index("#101") < prompt.index("#103")
+                assert "#105" not in prompt
+                (cwd / "inventory.txt").write_text("frozen: 101,103\n")
+                # A proposed fixture edit must not replace the already-loaded
+                # before/Item graphs or alter the selected batch.
+                (fixture / "main.py").write_text(
+                    "raise RuntimeError('next Run only')\n"
+                )
+                source.list_ready.return_value = [issues[2]]
+                selected_batch[:] = [issues[2]]
+            elif phase == "prepare":
+                assert (cwd / "inventory.txt").is_file()
+                (cwd / "prepared.txt").write_text("prepared\n")
+            elif phase == "implement":
+                number = int(cwd.name.removeprefix("issue-"))
+                item_starts.append((number, (cwd / "prepared.txt").is_file(), prompt))
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    def setup(cwd: Path) -> None:
+        events.append(("setup", cwd))
+
+    base_runner = _git_aware_runner()
+
+    def runner_side_effect(argv: list[str], **kwargs: object) -> object:
+        if argv[:3] == ["git", "worktree", "add"] and "issue-" in argv[3]:
+            destination = Path(argv[3])
+            destination.mkdir(parents=True, exist_ok=True)
+            for prepared in ("inventory.txt", "prepared.txt"):
+                (destination / prepared).write_text(
+                    (run_worktree / prepared).read_text()
+                )
+            return _ok()
+        if argv[:3] == ["git", "diff", "--cached"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="103\n")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]")
+        return base_runner(argv, **kwargs)
+
+    runner = MagicMock(side_effect=runner_side_effect)
+    gate_paths: list[Path] = []
+
+    def gate(cwd: Path) -> orchestrator.GateOutcome:
+        gate_paths.append(cwd)
+        return orchestrator.GateOutcome(True, "green", exit_code=0)
+
+    with patch("pycastle.orchestrator.select_batch", return_value=selected_batch):
+        outcome = orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="frozen",
+            iterations=2,
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=runner,
+            gate_check=gate,
+            setup=setup,
+        )
+
+    assert events[:3] == [
+        ("setup", run_worktree),
+        ("inventory", run_worktree),
+        ("prepare", run_worktree),
+    ]
+    assert [number for number, inherited, _prompt in item_starts] == [101, 103]
+    assert all(inherited for _number, inherited, _prompt in item_starts)
+    assert source.list_ready.call_count == 1
+    assert gate_paths[-1] == run_worktree
+    assert outcome.completed == [101, 103]
+    assert outcome.pr_opened and outcome.pr_ready and outcome.succeeded
+
+    calls = [call.args[0] for call in runner.call_args_list]
+    checkpoints = [
+        call[3]
+        for call in calls
+        if call[:3] == ["git", "commit", "-m"] and "Run phase" in call[3]
+    ]
+    assert checkpoints == [
+        "chore: checkpoint Run phase inventory",
+        "chore: checkpoint Run phase prepare",
+    ]
+    first_item_branch = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ["git", "branch"]
+        and call[-1] == "pycastle/run-frozen"
+        and "issue-101" in call[2]
+    )
+    second_checkpoint_push = max(
+        index
+        for index, call in enumerate(calls[:first_item_branch])
+        if call[:3] == ["git", "push", "-u"]
+    )
+    assert second_checkpoint_push < first_item_branch
+
+
 def test_successful_run_phase_with_no_changes_pushes_without_empty_commit(
     fixture_dir: Path, tmp_path: Path
 ) -> None:

@@ -1330,11 +1330,17 @@ def run_batch(
     run_definition: RunDefinition = load_run(fixture_dir)
 
     issues = issue_source.list_ready()
-    selected = select_batch(
-        issues,
-        assignee=assignee,
-        include_unassigned=include_unassigned,
-        limit=iterations,
+    # Snapshot the ordered selection before any project-owned Run phase executes.
+    # A tuple makes the lifecycle invariant explicit: fixture edits, Issue source
+    # changes, and in-process Runtime behavior cannot add, remove, or reorder the
+    # active batch after its factual prompt envelope has been prepared.
+    selected = tuple(
+        select_batch(
+            issues,
+            assignee=assignee,
+            include_unassigned=include_unassigned,
+            limit=iterations,
+        )
     )
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(run_id=run_id, run_branch=run_branch)
