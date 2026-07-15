@@ -156,7 +156,18 @@ def test_prune_run_branches_aborts_when_remote_branch_lookup_fails(
     assert not _calls_containing(runner, "--delete")
 
 
-@pytest.mark.parametrize("stdout", [None, "malformed ref output"])
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        None,
+        "malformed ref output",
+        "abc\trefs/heads/pycastle/run-\n",
+        (
+            "abc\trefs/heads/pycastle/run-duplicate\n"
+            "abc\trefs/heads/pycastle/run-duplicate\n"
+        ),
+    ],
+)
 def test_prune_run_branches_aborts_on_invalid_remote_branch_output(
     tmp_path: Path, stdout: str | None
 ) -> None:
@@ -532,6 +543,45 @@ def test_incremental_push_failure_is_logged_and_later_checkpoint_retries(
     )
 
 
+def test_incremental_push_os_error_is_logged_without_aborting_run(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    issue = IssueRef(number=2, title="First", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    base_runner = _git_aware_runner()
+    push_count = 0
+
+    def side_effect(argv: list[str], **kwargs: object) -> object:
+        nonlocal push_count
+        if argv[:2] == ["git", "push"]:
+            push_count += 1
+            if push_count == 1:
+                raise OSError("origin is unreachable")
+        return base_runner(argv, **kwargs)
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        fixture_dir=fixture_dir,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="20260613-101500",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=MagicMock(side_effect=side_effect),
+    )
+
+    assert outcome.completed == [2]
+    assert outcome.pr_opened is True
+    assert push_count == 2
+    assert (
+        "Durability push failed"
+        in (fixture_dir / "runs" / "20260613-101500" / "run.log").read_text()
+    )
+
+
 def test_failed_final_push_prevents_pull_request_creation(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -606,6 +656,16 @@ def test_merge_conflict_marks_for_human_and_run_continues(
     merged = {o.issue.number: o.merged for o in outcome.issues}
     assert merged == {2: True, 4: False, 6: True}
     assert _calls_containing(runner, "git", "merge", "--abort")
+    pushes = [
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:2] == ["git", "push"]
+    ]
+    assert pushes == [
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+        ["git", "push", "-u", "origin", outcome.run_branch],
+    ]
 
     # The conflicting issue is marked for human handling; the clean ones are not.
     source.mark_for_human.assert_called_once_with(4)

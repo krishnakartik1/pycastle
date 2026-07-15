@@ -145,13 +145,22 @@ def prune_run_branches(
 
     ref_prefix = "refs/heads/pycastle/run-"
     remote_branches: list[str] = []
+    seen_branches: set[str] = set()
     for line in ref_lines:
         fields = line.split("\t")
-        if len(fields) != 2 or not fields[0] or not fields[1].startswith(ref_prefix):
+        branch = fields[1].removeprefix("refs/heads/") if len(fields) == 2 else ""
+        if (
+            len(fields) != 2
+            or not fields[0]
+            or fields[1] == ref_prefix
+            or not fields[1].startswith(ref_prefix)
+            or branch in seen_branches
+        ):
             raise PruneError(
                 "Could not parse remote run branches; no branches were deleted."
             )
-        remote_branches.append(fields[1].removeprefix("refs/heads/"))
+        remote_branches.append(branch)
+        seen_branches.add(branch)
     stale = [
         branch
         for branch in remote_branches
