@@ -553,6 +553,41 @@ def _transcript_sink(
     return _sink
 
 
+def _run_transcript_sink(
+    fixture_dir: Path, run_id: str, scope: str
+) -> Callable[[str, str, str], None]:
+    """Build a sink for one before-Run or after-Run phase graph."""
+    path = _telemetry_dir(fixture_dir, run_id) / "run-phase-transcript.log"
+
+    def _sink(phase: str, tag: str, text: str) -> None:
+        with path.open("a") as handle:
+            lines = text.splitlines() or [""]
+            for line in lines:
+                handle.write(f"[{scope}] [{phase}] [{tag}] {line}\n")
+
+    return _sink
+
+
+def _append_run_telemetry(
+    fixture_dir: Path,
+    run_id: str,
+    scope: str,
+    phase_results: list[PhaseResult],
+) -> None:
+    """Append scoped Run-phase telemetry in lifecycle order."""
+    path = _telemetry_dir(fixture_dir, run_id) / "run-phase-telemetry.json"
+    records = json.loads(path.read_text()) if path.exists() else []
+    records.extend(
+        {
+            "scope": scope,
+            **phase_result.result.telemetry.model_dump(mode="json"),
+            "phase": phase_result.phase,
+        }
+        for phase_result in phase_results
+    )
+    path.write_text(json.dumps(records, indent=2) + "\n")
+
+
 def _surface_gate(sink: Callable[[str, str, str], None], outcome: GateOutcome) -> None:
     """Persist the gate's captured output into the per-issue transcript.
 
@@ -1245,50 +1280,69 @@ def _checkpoint_run_phase(
     phase: Phase,
     *,
     run: RunContext,
+    scope: str = "Run",
 ) -> None:
     """Commit a successful Run phase when dirty and attempt a durability push."""
+    argv: Sequence[str]
     try:
+        # Run review/report artifacts are part of the Project fixture's ignored
+        # scratch-file contract.  Explicitly naming those ignored paths as
+        # exclusion pathspecs makes real Git reject the otherwise valid add.
+        add_argv = ["git", "add", "-A", "--", "."]
+        argv = add_argv
         staged = run.runner(
-            [
-                "git",
-                "add",
-                "-A",
-                "--",
-                ".",
-                f":(exclude,top){RUN_REVIEW}",
-                f":(exclude,top){RUN_REPORT}",
-            ],
+            add_argv,
             capture=True,
             cwd=run.worktree,
         )
         if getattr(staged, "returncode", 1) != 0:
-            raise RunCheckpointError(f"git add failed for {phase.name}")
+            detail = _record_host_command_failure(
+                run, scope=scope, phase=phase.name, argv=add_argv, result=staged
+            )
+            raise RunCheckpointError(detail)
 
+        diff_argv = ["git", "diff", "--cached", "--quiet"]
+        argv = diff_argv
         dirty = run.runner(
-            ["git", "diff", "--cached", "--quiet"],
+            diff_argv,
             capture=True,
             cwd=run.worktree,
         )
         dirty_code = getattr(dirty, "returncode", 2)
         if dirty_code not in (0, 1):
-            raise RunCheckpointError(f"staged diff inspection failed for {phase.name}")
+            detail = _record_host_command_failure(
+                run, scope=scope, phase=phase.name, argv=diff_argv, result=dirty
+            )
+            raise RunCheckpointError(detail)
         if dirty_code == 1:
+            commit_argv = [
+                "git",
+                "commit",
+                "-m",
+                f"chore: checkpoint Run phase {phase.name}",
+            ]
+            argv = commit_argv
             committed = run.runner(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore: checkpoint Run phase {phase.name}",
-                ],
+                commit_argv,
                 capture=True,
                 cwd=run.worktree,
             )
             if getattr(committed, "returncode", 1) != 0:
-                raise RunCheckpointError(f"git commit failed for {phase.name}")
+                detail = _record_host_command_failure(
+                    run,
+                    scope=scope,
+                    phase=phase.name,
+                    argv=commit_argv,
+                    result=committed,
+                )
+                raise RunCheckpointError(detail)
     except OSError as exc:
-        raise RunCheckpointError(f"checkpoint failed for {phase.name}: {exc}") from exc
+        detail = _record_host_command_exception(
+            run, scope=scope, phase=phase.name, argv=argv, exc=exc
+        )
+        raise RunCheckpointError(detail) from exc
 
-    _push_run_branch(run=run, final=False)
+    _push_run_branch(run=run, final=False, scope=scope, phase=phase.name)
 
 
 def _walk_run_graph(
@@ -1297,6 +1351,7 @@ def _walk_run_graph(
     runtime: Runtime,
     run: RunContext,
     context: str,
+    scope: str = "Run",
 ) -> WalkResult:
     """Walk one Run phase graph, checkpointing each successful visit."""
     executor = GraphExecutor(runtime, fixture_dir=run.fixture_dir, preamble=context)
@@ -1304,20 +1359,12 @@ def _walk_run_graph(
 
     def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
         passed, results = default(phase, extra)
+        if results:
+            _append_run_telemetry(run.fixture_dir, run.run_id, scope, results)
         if passed:
-            _checkpoint_run_phase(phase, run=run)
+            _checkpoint_run_phase(phase, run=run, scope=scope)
         else:
-            run.runner(
-                ["git", "reset", "--hard", "HEAD"],
-                capture=True,
-                cwd=run.worktree,
-            )
-            run.runner(["git", "clean", "-fd"], capture=True, cwd=run.worktree)
-            run.runner(
-                ["git", "clean", "-fdX", "--", RUN_REVIEW, RUN_REPORT],
-                capture=True,
-                cwd=run.worktree,
-            )
+            _discard_run_commands(run, scope=scope, phase=phase.name)
         return passed, results
 
     return executor.execute(graph, cwd=run.worktree, phase_runner=run_phase)
@@ -1325,6 +1372,11 @@ def _walk_run_graph(
 
 def _discard_incomplete_run_scope(run: RunContext) -> None:
     """Restore the Run worktree to its last committed durable checkpoint."""
+    _discard_run_commands(run, scope="after-Run", phase="Setup")
+
+
+def _discard_run_commands(run: RunContext, *, scope: str, phase: str) -> None:
+    """Discard incomplete Run work and retain diagnostics for failed commands."""
     commands = (
         ["git", "reset", "--hard", "HEAD"],
         ["git", "clean", "-fd"],
@@ -1333,9 +1385,82 @@ def _discard_incomplete_run_scope(run: RunContext) -> None:
     for argv in commands:
         result = run.runner(argv, capture=True, cwd=run.worktree)
         if getattr(result, "returncode", 1) != 0:
-            raise RunCheckpointError(
-                f"could not discard incomplete Run scope ({' '.join(argv)})"
+            detail = _record_host_command_failure(
+                run, scope=scope, phase=phase, argv=argv, result=result
             )
+            raise RunCheckpointError(
+                f"could not discard incomplete Run scope\n{detail}"
+            )
+
+
+def _record_host_command_failure(
+    run: RunContext,
+    *,
+    scope: str,
+    phase: str,
+    argv: Sequence[str],
+    result: Any,
+) -> str:
+    """Surface and retain all captured diagnostics from a boundary command."""
+    return _record_host_command_diagnostics(
+        run,
+        scope=scope,
+        phase=phase,
+        argv=argv,
+        headline="Host command failed",
+        exit_code=repr(getattr(result, "returncode", None)),
+        stdout=repr(getattr(result, "stdout", None)),
+        stderr=repr(getattr(result, "stderr", None)),
+    )
+
+
+def _record_host_command_exception(
+    run: RunContext,
+    *,
+    scope: str,
+    phase: str,
+    argv: Sequence[str],
+    exc: OSError,
+) -> str:
+    """Surface command identity when a boundary command cannot be launched."""
+    return _record_host_command_diagnostics(
+        run,
+        scope=scope,
+        phase=phase,
+        argv=argv,
+        headline="Host command could not be launched",
+        exit_code="unavailable",
+        stdout="unavailable",
+        stderr=repr(str(exc)),
+    )
+
+
+def _record_host_command_diagnostics(
+    run: RunContext,
+    *,
+    scope: str,
+    phase: str,
+    argv: Sequence[str],
+    headline: str,
+    exit_code: str,
+    stdout: str,
+    stderr: str,
+) -> str:
+    """Write one consistently formatted host-command failure record."""
+    detail = "\n".join(
+        (
+            headline,
+            f"argv: {json.dumps(list(argv))}",
+            f"exit code: {exit_code}",
+            f"stdout: {stdout}",
+            f"stderr: {stderr}",
+        )
+    )
+    logger.error("%s", detail)
+    sink = _run_transcript_sink(run.fixture_dir, run.run_id, scope)
+    for line in detail.splitlines():
+        sink(phase, "HOST-COMMAND", line)
+    return detail
 
 
 def _harvest_report(run: RunContext) -> tuple[str | None, str | None]:
@@ -1456,11 +1581,16 @@ def run_batch(
         with _sigint_as_keyboard_interrupt():
             setup(run_worktree)
             if run_definition.before is not None:
+                if verbose:
+                    runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
+                        fixture_dir, run_id, "before-Run"
+                    )
                 before = _walk_run_graph(
                     run_definition.before,
                     runtime=runtime,
                     run=run,
                     context=render_run_context(run_id, selected, []),
+                    scope="before-Run",
                 )
             else:
                 before = None
@@ -1550,6 +1680,10 @@ def run_batch(
                 if outcome.succeeded:
                     setup(run_worktree)
                     if run_definition.after is not None:
+                        if verbose:
+                            runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
+                                fixture_dir, run_id, "after-Run"
+                            )
                         after = _walk_run_graph(
                             run_definition.after,
                             runtime=runtime,
@@ -1557,6 +1691,7 @@ def run_batch(
                             context=render_run_context(
                                 run_id, selected, outcome.issues
                             ),
+                            scope="after-Run",
                         )
                         if after.terminal is HUMAN:
                             outcome.succeeded = False
@@ -1917,18 +2052,36 @@ def _push_run_branch(
     *,
     run: RunContext,
     final: bool,
+    scope: str = "Run",
+    phase: str | None = None,
 ) -> bool:
     """Push the current Run checkpoint, logging failures without raising."""
+    argv = ["git", "push", "-u", "origin", run.branch]
+    phase_name = phase or ("final-push" if final else "durability-push")
     try:
         result = run.runner(
-            ["git", "push", "-u", "origin", run.branch],
+            argv,
             capture=True,
             cwd=run.worktree,
         )
         succeeded = getattr(result, "returncode", 1) == 0
+        if not succeeded:
+            _record_host_command_failure(
+                run,
+                scope=scope,
+                phase=phase_name,
+                argv=argv,
+                result=result,
+            )
     except OSError as exc:
         succeeded = False
-        logger.warning("Could not push Run branch %s: %s", run.branch, exc)
+        _record_host_command_exception(
+            run,
+            scope=scope,
+            phase=phase_name,
+            argv=argv,
+            exc=exc,
+        )
 
     if succeeded:
         if not final:

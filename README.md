@@ -18,10 +18,11 @@ Claude Code and Codex are supported as runtimes, on the host or in Docker.
 
 ## Install
 
-Until PyCastle is published, install the current repository directly from GitHub:
+Release `v0.1.1` is the first release containing the lifecycle skill. Once that
+tag is published, install it directly from GitHub:
 
 ```bash
-uv pip install git+https://github.com/krishnakartik1/pycastle
+uv pip install git+https://github.com/krishnakartik1/pycastle@v0.1.1
 ```
 
 Run that inside an active virtual environment, or pass `--system` to `uv pip`
@@ -34,6 +35,34 @@ uv pip install pycastle
 
 For development on PyCastle itself, clone the repository and run
 `uv pip install -e ".[dev]"`.
+
+### Install the lifecycle skill
+
+The repository ships one vendor-neutral lifecycle skill for both Codex and
+Claude Code. Obtain its canonical source from the same Git tag as the installed
+runner:
+
+```bash
+git clone --depth 1 --branch v0.1.1 https://github.com/krishnakartik1/pycastle ~/.local/share/pycastle-v0.1.1
+```
+
+Link that one `skills/pycastle/` directory into the discovery location for the
+host you use:
+
+```bash
+# Codex
+mkdir -p ~/.codex/skills
+ln -s ~/.local/share/pycastle-v0.1.1/skills/pycastle ~/.codex/skills/pycastle
+
+# Claude Code
+mkdir -p ~/.claude/skills
+ln -s ~/.local/share/pycastle-v0.1.1/skills/pycastle ~/.claude/skills/pycastle
+```
+
+The wheel/tool and skill must always come from the same Git tag. The skill embeds
+that release and requires it to exactly match `pycastle --version` before it
+initializes a Project, checks readiness, or starts a Run. Restart or reload the
+host after installing the skill.
 
 ## Quick start
 
@@ -159,10 +188,10 @@ building stays on the host.
 ## Upgrade a Project fixture
 
 Choose a PyCastle release tag, reinstall that exact runner, and then explicitly
-migrate each initialized repository. For example, for `v0.1.0`:
+migrate each initialized repository. For example, for `v0.1.1`:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.0
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
 cd /path/to/initialized/repository
 pycastle upgrade
 ```
@@ -170,7 +199,7 @@ pycastle upgrade
 The equivalent `pipx` workflow is:
 
 ```bash
-pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.0
+pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
 cd /path/to/initialized/repository
 pycastle upgrade
 ```

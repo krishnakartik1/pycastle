@@ -188,6 +188,25 @@ def test_committed_setup_syncs_pycastle_from_uv_lockfile() -> None:
     assert stat.S_IMODE(setup.stat().st_mode) == 0o755
 
 
+def test_committed_gate_sources_setup_and_uses_its_canonical_environment() -> None:
+    fixture = _repo_root() / FIXTURE_DIRNAME
+    setup = fixture / "setup"
+    gate = fixture / "gate"
+    gate_text = gate.read_text()
+
+    assert stat.S_IMODE(gate.stat().st_mode) == 0o755
+    assert "${BASH_SOURCE[0]}" in gate_text
+    assert 'source "$fixture_dir/setup"' in gate_text
+    assert ".venv/bin" not in gate_text
+    assert "source .pycastle/venv/bin/activate" in setup.read_text()
+    for command in (
+        "python -m ruff check . --exit-non-zero-on-fix",
+        "python -m black --check .",
+        "python -m pytest -q",
+    ):
+        assert command in gate_text
+
+
 def test_guard_catches_byte_drift(tmp_path: Path) -> None:
     """The byte comparison is not vacuous: it fails when a fixture file drifts.
 

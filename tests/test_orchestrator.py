@@ -643,18 +643,99 @@ def test_successful_run_phase_with_no_changes_pushes_without_empty_commit(
 
     calls = [call.args[0] for call in runner.call_args_list]
     assert calls == [
-        [
-            "git",
-            "add",
-            "-A",
-            "--",
-            ".",
-            ":(exclude,top).pycastle/run-review.md",
-            ":(exclude,top).pycastle/run-report.md",
-        ],
+        ["git", "add", "-A", "--", "."],
         ["git", "diff", "--cached", "--quiet"],
         ["git", "push", "-u", "origin", "pycastle/run-run-101"],
     ]
+
+
+@pytest.mark.parametrize("artifact", [orchestrator.RUN_REVIEW, orchestrator.RUN_REPORT])
+def test_run_phase_checkpoint_respects_ignored_artifacts_with_real_git(
+    tmp_path: Path, artifact: str
+) -> None:
+    """Ignored Run artifacts do not make real Git reject a checkpoint."""
+    worktree = tmp_path / "repo"
+    fixture = worktree / ".pycastle"
+    fixture.mkdir(parents=True)
+    (fixture / ".gitignore").write_text("/run-review.md\n/run-report.md\n/runs/\n")
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.name", "PyCastle Test")
+    git("config", "user.email", "pycastle@example.invalid")
+    (worktree / "tracked.txt").write_text("baseline\n")
+    git("add", ".")
+    git("commit", "-m", "baseline")
+    baseline = git("rev-parse", "HEAD").stdout.strip()
+    target = worktree / artifact
+    target.write_text("No findings\n")
+
+    def runner(argv: list[str], **kwargs: object) -> object:
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.run(
+            argv,
+            cwd=kwargs.get("cwd"),
+            capture_output=True,
+            text=True,
+        )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="review", prompt="run-review.md"),
+        run=_run_context(
+            fixture_dir=fixture,
+            worktree=worktree,
+            runner=runner,
+            run_id="real-git",
+        ),
+        scope="after-Run",
+    )
+
+    assert git("rev-parse", "HEAD").stdout.strip() == baseline
+    assert git("check-ignore", artifact).stdout.strip() == artifact
+    assert git("diff", "--cached", "--name-only").stdout == ""
+
+
+def test_run_phase_checkpoint_push_failure_retains_exact_diagnostics(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A non-fatal durability failure still leaves complete Run evidence."""
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess(
+                [], 17, stdout="push stdout", stderr="push stderr"
+            ),
+        ]
+    )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="review", prompt="run-review.md"),
+        run=_run_context(
+            fixture_dir=fixture_dir,
+            worktree=tmp_path / "run-worktree",
+            runner=runner,
+            run_id="push-failure",
+        ),
+        scope="after-Run",
+    )
+
+    transcript = (
+        fixture_dir / "runs" / "push-failure" / "run-phase-transcript.log"
+    ).read_text()
+    assert '[after-Run] [review] [HOST-COMMAND] argv: ["git", "push"' in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] exit code: 17" in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] stdout: 'push stdout'" in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] stderr: 'push stderr'" in transcript
 
 
 @pytest.mark.parametrize("failure", ["add", "diff", "commit"])
@@ -1586,6 +1667,77 @@ def test_transcript_sink_interleaves_tagged_lines(
     )
 
 
+def test_run_transcript_sink_interleaves_scoped_phase_lines(
+    fixture_dir: Path,
+) -> None:
+    before = orchestrator._run_transcript_sink(
+        fixture_dir, "20260715-090949", "before-Run"
+    )
+    after = orchestrator._run_transcript_sink(
+        fixture_dir, "20260715-090949", "after-Run"
+    )
+
+    before("review", "THINKING", "inspect the batch")
+    after("review", "OUTPUT", "two integrated findings")
+
+    path = fixture_dir / "runs" / "20260715-090949" / "run-phase-transcript.log"
+    assert path.read_text().splitlines() == [
+        "[before-Run] [review] [THINKING] inspect the batch",
+        "[after-Run] [review] [OUTPUT] two integrated findings",
+    ]
+
+
+def test_run_transcript_sink_tags_multiline_and_empty_chunks(
+    fixture_dir: Path,
+) -> None:
+    sink = orchestrator._run_transcript_sink(fixture_dir, "edge-chunks", "after-Run")
+
+    sink("review", "OUTPUT", "first\nsecond")
+    sink("report", "THINKING", "")
+
+    path = fixture_dir / "runs" / "edge-chunks" / "run-phase-transcript.log"
+    assert path.read_text().splitlines() == [
+        "[after-Run] [review] [OUTPUT] first",
+        "[after-Run] [review] [OUTPUT] second",
+        "[after-Run] [report] [THINKING] ",
+    ]
+
+
+def test_run_phase_telemetry_appends_scoped_records(fixture_dir: Path) -> None:
+    before = orchestrator.PhaseResult(
+        phase="review",
+        result=RuntimeResult(
+            output="before",
+            telemetry=Telemetry(runtime="stub", phase="review", num_turns=1),
+        ),
+    )
+    after = orchestrator.PhaseResult(
+        phase="review",
+        result=RuntimeResult(
+            output="after",
+            telemetry=Telemetry(runtime="stub", phase="review", num_turns=2),
+        ),
+    )
+
+    orchestrator._append_run_telemetry(
+        fixture_dir, "20260715-090949", "before-Run", [before]
+    )
+    orchestrator._append_run_telemetry(
+        fixture_dir, "20260715-090949", "after-Run", [after]
+    )
+
+    records = json.loads(
+        (
+            fixture_dir / "runs" / "20260715-090949" / "run-phase-telemetry.json"
+        ).read_text()
+    )
+    assert [(record["scope"], record["phase"]) for record in records] == [
+        ("before-Run", "review"),
+        ("after-Run", "review"),
+    ]
+    assert [record["num_turns"] for record in records] == [1, 2]
+
+
 def test_verbose_run_binds_a_per_issue_transcript_sink(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -1652,6 +1804,172 @@ def test_non_verbose_run_does_not_bind_a_transcript_sink(
     assert not (
         fixture_dir / "runs" / "20260613-101500" / "issue-2-transcript.log"
     ).is_file()
+
+
+def test_verbose_run_scopes_before_item_and_after_transcripts(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path, before=True, after=True)
+    issue = IssueRef(number=2, title="Scoped transcripts", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+
+    class SinkAwareRuntime(StubRuntime):
+        transcript_sink = None
+
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            assert self.transcript_sink is not None
+            self.transcript_sink(phase, "THINKING", f"thinking-{phase}")
+            self.transcript_sink(phase, "OUTPUT", f"output-{phase}")
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    orchestrator.run_batch(
+        runtime=SinkAwareRuntime(),
+        issue_source=source,
+        selected=source.list_ready(),
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="scoped",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        verbose=True,
+    )
+
+    run_dir = fixture / "runs" / "scoped"
+    run_transcript = (run_dir / "run-phase-transcript.log").read_text()
+    item_transcript = (run_dir / "issue-2-transcript.log").read_text()
+    assert "[before-Run] [before] [THINKING] thinking-before" in run_transcript
+    assert "[after-Run] [after] [OUTPUT] output-after" in run_transcript
+    assert "output-implement" in item_transcript
+    assert "output-after" not in item_transcript
+
+
+def test_failed_after_run_checkpoint_retains_transcript_and_git_diagnostics(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    issue = IssueRef(number=2, title="Checkpoint evidence", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    run_worktree = tmp_path / "wt" / "run-checkpoint-failure"
+    after_finished = False
+
+    class Runtime(StubRuntime):
+        transcript_sink = None
+
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            nonlocal after_finished
+            if self.transcript_sink is not None:
+                self.transcript_sink(phase, "THINKING", f"thinking-{phase}")
+                self.transcript_sink(phase, "OUTPUT", f"output-{phase}")
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "after":
+                review = cwd / orchestrator.RUN_REVIEW
+                review.parent.mkdir(parents=True, exist_ok=True)
+                review.write_text("two findings")
+                after_finished = True
+            return result
+
+    base_runner = _git_aware_runner()
+
+    def fail_after_add(argv: list[str], **kwargs: object) -> object:
+        if (
+            after_finished
+            and argv[:2] == ["git", "add"]
+            and kwargs.get("cwd") == run_worktree
+        ):
+            return subprocess.CompletedProcess(
+                argv,
+                23,
+                stdout="index stdout detail",
+                stderr="fatal: distinctive add error",
+            )
+        if argv[:3] == ["git", "worktree", "remove"] and argv[3] == str(run_worktree):
+            (run_worktree / orchestrator.RUN_REVIEW).unlink(missing_ok=True)
+        return base_runner(argv, **kwargs)
+
+    with caplog.at_level("ERROR"):
+        outcome = orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="checkpoint-failure",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=MagicMock(side_effect=fail_after_add),
+            verbose=True,
+        )
+
+    assert outcome.stopping_point is not None
+    assert outcome.stopping_point.startswith("after-Run checkpoint:")
+    assert not (run_worktree / orchestrator.RUN_REVIEW).exists()
+    run_dir = fixture / "runs" / "checkpoint-failure"
+    transcript = (run_dir / "run-phase-transcript.log").read_text()
+    assert "[after-Run] [after] [OUTPUT] output-after" in transcript
+    assert 'argv: ["git", "add", "-A"' in transcript
+    assert "exit code: 23" in transcript
+    assert "stdout: 'index stdout detail'" in transcript
+    assert "stderr: 'fatal: distinctive add error'" in transcript
+    assert "output-after" not in (run_dir / "issue-2-transcript.log").read_text()
+    assert "fatal: distinctive add error" in caplog.text
+
+
+def test_after_run_checkpoint_launch_error_retains_command_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fixture = _scoped_fixture(tmp_path, after=True)
+    issue = IssueRef(number=2, title="Launch evidence", assignees=["krishna"])
+    source = MagicMock()
+    source.list_ready.return_value = [issue]
+    after_finished = False
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            nonlocal after_finished
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            after_finished = phase == "after"
+            return result
+
+    base_runner = _git_aware_runner()
+
+    def fail_after_add(argv: list[str], **kwargs: object) -> object:
+        if after_finished and argv[:2] == ["git", "add"]:
+            raise OSError("git executable vanished")
+        return base_runner(argv, **kwargs)
+
+    with caplog.at_level("ERROR"):
+        outcome = orchestrator.run_batch(
+            runtime=Runtime(),
+            issue_source=source,
+            selected=source.list_ready(),
+            fixture_dir=fixture,
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="launch-failure",
+            workspace=tmp_path,
+            worktree_root=tmp_path / "wt",
+            runner=MagicMock(side_effect=fail_after_add),
+            verbose=True,
+        )
+
+    assert outcome.stopping_point is not None
+    assert outcome.stopping_point.startswith("after-Run checkpoint:")
+    transcript = (
+        fixture / "runs" / "launch-failure" / "run-phase-transcript.log"
+    ).read_text()
+    assert 'argv: ["git", "add", "-A"' in transcript
+    assert "exit code: unavailable" in transcript
+    assert "stdout: unavailable" in transcript
+    assert "stderr: 'git executable vanished'" in transcript
+    assert "git executable vanished" in caplog.text
 
 
 def test_batch_works_up_to_n_issues_into_one_pr(

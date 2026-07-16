@@ -229,13 +229,21 @@ ran=0
 missing=()
 
 run_if_available() {
-  if command -v "$1" >/dev/null 2>&1; then
+  if [ -n "${VIRTUAL_ENV:-}" ] && command -v python >/dev/null 2>&1; then
+    if python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('$1') is None)"; then
+      ran=$((ran + 1))
+      module="$1"
+      shift
+      python -m "$module" "$@"
+      return
+    fi
+  elif command -v "$1" >/dev/null 2>&1; then
     ran=$((ran + 1))
     "$@"
-  else
-    missing+=("$1")
-    echo "skipping gate step (not installed): $1"
+    return
   fi
+  missing+=("$1")
+  echo "skipping gate step (not installed): $1"
 }
 
 if [ "${1:-}" = "--check-tools" ]; then
@@ -252,6 +260,9 @@ if [ "${1:-}" = "--check-tools" ]; then
   fi
   exit 0
 fi
+
+fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$fixture_dir/setup"
 
 run_if_available ruff check . --exit-non-zero-on-fix
 run_if_available black --check .
@@ -273,7 +284,7 @@ _SETUP_NOOP = """\
 # No supported dependency manifest was found when `pycastle init` ran.
 # Replace this no-op with the command that prepares your project for its phases
 # and gate. PyCastle executes this project-owned hook at the start of each issue.
-exit 0
+:
 """
 
 
