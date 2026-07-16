@@ -141,6 +141,23 @@ def test_fixture_structure_rejects_symlinked_prompt(tmp_path: Path) -> None:
         adapter.check_fixture_structure(configuration())
 
 
+def test_fixture_structure_accepts_out_of_order_runtime_and_gate_nodes(
+    tmp_path: Path,
+) -> None:
+    fixture = _valid_fixture(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "gate_node('verify'),runtime_node('work','item.md',on_success='verify')]))\n"
+    )
+
+    result = DefaultReadinessAdapter(fixture, tmp_path).check_fixture_structure(
+        configuration()
+    )
+
+    assert result.status is Status.PASS
+
+
 def test_github_repository_requires_matching_identity(tmp_path: Path) -> None:
     def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(

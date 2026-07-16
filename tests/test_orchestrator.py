@@ -260,6 +260,71 @@ def _run_context(
     )
 
 
+def test_explicit_item_graph_runs_frozen_setup_runtime_setup_gate(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "work.md").write_text("work")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "gate_node('verify'),runtime_node('work','work.md',on_success='verify')]))\n"
+    )
+    timeline = tmp_path / "timeline"
+    for name, marker in (("setup", "setup"), ("gate", "gate")):
+        hook = fixture / name
+        hook.write_text(f"#!/bin/sh\nprintf '{marker}\\n' >> '{timeline}'\n")
+        hook.chmod(0o755)
+
+    issue = IssueRef(number=134, title="Explicit graph", assignees=["krishna"])
+    source = MagicMock()
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            with timeline.open("a") as stream:
+                stream.write("runtime\n")
+            # The active Run must keep using the frozen hook bytes.
+            (fixture / "setup").write_text("#!/bin/sh\nexit 91\n")
+            (fixture / "gate").write_text("#!/bin/sh\nexit 92\n")
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    legacy_gate = MagicMock(return_value=orchestrator.GateOutcome(True, "must not run"))
+    outcome = orchestrator.run_batch(
+        runtime=Runtime(),
+        issue_source=source,
+        selected=[issue],
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="explicit-134",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=_git_aware_runner(),
+        gate_check=legacy_gate,
+    )
+
+    assert outcome.completed == [134]
+    assert outcome.pr_opened and outcome.succeeded
+    assert timeline.read_text().splitlines() == [
+        "setup",  # Run bootstrap
+        "setup",
+        "runtime",
+        "setup",
+        "gate",
+    ]
+    legacy_gate.assert_not_called()
+    records = sorted((fixture / "runs" / "explicit-134" / "executions").glob("*.json"))
+    assert [path.name for path in records] == [
+        "item-134-verify-gate-1.json",
+        "item-134-verify-setup-1.json",
+        "item-134-work-setup-1.json",
+        "run-bootstrap-setup-1.json",
+    ]
+
+
 def _scoped_fixture(
     tmp_path: Path, *, before: bool = False, after: bool = False
 ) -> Path:

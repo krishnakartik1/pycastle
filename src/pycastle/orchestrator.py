@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import signal
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -40,15 +41,20 @@ from typing import Any
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
+from .execution import execute_hook, project_gate_evidence
 from .graph import (
     HUMAN,
+    GateNode,
     GraphExecutor,
+    NodeOutcome,
     Phase,
     PhaseGraph,
     PhaseResult,
     RunDefinition,
+    RuntimeNode,
     WalkResult,
     load_run,
+    walk_execution_graph,
 )
 from .issues import IssueSource
 from .models import IssueRef
@@ -251,6 +257,52 @@ FIXTURE_SETUP = "setup"
 
 class SetupError(RuntimeError):
     """The project-owned setup hook could not prepare an issue worktree."""
+
+
+@dataclass
+class ExplicitItemExecution:
+    """Frozen host hook inputs and deterministic per-visit record allocation."""
+
+    setup: Path
+    gate: Path
+    records: Path
+
+    @classmethod
+    def freeze(cls, fixture_dir: Path, run_id: str) -> ExplicitItemExecution:
+        root = fixture_dir / "runs" / run_id
+        frozen = root / "frozen"
+        frozen.mkdir(parents=True, exist_ok=True)
+        paths: dict[str, Path] = {}
+        for name in (FIXTURE_SETUP, FIXTURE_GATE):
+            source = fixture_dir / name
+            destination = frozen / name
+            shutil.copyfile(source, destination)
+            destination.chmod(source.stat().st_mode & 0o777)
+            paths[name] = destination
+        return cls(paths[FIXTURE_SETUP], paths[FIXTURE_GATE], root / "executions")
+
+    def invoke_setup(
+        self, worktree: Path, *, scope: str, identity: str, ordinal: int
+    ) -> None:
+        record = execute_hook(
+            self.setup,
+            cwd=worktree,
+            scope=scope,  # type: ignore[arg-type]
+            record_path=self.records / f"{identity}-setup-{ordinal}.json",
+        )
+        if not record.success:
+            raise SetupError(f"Project setup failed: {record.termination}")
+
+    def invoke_gate(
+        self, worktree: Path, *, identity: str, node: str, ordinal: int
+    ) -> NodeOutcome:
+        record = execute_hook(
+            self.gate,
+            cwd=worktree,
+            scope="item",
+            record_path=self.records / f"{identity}-{node}-gate-{ordinal}.json",
+        )
+        return NodeOutcome(record.success, project_gate_evidence(record, node=node))
 
 
 def make_fixture_setup(
@@ -1001,6 +1053,59 @@ def _walk_issue(
     return executor.execute(graph, cwd=issue_worktree, phase_runner=run_phase)
 
 
+def _walk_explicit_item_graph(
+    issue: IssueRef,
+    *,
+    runtime: Runtime,
+    fixture_dir: Path,
+    issue_worktree: Path,
+    graph: PhaseGraph,
+    execution: ExplicitItemExecution,
+) -> WalkResult:
+    """Walk a mixed Item Execution graph with Setup before every node."""
+    executor = GraphExecutor(
+        runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
+    )
+    results: list[PhaseResult] = []
+    identity = f"item-{issue.number}"
+
+    def visit(entry: Any) -> NodeOutcome:
+        node = entry.node
+        execution.invoke_setup(
+            issue_worktree,
+            scope="item",
+            identity=f"{identity}-{node.name}",
+            ordinal=entry.ordinal,
+        )
+        if isinstance(node, GateNode):
+            return execution.invoke_gate(
+                issue_worktree,
+                identity=identity,
+                node=node.name,
+                ordinal=entry.ordinal,
+            )
+        if not isinstance(node, RuntimeNode):
+            raise TypeError("Unknown Execution node")
+        extra = (
+            json.dumps(entry.predecessor, sort_keys=True)
+            if entry.predecessor is not None
+            else None
+        )
+        try:
+            result = runtime.run(
+                executor.render_prompt(node, extra),
+                cwd=issue_worktree,
+                phase=node.name,
+            )
+        except AgentCrashError:
+            return NodeOutcome(False)
+        results.append(PhaseResult(node.name, result))
+        return NodeOutcome(True)
+
+    walked = walk_execution_graph(graph, visit)
+    return WalkResult(results, walked.terminal)
+
+
 def _last_thread_id(phase_results: list[PhaseResult]) -> str | None:
     """Return the thread id of the last phase that exposed one, if any.
 
@@ -1027,6 +1132,7 @@ def _work_issue(
     gate_check: GateCheck,
     setup: Setup,
     item_graph: PhaseGraph,
+    explicit_execution: ExplicitItemExecution | None = None,
     cancellation: CancellationState | None = None,
     verbose: bool = False,
 ) -> IssueOutcome:
@@ -1092,20 +1198,29 @@ def _work_issue(
     # directory that was never created (#64).
     add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
 
-    setup(issue_worktree)
-
-    walk: WalkResult = _walk_issue(
-        issue,
-        runtime=runtime,
-        fixture_dir=fixture_dir,
-        run_id=run_id,
-        issue_worktree=issue_worktree,
-        impl_retries=impl_retries,
-        gate_check=gate_check,
-        gate_sink=gate_sink,
-        verbose=verbose,
-        graph=item_graph,
-    )
+    if explicit_execution is not None:
+        walk = _walk_explicit_item_graph(
+            issue,
+            runtime=runtime,
+            fixture_dir=fixture_dir,
+            issue_worktree=issue_worktree,
+            graph=item_graph,
+            execution=explicit_execution,
+        )
+    else:
+        setup(issue_worktree)
+        walk = _walk_issue(
+            issue,
+            runtime=runtime,
+            fixture_dir=fixture_dir,
+            run_id=run_id,
+            issue_worktree=issue_worktree,
+            impl_retries=impl_retries,
+            gate_check=gate_check,
+            gate_sink=gate_sink,
+            verbose=verbose,
+            graph=item_graph,
+        )
     if walk.results:
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
 
@@ -1556,6 +1671,13 @@ def run_batch(
     # Import once: Runtime edits to the fixture are proposed changes and cannot
     # rewrite the active Run definition or weaken its graphs.
     run_definition: RunDefinition = load_run(fixture_dir)
+    explicit_execution = (
+        ExplicitItemExecution.freeze(fixture_dir, run_id)
+        if any(
+            isinstance(node, GateNode) for node in run_definition.item.nodes.values()
+        )
+        else None
+    )
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
@@ -1579,7 +1701,15 @@ def run_batch(
     cancellation = CancellationState()
     try:
         with _sigint_as_keyboard_interrupt():
-            setup(run_worktree)
+            if explicit_execution is not None:
+                explicit_execution.invoke_setup(
+                    run_worktree,
+                    scope="run",
+                    identity="run-bootstrap",
+                    ordinal=1,
+                )
+            else:
+                setup(run_worktree)
             if run_definition.before is not None:
                 if verbose:
                     runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
@@ -1639,6 +1769,7 @@ def run_batch(
                         gate_check=gate_check,
                         setup=setup,
                         item_graph=run_definition.item,
+                        explicit_execution=explicit_execution,
                         cancellation=cancellation,
                         verbose=verbose,
                     )
@@ -1678,7 +1809,8 @@ def run_batch(
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
-                    setup(run_worktree)
+                    if explicit_execution is None or run_definition.after is not None:
+                        setup(run_worktree)
                     if run_definition.after is not None:
                         if verbose:
                             runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
@@ -1696,13 +1828,14 @@ def run_batch(
                         if after.terminal is HUMAN:
                             outcome.succeeded = False
                             outcome.stopping_point = "after-Run HUMAN"
-                    run_gate = gate_check(run_worktree)
-                    (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
-                        run_gate.output
-                    )
-                    if not run_gate.passed:
-                        outcome.succeeded = False
-                        outcome.stopping_point = "Run Gate"
+                    if explicit_execution is None:
+                        run_gate = gate_check(run_worktree)
+                        (
+                            _telemetry_dir(fixture_dir, run_id) / "run-gate.log"
+                        ).write_text(run_gate.output)
+                        if not run_gate.passed:
+                            outcome.succeeded = False
+                            outcome.stopping_point = "Run Gate"
         except SetupError as exc:
             suppress_report_harvest = True
             if outcome.succeeded:

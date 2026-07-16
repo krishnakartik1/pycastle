@@ -18,7 +18,7 @@ from typing import Any
 from . import __version__, sandbox
 from .commands import command_exists, run_cmd
 from .compatibility import check_fixture_compatibility
-from .graph import PhaseGraph, RunDefinition, Terminal, load_run
+from .graph import GateNode, PhaseGraph, RunDefinition, RuntimeNode, Terminal, load_run
 from .issues import GitHubIssueSource, select_batch
 from .models import IssueRef
 
@@ -999,11 +999,15 @@ def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> No
             continue
         if not isinstance(graph, PhaseGraph) or graph.start not in graph.phases:
             raise ValueError(f"Invalid {scope} graph")
-        for phase in graph.phases.values():
-            for target in (phase.on_success, phase.on_failure):
+        for node in graph.nodes.values():
+            if not isinstance(node, RuntimeNode | GateNode):
+                raise ValueError(f"Invalid node in {scope} graph")
+            for target in (node.on_success, node.on_failure):
                 if not isinstance(target, Terminal) and target not in graph.phases:
                     raise ValueError(f"Invalid edge in {scope} graph")
-            candidate = prompts / phase.prompt
+            if isinstance(node, GateNode):
+                continue
+            candidate = prompts / node.prompt
             path = candidate.resolve()
             relative_parts = candidate.relative_to(prompts).parts
             has_symlink = any(
