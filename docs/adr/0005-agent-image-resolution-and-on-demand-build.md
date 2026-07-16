@@ -1,6 +1,6 @@
 # ADR-0005: Agent image resolution — `--image`, else build the project Dockerfile (content-addressed), else default tag
 
-Status: Accepted (2026-06-18)
+Status: Superseded by ADR-0012 (2026-07-16)
 
 ## Context
 
