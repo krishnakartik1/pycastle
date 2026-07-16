@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from importlib.metadata import version
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from packaging.version import Version
@@ -487,6 +487,160 @@ def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
     assert timeline.count("setup") == 22
     source.mark_for_human.assert_called_once_with(1)
     assert not any(call[:3] == ["gh", "pr", "create"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("failure", "completed", "released", "opens_draft"),
+    [
+        ("bootstrap", [], None, False),
+        ("first-item", [], 1, False),
+        ("second-item", [1], 2, True),
+    ],
+)
+def test_cli_setup_failure_preserves_only_safe_run_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+    completed: list[int],
+    released: int | None,
+    opens_draft: bool,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "work.md").write_text("work")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md')]))\n"
+    )
+    item_count = tmp_path / "item-setup-count"
+    setup = fixture / "setup"
+    if failure == "bootstrap":
+        setup_body = "exit 17\n"
+    else:
+        failing_item = 1 if failure == "first-item" else 2
+        setup_body = (
+            'test "$PYCASTLE_SCOPE" = run && exit 0\n'
+            f"count=$(cat '{item_count}' 2>/dev/null || printf 0)\n"
+            "count=$((count + 1))\n"
+            f"printf %s \"$count\" > '{item_count}'\n"
+            f'test "$count" -ne {failing_item}\n'
+        )
+    setup.write_text("#!/bin/sh\n" + setup_body)
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text("#!/bin/sh\nexit 0\n")
+    gate.chmod(0o755)
+    (fixture / ".gitignore").write_text("/runs/\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    selected = (IssueRef(number=1, title="One"), IssueRef(number=2, title="Two"))
+    frozen = FrozenReadinessInputs(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(),
+        readiness._freeze_project_fixture(fixture, load_run(fixture)),
+        selected,
+        "host",
+        "stub",
+        None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_cli_readiness",
+        lambda _args: ReadinessReport(
+            schema_version=1,
+            outcome=ReadinessOutcome.READY,
+            runner_version="0.1.0",
+            configuration=ReadinessConfiguration(
+                repository="owner/repo",
+                base_branch="main",
+                github_default_branch="main",
+                runtime="stub",
+                sandbox="host",
+                agent_image=None,
+                assignee="krishna",
+                include_unassigned=False,
+                item_limit=2,
+            ),
+            checks=tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            eligible_items=tuple(EligibleItem(x.number, x.title) for x in selected),
+            selected_items=selected,
+            frozen_inputs=frozen,
+        ),
+    )
+
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], *, capture: bool = False, cwd=None, **_: object):
+        calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str):
+            (cwd / f"item-{cwd.name.removeprefix('issue-')}.txt").write_text("done\n")
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: f"cli-setup-{failure}")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "stub", "-i", "2"]) == 1
+    assert outcomes[0].completed == completed
+    assert source.release.call_args_list == (
+        [] if released is None else [call(released)]
+    )
+    source.mark_for_human.assert_not_called()
+    merges = [
+        process_call for process_call in calls if process_call[:2] == ["git", "merge"]
+    ]
+    assert len(merges) == len(completed)
+    assert any(call[:3] == ["gh", "pr", "create"] for call in calls) is opens_draft
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in calls)
+    assert (fixture / "runs" / f"cli-setup-{failure}").is_dir()
 
 
 def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
