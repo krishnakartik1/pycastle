@@ -372,13 +372,12 @@ def evaluate_readiness(
         if progress is not None:
             progress("complete", check_id, result.status)
     successful = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
-    outcome = (
-        ReadinessOutcome.NO_WORK
-        if successful and no_work
-        else ReadinessOutcome.READY
-        if successful
-        else ReadinessOutcome.NOT_READY
-    )
+    if successful and no_work:
+        outcome = ReadinessOutcome.NO_WORK
+    elif successful:
+        outcome = ReadinessOutcome.READY
+    else:
+        outcome = ReadinessOutcome.NOT_READY
     return ReadinessReport(
         SCHEMA_VERSION,
         outcome,
