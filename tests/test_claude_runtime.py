@@ -118,7 +118,7 @@ def test_in_docker_build_command_skips_permissions(tmp_path: Path) -> None:
     # claude argv skips permissions there; otherwise headless claude denies
     # every Write and each phase silently no-ops (issue #44). This mirrors
     # CodexRuntime.in_docker carrying CODEX_DOCKER_BYPASS.
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     assert "--dangerously-skip-permissions" in runtime.build_command("hi")
 
 
@@ -369,21 +369,20 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     The inner ``claude …`` argv is unchanged; the sandbox wraps it. The same
     stream-json parsing applies to the container's stdout.
     """
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     result = runtime.run("a prompt", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
     # The whole command is a docker invocation wrapping the claude argv.
     assert argv[:3] == ["docker", "run", "--rm"]
-    assert sandbox.DEFAULT_IMAGE in argv
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert "sha256:" + ("a" * 64) in argv
+    image_idx = argv.index("sha256:" + ("a" * 64))
     assert argv[image_idx + 1 : image_idx + 4] == ["claude", "-p", "a prompt"]
-    assert "pycastle-claude-auth:/home/node/.claude" in argv
-    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" in argv
+    assert "pycastle-claude-auth:/pycastle/auth" in argv
+    assert "CLAUDE_CONFIG_DIR=/pycastle/auth" in argv
     # Same stream-json parsing as the host path.
     assert result.output == "Implemented the feature."
     assert result.telemetry.num_turns == 3
@@ -395,7 +394,7 @@ def test_docker_runtime_runs_both_runtime_and_commands_in_container(
     # Every phase the Runtime drives is wrapped: there is no host-side claude.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     runtime.run("p", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
@@ -414,7 +413,9 @@ def test_in_docker_resolves_relative_workspace(
     (tmp_path / "repo").mkdir()
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=Path("repo"))
+    runtime = ClaudeRuntime.in_docker(
+        image="sha256:" + ("a" * 64), workspace=Path("repo")
+    )
     runtime.run("p", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
@@ -437,7 +438,7 @@ def test_docker_workdir_is_run_cwd_not_workspace(
     worktree = root / ".pycastle" / "worktrees" / "issue-3"
     worktree.mkdir(parents=True)
 
-    runtime = ClaudeRuntime.in_docker(workspace=root)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=root)
     runtime.run("p", cwd=worktree, phase="implement")
 
     argv = mock_popen.call_args.args[0]
@@ -457,7 +458,7 @@ def test_docker_resolves_relative_run_cwd_for_w(
     (tmp_path / "worktree").mkdir()
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     runtime.run("p", cwd=Path("worktree"), phase="implement")
 
     argv = mock_popen.call_args.args[0]
@@ -610,7 +611,10 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # docker run captures the transcript just like the host path.
     sink = MagicMock()
     runtime = ClaudeRuntime.in_docker(
-        workspace=tmp_path, verbose=True, transcript_sink=sink
+        image="sha256:" + ("a" * 64),
+        workspace=tmp_path,
+        verbose=True,
+        transcript_sink=sink,
     )
     assert runtime.verbose is True
     assert runtime.transcript_sink is sink

@@ -257,17 +257,16 @@ def test_docker_relative_cwd_yields_absolute_inner_dash_c(
     # Under Docker the inner -C must also be absolute so it matches the
     # bind-mount path that build_run_command already resolves; a relative inner
     # -C would double under -w.
-    from pycastle import sandbox
 
     monkeypatch.chdir(tmp_path)
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     relative = Path(".pycastle/worktrees/issue-3")
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     runtime.run("p", cwd=relative, phase="implement")
 
     argv = mock_popen.call_args.args[0]
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    image_idx = argv.index("sha256:" + ("a" * 64))
     inner = argv[image_idx + 1 :]
     inner_dash_c_value = inner[inner.index("-C") + 1]
     assert Path(inner_dash_c_value).is_absolute()
@@ -280,19 +279,18 @@ def test_docker_workdir_matches_inner_dash_c(
     # The symmetric half of the #50 fix: under docker the container -w and the
     # inner codex -C must agree (both the resolved worktree), and the bind-mount
     # source must stay the workspace root, not the worktree.
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
     root = tmp_path / "root"
     worktree = root / ".pycastle" / "worktrees" / "issue-3"
     worktree.mkdir(parents=True)
 
-    runtime = CodexRuntime.in_docker(workspace=root)
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=root)
     runtime.run("p", cwd=worktree, phase="implement")
 
     argv = mock_popen.call_args.args[0]
     workdir = argv[argv.index("-w") + 1]
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    image_idx = argv.index("sha256:" + ("a" * 64))
     inner = argv[image_idx + 1 :]
     inner_dash_c = inner[inner.index("-C") + 1]
     assert workdir == inner_dash_c == str(worktree.resolve())
@@ -715,7 +713,10 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # in_docker forwards verbose and the sink onto the constructed codex runtime.
     sink = MagicMock()
     runtime = CodexRuntime.in_docker(
-        workspace=tmp_path, verbose=True, transcript_sink=sink
+        image="sha256:" + ("a" * 64),
+        workspace=tmp_path,
+        verbose=True,
+        transcript_sink=sink,
     )
     assert runtime.verbose is True
     assert runtime.transcript_sink is sink
@@ -786,17 +787,16 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     The Docker argv carries CODEX_HOME, the codex auth volume, and the bypass
     flag on the inner codex argv. The same JSONL parsing applies to stdout.
     """
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     result = runtime.run("a prompt", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[:3] == ["docker", "run", "--rm"]
-    assert sandbox.DEFAULT_IMAGE in argv
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert "sha256:" + ("a" * 64) in argv
+    image_idx = argv.index("sha256:" + ("a" * 64))
     # The inner argv starts the codex command and carries the bypass flag.
     inner = argv[image_idx + 1 :]
     assert inner[0] == "codex"
@@ -806,9 +806,9 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     assert "workspace-write" not in inner
     assert "-s" not in inner
     # CODEX_HOME and the codex auth volume are pinned, not Claude's.
-    assert "pycastle-codex-auth:/home/node/.codex" in argv
-    assert "CODEX_HOME=/home/node/.codex" in argv
-    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" not in argv
+    assert "pycastle-codex-auth:/pycastle/auth" in argv
+    assert "CODEX_HOME=/pycastle/auth" in argv
+    assert "CLAUDE_CONFIG_DIR=/pycastle/auth" not in argv
     # Same JSONL parsing as the host path.
     assert result.output == "implemented"
     assert result.telemetry.thread_id == "thread-123"
@@ -819,7 +819,7 @@ def test_docker_runtime_runs_both_runtime_and_commands_in_container(
 ) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     runtime.run("p", cwd=tmp_path, phase="implement")
 
     argv = mock_popen.call_args.args[0]
@@ -910,7 +910,9 @@ def test_run_works_one_issue_end_to_end_via_codex_in_docker(
     runner = MagicMock(side_effect=_ok)
 
     outcome = orchestrator.run_batch(
-        runtime=CodexRuntime.in_docker(workspace=tmp_path),
+        runtime=CodexRuntime.in_docker(
+            image="sha256:" + ("a" * 64), workspace=tmp_path
+        ),
         issue_source=source,
         selected=source.list_ready(),
         fixture_dir=fixture_dir,

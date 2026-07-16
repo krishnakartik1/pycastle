@@ -17,7 +17,7 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
 
     for command in (
         "pycastle init",
-        "pycastle sandbox setup --runtime claude",
+        "pycastle runtime login --runtime claude",
         "pycastle run --runtime claude",
         "pycastle prune",
     ):

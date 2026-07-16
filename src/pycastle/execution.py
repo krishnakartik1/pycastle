@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Literal, TypeAlias
@@ -148,6 +149,9 @@ def execute_hook(
     scope: Literal["item", "run"],
     record_path: Path,
     environment: dict[str, str] | None = None,
+    argv_builder: (
+        Callable[[Path, Path, Literal["item", "run"]], list[str]] | None
+    ) = None,
 ) -> ExecutionRecord:
     """Execute a hook by shebang, with no args and closed standard input."""
     env = dict(environment if environment is not None else os.environ)
@@ -157,10 +161,15 @@ def execute_hook(
         tempfile.TemporaryFile() as stderr_file,
     ):
         try:
+            argv = (
+                argv_builder(executable, cwd, scope)
+                if argv_builder is not None
+                else [str(executable)]
+            )
             process = subprocess.Popen(
-                [str(executable)],
+                argv,
                 cwd=cwd,
-                env=env,
+                env=None if argv_builder is not None else env,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,

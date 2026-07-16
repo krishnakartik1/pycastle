@@ -41,8 +41,8 @@ CHECK_IDS = (
     "github_permissions",
     "workflow_labels",
     "eligible_items",
-    "frozen_execution_inputs",
     "agent_image",
+    "frozen_execution_inputs",
     "runtime",
     "runtime_authentication",
 )
@@ -52,20 +52,7 @@ class AgentImagePreparationError(RuntimeError):
     """The resolved Agent image could not be prepared safely."""
 
 
-def resolve_agent_image_name(image_flag: str | None, fixture_dir: Path) -> str:
-    """Resolve ADR-0005 precedence without invoking Docker."""
-    if image_flag is not None:
-        if not image_flag.strip():
-            raise AgentImagePreparationError("The --image value is empty.")
-        return image_flag
-    dockerfile = fixture_dir / "Dockerfile"
-    if dockerfile.is_file():
-        return sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-    return sandbox.DEFAULT_IMAGE
-
-
 def prepare_agent_image(
-    image_flag: str | None,
     fixture_dir: Path,
     *,
     runner: Callable[..., Any] = run_cmd,
@@ -74,32 +61,50 @@ def prepare_agent_image(
     inspect_timeout: float | None = None,
     build_timeout: float | None = None,
 ) -> str:
-    """Resolve and, when selected by Dockerfile, prepare Run's exact image."""
-    image = resolve_agent_image_name(image_flag, fixture_dir)
-    if image_flag is not None or not (fixture_dir / "Dockerfile").is_file():
-        return image
+    """Build the canonical Dockerfile and return its immutable image ID."""
+    dockerfile = fixture_dir / "Dockerfile"
+    if dockerfile.is_symlink() or not dockerfile.is_file():
+        raise AgentImagePreparationError(
+            "The canonical Dockerfile is missing or unsafe."
+        )
+    repository_root = Path(cwd or fixture_dir.parent).resolve()
+    image = f"pycastle-readiness:{uuid.uuid4().hex}"
     run_options: dict[str, Any] = {}
-    if cwd is not None:
-        run_options["cwd"] = cwd
-    inspect_options = dict(run_options)
-    if inspect_timeout is not None:
-        inspect_options["timeout"] = inspect_timeout
-    inspect = runner(
-        ["docker", "image", "inspect", image], capture=True, **inspect_options
-    )
-    if getattr(inspect, "returncode", 1) == 0:
-        return image
+    run_options["cwd"] = repository_root
     build_options = dict(run_options)
     if build_timeout is not None:
         build_options["timeout"] = build_timeout
     build = runner(
-        ["docker", "build", "-t", image, str(fixture_dir)],
+        [
+            "docker",
+            "build",
+            "--file",
+            str(dockerfile.resolve()),
+            "--tag",
+            image,
+            str(repository_root),
+        ],
         capture=capture_build,
         **build_options,
     )
     if getattr(build, "returncode", 1) != 0:
         raise AgentImagePreparationError("Agent image build failed.")
-    return image
+    inspect_options = dict(run_options)
+    if inspect_timeout is not None:
+        inspect_options["timeout"] = inspect_timeout
+    inspect = runner(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        capture=True,
+        **inspect_options,
+    )
+    identity = (getattr(inspect, "stdout", "") or "").strip()
+    if getattr(inspect, "returncode", 1) != 0 or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", identity
+    ):
+        raise AgentImagePreparationError(
+            "Docker did not resolve an immutable image ID."
+        )
+    return identity
 
 
 class Status(StrEnum):
@@ -235,6 +240,7 @@ _PREREQUISITES: dict[str, tuple[str, ...]] = {
         "fixture_structure",
         "sandbox",
         "eligible_items",
+        "agent_image",
     ),
     "runtime": ("sandbox", "agent_image", "frozen_execution_inputs", "eligible_items"),
     "runtime_authentication": ("runtime", "eligible_items"),
@@ -563,7 +569,6 @@ class DefaultReadinessAdapter:
         *,
         runner: Callable[..., Any] = run_cmd,
         exists: Callable[[str], bool] = command_exists,
-        image_flag: str | None = None,
         include_item_content: bool = False,
         stream_image_build: bool = False,
         cleanup_reporter: Callable[[str], None] | None = None,
@@ -572,7 +577,6 @@ class DefaultReadinessAdapter:
         self.workspace = workspace
         self.runner = runner
         self.exists = exists
-        self.image_flag = image_flag
         self.include_item_content = include_item_content
         self.stream_image_build = stream_image_build
         self.cleanup_reporter = cleanup_reporter
@@ -621,11 +625,13 @@ class DefaultReadinessAdapter:
     ) -> list[str]:
         if config.sandbox == "host":
             return inner_argv
+        if not config.agent_image:
+            raise AgentImagePreparationError("Agent image has not been pinned")
         return sandbox.build_run_command(
             config.runtime,
             inner_argv=inner_argv,
             workspace=self._readiness_workspace(),
-            image=config.agent_image or sandbox.DEFAULT_IMAGE,
+            image=config.agent_image,
         )
 
     @staticmethod
@@ -797,17 +803,8 @@ class DefaultReadinessAdapter:
             return CheckResult(
                 Status.NOT_APPLICABLE, "Host Sandbox uses no Agent image."
             )
-        if not config.agent_image:
-            return CheckResult(
-                Status.FAIL,
-                "No Agent image was resolved.",
-                remediation="Provide --image or add .pycastle/Dockerfile.",
-            )
-        # Explicit-image provenance is authoritative: never even stat/read the
-        # Project Dockerfile in bring-your-own-image mode.
         try:
             prepared = prepare_agent_image(
-                self.image_flag,
                 self.fixture_dir,
                 runner=self.runner,
                 cwd=self.workspace,
@@ -815,14 +812,12 @@ class DefaultReadinessAdapter:
                 inspect_timeout=SHORT_TIMEOUT,
                 build_timeout=IMAGE_BUILD_TIMEOUT,
             )
-            if prepared != config.agent_image:
-                raise AgentImagePreparationError("resolved image changed")
+            object.__setattr__(config, "agent_image", prepared)
         except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired):
             return CheckResult(
                 Status.FAIL,
                 "Agent image could not be prepared.",
-                {"image": config.agent_image},
-                "Fix .pycastle/Dockerfile or provide a valid --image, then retry.",
+                remediation="Fix .pycastle/Dockerfile and retry.",
             )
         runtime_config = sandbox.RUNTIME_CONFIG.get(config.runtime)
         if runtime_config is None:
@@ -837,8 +832,9 @@ class DefaultReadinessAdapter:
         script = r"""set -eu
 cleanup() { rm -f "${auth_file:-}" "${workspace_file:-}"; }
 trap cleanup EXIT HUP INT TERM
-test "$(id -un)" = node
-test "$HOME" = /home/node
+test "$(id -u)" != 0
+test -n "${HOME:-}"
+test -w "$HOME"
 command -v "$runtime" >/dev/null
 eval "config_value=\${$config_env-}"
 test "$config_value" = "$config_dir"
@@ -867,20 +863,20 @@ test -w "$workspace_file"
             config.runtime,
             inner_argv=inner,
             workspace=self._readiness_workspace(),
-            image=config.agent_image,
+            image=prepared,
         )
         result = self._run(argv)
         return (
             CheckResult(
                 Status.PASS,
                 "Agent image satisfies the runtime contract.",
-                {"image": config.agent_image},
+                {"image": prepared},
             )
             if self._ok(result)
             else CheckResult(
                 Status.FAIL,
                 "Agent image does not satisfy the runtime contract.",
-                {"image": config.agent_image},
+                {"image": prepared},
                 "Fix the image user, home, Runtime PATH, Auth volume, or workspace permissions.",
             )
         )
@@ -929,8 +925,10 @@ test -w "$workspace_file"
             )
         argv = list(runtime_config.status_args)
         if config.sandbox == "docker":
+            if not config.agent_image:
+                return CheckResult(Status.BLOCKED, "Agent image is unavailable.")
             argv = sandbox.build_status_command(
-                config.runtime, image=config.agent_image or sandbox.DEFAULT_IMAGE
+                config.runtime, image=config.agent_image
             )
         try:
             result = self._run(argv)
@@ -947,35 +945,6 @@ test -w "$workspace_file"
                 Status.FAIL,
                 "Runtime is not authenticated.",
                 remediation=f"Authenticate {config.runtime} in the selected Sandbox.",
-            )
-        )
-
-    def check_gate_toolchain(self, config: ReadinessConfiguration) -> CheckResult:
-        gate = self.fixture_dir / "gate"
-        if not gate.is_file():
-            return CheckResult(Status.NOT_APPLICABLE, "The optional Gate is absent.")
-        argv = [str(gate.resolve()), "--check-tools"]
-        if config.sandbox == "docker":
-            workspace = self._readiness_workspace()
-            disposable_gate = workspace / "gate"
-            shutil.copy2(gate, disposable_gate)
-            # The canonical container user may not share the host owner's uid.
-            disposable_gate.chmod(0o755)
-            argv = [str(disposable_gate), "--check-tools"]
-            argv = sandbox.build_run_command(
-                config.runtime,
-                inner_argv=argv,
-                workspace=workspace,
-                image=config.agent_image or sandbox.DEFAULT_IMAGE,
-            )
-        result = self._run(argv)
-        return (
-            CheckResult(Status.PASS, "Gate toolchain check passed.")
-            if self._ok(result)
-            else CheckResult(
-                Status.FAIL,
-                "Gate toolchain check failed.",
-                remediation="Install the project toolchain in the selected Sandbox.",
             )
         )
 

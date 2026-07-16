@@ -1162,7 +1162,7 @@ def test_docker_gate_wraps_canonical_gate_through_build_run_command(
     # The repo root is mounted at its own path (mount = workspace, not worktree).
     assert f"{repo_root.resolve()}:{repo_root.resolve()}" in argv
     # The runtime's auth mount is reused verbatim (inert for the gate).
-    assert f"{sandbox.auth_volume('claude')}:{sandbox.CLAUDE_CONFIG_DIR}" in argv
+    assert f"{sandbox.auth_volume('claude')}:{sandbox.AUTH_DIR}" in argv
     # The inner argv runs bash on the CANONICAL repo-root gate, absolute.
     canonical = str((fixture_dir / orchestrator.FIXTURE_GATE).resolve())
     assert argv[-2:] == ["bash", canonical]

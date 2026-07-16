@@ -295,6 +295,26 @@ class FrozenRunExecution:
     setup: Path
     gate: Path
     records: Path
+    sandbox: str = "host"
+    runtime_name: str = "claude"
+    workspace: Path | None = None
+    image: str | None = None
+
+    def _hook_argv(
+        self, executable: Path, cwd: Path, scope: Literal["item", "run"]
+    ) -> list[str]:
+        if self.sandbox == "host":
+            return [str(executable)]
+        if self.workspace is None or self.image is None:
+            raise ValueError("Docker hook execution requires workspace and image")
+        return sandbox_mod.build_run_command(
+            self.runtime_name,
+            inner_argv=[str(executable)],
+            workspace=self.workspace,
+            workdir=cwd,
+            image=self.image,
+            environment={"PYCASTLE_SCOPE": scope},
+        )
 
     @staticmethod
     def _record_identity(value: str) -> str:
@@ -333,6 +353,7 @@ class FrozenRunExecution:
                 scope=scope,
                 record_path=self.records
                 / f"{self._record_identity(identity)}-setup-{ordinal}.json",
+                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
             )
         except Exception as exc:
             raise SetupError(
@@ -372,6 +393,7 @@ class FrozenRunExecution:
                     f"{self._record_identity(node)}-gate-{ordinal}.json"
                 ),
                 environment=environment,
+                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
             )
         finally:
             duration_seconds = time.monotonic() - started_at
@@ -426,12 +448,14 @@ def make_fixture_setup(
             return
         try:
             if sandbox == "docker":
+                if image is None:
+                    raise SetupError("Docker Setup requires a pinned Agent image")
                 argv = sandbox_mod.build_run_command(
                     runtime_name,
                     inner_argv=["bash", str(setup_path.resolve())],
                     workspace=workspace or Path.cwd(),
                     workdir=worktree,
-                    image=image or sandbox_mod.DEFAULT_IMAGE,
+                    image=image,
                 )
                 result = runner(argv, capture=True)
             else:
@@ -518,6 +542,8 @@ def make_fixture_gate_check(
         started = time.monotonic()
         try:
             if sandbox == "docker":
+                if image is None:
+                    raise ValueError("Docker Gate requires a pinned Agent image")
                 # Wrap the canonical gate through the same docker wrapper the
                 # runtime uses: repo root mounted at its own path, worktree as the
                 # container cwd (-w). ``docker run`` is launched from the host with
@@ -527,7 +553,7 @@ def make_fixture_gate_check(
                     inner_argv=["bash", str(gate_path.resolve())],
                     workspace=workspace or Path.cwd(),
                     workdir=worktree,
-                    image=image or sandbox_mod.DEFAULT_IMAGE,
+                    image=image,
                 )
                 result = runner(argv, capture=True)
             else:
@@ -1868,6 +1894,10 @@ def run_batch(
             project_fixture_dir / FIXTURE_SETUP,
             project_fixture_dir / FIXTURE_GATE,
             fixture_dir / "runs" / run_id / "executions",
+            sandbox=getattr(frozen_inputs, "sandbox", "host"),
+            runtime_name=getattr(frozen_inputs, "runtime", "claude"),
+            workspace=workspace,
+            image=getattr(frozen_inputs, "agent_image", None),
         )
         if frozen_project is not None
         else (

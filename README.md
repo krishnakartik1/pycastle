@@ -94,19 +94,19 @@ The fixture contains all of the project-owned behavior:
 Review and commit this directory. In particular, make `.pycastle/gate` express
 what “passing” means for the project and extend `.pycastle/Dockerfile` with any
 toolchain the phases and gate need. The Docker sandbox runs both the runtime and
-the gate in that image; PyCastle builds it on demand and reuses it while the
-Dockerfile is unchanged.
+the gate in that image. Readiness builds it from the repository root, pins the
+resulting immutable identity, and reuses that identity for the whole Run.
 
 For a Docker run, authenticate the runtime once. The login is stored in a named
 Docker volume and reused across projects:
 
 ```bash
-pycastle sandbox setup --runtime claude
+pycastle runtime login --runtime claude --sandbox docker
 ```
 
-Use `--runtime codex` instead for Codex. Host runs do not need `sandbox setup`,
-but the selected runtime CLI must already be installed, authenticated, and
-available on `PATH`.
+Use `--runtime codex` instead for Codex. Host authentication uses
+`pycastle runtime login --runtime claude --sandbox host`; the selected Runtime
+CLI must already be installed and available on `PATH`.
 
 PyCastle reads GitHub Issues carrying the `ready-for-agent` label. By default it
 only selects issues assigned to your authenticated `gh` user, so prepare an
@@ -171,10 +171,10 @@ the remote branches from pull-request history.
   whose PRs are merged or closed. By default no-PR recovery branches are kept;
   opt in to deleting them with `--include-no-pr`. Open-PR branches are always
   preserved.
-- `pycastle sandbox setup --runtime claude` — authenticate a runtime in its
-  shared Docker auth volume.
-- `pycastle sandbox build` — explicitly build the content-addressed image from
-  `.pycastle/Dockerfile`; normal Docker runs build it on demand.
+- `pycastle runtime login --runtime claude [--sandbox host|docker]` — explicitly
+  authenticate a Runtime. Without the flag, use the `.pycastle/sandbox` marker.
+- Docker Doctor and Run build the canonical `.pycastle/Dockerfile`; there is no
+  image override or separate Sandbox build lifecycle.
 
 ## Customize the project fixture
 
