@@ -795,7 +795,7 @@ def test_failed_run_phase_removes_ignored_scratch_artifacts(
     runner = MagicMock(side_effect=side_effect)
     graph = orchestrator.PhaseGraph(
         start="review",
-        phases={
+        nodes={
             "review": orchestrator.Phase(name="review", prompt="run.md"),
         },
     )

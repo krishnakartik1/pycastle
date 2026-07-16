@@ -440,6 +440,89 @@ def _dockerfile(*, python: bool) -> str:
 # too -- otherwise the orchestrator's `git add -A` folds them into the issue
 # branch and the run's PR. They are anchored to this dir (leading `/`) so they
 # never shadow the tracked prompts/plan.md.
+# ADRs 0010-0014 replace the earlier language-aware templates above. Keeping the
+# accepted contract together here makes initialization invariant to repository
+# contents; only the Sandbox marker differs.
+_MAIN_PY = '''"""Project-owned PyCastle Run definition."""
+
+from pycastle.graph import DONE, build_run, execution_graph, gate_node, runtime_node
+
+run = build_run(
+    item=execution_graph(
+        start="plan",
+        nodes=[
+            runtime_node("plan", "plan.md", on_success="implement"),
+            runtime_node("implement", "implement.md", on_success="review"),
+            runtime_node("review", "review.md", on_success="verify"),
+            gate_node("verify", on_success=DONE, on_failure="repair"),
+            runtime_node("repair", "repair.md", on_success="verify"),
+        ],
+    ),
+    after=execution_graph(
+        start="run-review",
+        nodes=[
+            runtime_node("run-review", "run-review.md", on_success="run-report"),
+            runtime_node("run-report", "run-report.md", on_success="run-verify"),
+            gate_node("run-verify", on_success=DONE, on_failure="run-repair"),
+            runtime_node("run-repair", "run-repair.md", on_success="run-report"),
+        ],
+    ),
+)
+'''
+
+_SETUP_NOOP = """#!/bin/sh
+# Project-owned preparation for the current worktree.
+# Invoked directly before every Runtime and Gate node. PYCASTLE_SCOPE is
+# "item" or "run". Keep durable effects and make this safe to repeat.
+# PyCastle deliberately does not inspect manifests or choose a toolchain.
+set -eu
+:
+"""
+
+_GATE = """#!/bin/sh
+# Project-owned verification policy. PYCASTLE_SCOPE is "item" or "run".
+set -eu
+echo "ERROR: .pycastle/gate has not been configured." >&2
+echo "Replace this body with the project's verification commands." >&2
+exit 1
+"""
+
+_REPAIR_MD = """# Repair
+
+The immediately preceding Gate failed. Use its typed, bounded evidence and the
+current worktree to repair the change. The graph will apply Gate again.
+"""
+
+_DOCKERFILE = """# Project-owned PyCastle Agent image.
+# Built from the repository root and pinned for one Run.
+FROM node:22-bookworm-slim
+
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends ca-certificates git procps \\
+    && rm -rf /var/lib/apt/lists/* \\
+    && npm install -g @anthropic-ai/claude-code @openai/codex \\
+    && npm cache clean --force
+
+RUN useradd --create-home --shell /bin/sh pycastle \\
+    && install -d -o pycastle -g pycastle /pycastle/auth
+
+# --- PROJECT TOOLCHAIN -----------------------------------------------------
+# Install project-owned interpreters, compilers, package managers and libraries.
+# ---------------------------------------------------------------------------
+USER pycastle
+ENV HOME=/home/pycastle
+WORKDIR /home/pycastle
+"""
+
+
+def _setup_script(_target_dir: Path) -> str:
+    return _SETUP_NOOP
+
+
+def _dockerfile(*, python: bool) -> str:
+    return _DOCKERFILE
+
+
 _GITIGNORE = """\
 # PyCastle run output (transient): run logs and generated run artifacts.
 logs/
@@ -485,6 +568,7 @@ def _fixture_files(
         "prompts/plan.md": _PLAN_MD,
         "prompts/implement.md": _IMPLEMENT_MD,
         "prompts/review.md": _REVIEW_MD,
+        "prompts/repair.md": _REPAIR_MD,
         "prompts/run-review.md": _RUN_REVIEW_MD,
         "prompts/run-repair.md": _RUN_REPAIR_MD,
         "prompts/run-report.md": _RUN_REPORT_MD,
