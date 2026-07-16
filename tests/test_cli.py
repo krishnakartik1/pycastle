@@ -469,6 +469,176 @@ def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
     assert not any(call[:3] == ["gh", "pr", "create"] for call in calls)
 
 
+def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    for name in ("item", "review", "report", "repair"):
+        (prompts / f"{name}.md").write_text(name)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(\n"
+        " item=execution_graph(start='item-work',nodes=["
+        "runtime_node('item-work','item.md',on_success='item-verify'),"
+        "gate_node('item-verify')]),\n"
+        " after=execution_graph(start='run-review',nodes=["
+        "runtime_node('run-review','review.md',on_success='run-report'),"
+        "runtime_node('run-report','report.md',on_success='run-verify'),"
+        "gate_node('run-verify',on_failure='run-repair'),"
+        "runtime_node('run-repair','repair.md',on_success='run-report')]))\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(
+        f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        f"#!/bin/sh\nprintf 'gate:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+        'test "$PYCASTLE_SCOPE" = item && exit 0\n'
+        "printf 'failed gate state\\n' >> .pycastle/gate-state\n"
+        "test -f repaired\n"
+    )
+    gate.chmod(0o755)
+    (fixture / ".gitignore").write_text("/runs/\n/run-report.md\n/gate-state\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    phases: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str):
+            phases.append(phase)
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            if phase == "item-work":
+                (cwd / f"item-{cwd.name.removeprefix('issue-')}.txt").write_text(
+                    "done\n"
+                )
+            elif phase == "run-review":
+                assert (cwd / "item-1.txt").is_file()
+                assert (cwd / "item-2.txt").is_file()
+                (cwd / "integrated.txt").write_text("reviewed\n")
+            elif phase == "run-report":
+                (cwd / ".pycastle" / "run-report.md").write_text(
+                    "# Integrated Run\n\nTwo Items repaired and verified.\n"
+                )
+            elif phase == "run-repair":
+                assert (cwd / ".pycastle" / "gate-state").is_file()
+                (cwd / "repaired").write_text("yes\n")
+            return result
+
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], *, capture: bool = False, cwd=None, **_: object):
+        calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    selected = (IssueRef(number=1, title="One"), IssueRef(number=2, title="Two"))
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_cli_readiness",
+        lambda _args: ReadinessReport(
+            schema_version=1,
+            ready=True,
+            runner_version="0.1.0",
+            configuration=ReadinessConfiguration(
+                repository="owner/repo",
+                base_branch="main",
+                github_default_branch="main",
+                runtime="stub",
+                sandbox="host",
+                agent_image=None,
+                assignee="krishna",
+                include_unassigned=False,
+                item_limit=2,
+            ),
+            checks=tuple(
+                ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+            ),
+            eligible_items=tuple(EligibleItem(x.number, x.title) for x in selected),
+            selected_items=selected,
+        ),
+    )
+    source = MagicMock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-run-136")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+    outcomes: list[RunOutcome] = []
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+
+    assert (
+        main(
+            [
+                "run",
+                "--sandbox",
+                "host",
+                "--runtime",
+                "stub",
+                "--iterations",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert outcomes[0].completed == [1, 2]
+    assert phases == [
+        "item-work",
+        "item-work",
+        "run-review",
+        "run-report",
+        "run-repair",
+        "run-report",
+    ]
+    lines = timeline.read_text().splitlines()
+    assert lines.count("gate:item") == 2
+    assert lines.count("gate:run") == 2
+    assert lines[-1] == "gate:run"  # passing Gate reaches DONE directly
+    draft = next(
+        i for i, call in enumerate(calls) if call[:3] == ["gh", "pr", "create"]
+    )
+    comment = next(
+        i
+        for i, call in enumerate(calls)
+        if call[:2] == ["gh", "api"] and "--method" in call
+    )
+    ready = next(i for i, call in enumerate(calls) if call[:3] == ["gh", "pr", "ready"])
+    assert draft < comment < ready
+    commits = [call[3] for call in calls if call[:3] == ["git", "commit", "-m"]]
+    assert len(commits) == 6
+
+
 @pytest.mark.parametrize(
     ("outcome", "expected"),
     [

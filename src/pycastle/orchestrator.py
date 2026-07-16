@@ -238,6 +238,7 @@ class GateOutcome:
     exit_code: int = 0
     duration_seconds: float = 0.0
     command: str = ".pycastle/gate"
+    termination: dict[str, object] | None = None
 
 
 def _gates_always_pass(_worktree: Path) -> GateOutcome:
@@ -266,8 +267,8 @@ class SetupError(RuntimeError):
 
 
 @dataclass
-class ExplicitItemExecution:
-    """Frozen host hook inputs and deterministic per-visit record allocation."""
+class FrozenRunExecution:
+    """Frozen Run hooks and deterministic per-graph visit record allocation."""
 
     setup: Path
     gate: Path
@@ -281,7 +282,7 @@ class ExplicitItemExecution:
         return f"{readable[:48]}-{digest}"
 
     @classmethod
-    def freeze(cls, fixture_dir: Path, run_id: str) -> ExplicitItemExecution:
+    def freeze(cls, fixture_dir: Path, run_id: str) -> FrozenRunExecution:
         fixture_dir = fixture_dir.resolve()
         root = fixture_dir / "runs" / run_id
         frozen = root / "frozen"
@@ -299,7 +300,7 @@ class ExplicitItemExecution:
         self,
         worktree: Path,
         *,
-        scope: Literal["item", "run"],
+        scope: Literal["item", "run"] = "item",
         identity: str,
         ordinal: int,
     ) -> None:
@@ -314,13 +315,19 @@ class ExplicitItemExecution:
             raise SetupError(f"Project setup failed: {record.termination}")
 
     def invoke_gate(
-        self, worktree: Path, *, identity: str, node: str, ordinal: int
-    ) -> NodeOutcome:
+        self,
+        worktree: Path,
+        *,
+        scope: Literal["item", "run"] = "item",
+        identity: str,
+        node: str,
+        ordinal: int,
+    ) -> tuple[NodeOutcome, GateOutcome]:
         environment = dict(os.environ)
         record = execute_hook(
             self.gate,
             cwd=worktree,
-            scope="item",
+            scope=scope,
             record_path=self.records
             / (
                 f"{self._record_identity(identity)}-"
@@ -328,14 +335,30 @@ class ExplicitItemExecution:
             ),
             environment=environment,
         )
+        evidence = project_gate_evidence(
+            record,
+            node=node,
+            sensitive_values=sensitive_environment_values(environment),
+        )
+        termination = evidence["termination"]
+        exit_code = (
+            int(termination["code"])
+            if isinstance(termination, dict) and "code" in termination
+            else 0
+        )
         return NodeOutcome(
             record.success,
-            project_gate_evidence(
-                record,
-                node=node,
-                sensitive_values=sensitive_environment_values(environment),
-            ),
+            evidence,
+        ), GateOutcome(
+            record.success,
+            "",
+            exit_code=exit_code,
+            termination=termination if isinstance(termination, dict) else None,
         )
+
+
+# Temporary internal compatibility for tests and callers migrating with #136.
+ExplicitItemExecution = FrozenRunExecution
 
 
 def make_fixture_setup(
@@ -1086,37 +1109,49 @@ def _walk_issue(
     return executor.execute(graph, cwd=issue_worktree, phase_runner=run_phase)
 
 
-def _walk_explicit_item_graph(
-    issue: IssueRef,
+def _walk_execution_graph(
+    issue: IssueRef | None,
     *,
     runtime: Runtime,
     fixture_dir: Path,
-    issue_worktree: Path,
+    worktree: Path,
     graph: PhaseGraph,
-    execution: ExplicitItemExecution,
-) -> WalkResult:
-    """Walk a mixed Item Execution graph with Setup before every node."""
+    execution: FrozenRunExecution,
+    scope: Literal["item", "run"] = "item",
+    identity: str | None = None,
+    context: str | None = None,
+    checkpoint: Callable[[RuntimeNode], None] | None = None,
+) -> tuple[WalkResult, GateOutcome | None]:
+    """Walk one mixed Execution graph with Setup before every node visit."""
+    if issue is None and context is None:
+        raise ValueError("Run graph execution requires factual Run context")
     executor = GraphExecutor(
-        runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
+        runtime,
+        fixture_dir=fixture_dir,
+        preamble=context if context is not None else render_issue_context(issue),
     )
     results: list[PhaseResult] = []
-    identity = f"item-{issue.number}"
+    identity = identity or f"item-{issue.number}"
+    last_gate: GateOutcome | None = None
 
     def visit(entry: Any) -> NodeOutcome:
         node = entry.node
         execution.invoke_setup(
-            issue_worktree,
-            scope="item",
+            worktree,
+            scope=scope,
             identity=f"{identity}-{node.name}",
             ordinal=entry.ordinal,
         )
         if isinstance(node, GateNode):
-            return execution.invoke_gate(
-                issue_worktree,
+            nonlocal last_gate
+            outcome, last_gate = execution.invoke_gate(
+                worktree,
+                scope=scope,
                 identity=identity,
                 node=node.name,
                 ordinal=entry.ordinal,
             )
+            return outcome
         if not isinstance(node, RuntimeNode):
             raise TypeError("Unknown Execution node")
         extra = (
@@ -1127,16 +1162,39 @@ def _walk_explicit_item_graph(
         try:
             result = runtime.run(
                 executor.render_prompt(node, extra),
-                cwd=issue_worktree,
+                cwd=worktree,
                 phase=node.name,
             )
         except AgentCrashError:
             return NodeOutcome(False)
         results.append(PhaseResult(node.name, result))
-        return NodeOutcome(True)
+        if checkpoint is not None:
+            checkpoint(node)
+        return NodeOutcome(True, {"source": node.name, "success": True})
 
     walked = walk_execution_graph(graph, visit)
-    return WalkResult(results, walked.terminal)
+    return WalkResult(results, walked.terminal), last_gate
+
+
+def _walk_explicit_item_graph(
+    issue: IssueRef,
+    *,
+    runtime: Runtime,
+    fixture_dir: Path,
+    issue_worktree: Path,
+    graph: PhaseGraph,
+    execution: FrozenRunExecution,
+) -> WalkResult:
+    """Compatibility wrapper for the shared Item/Run graph visitor."""
+    walk, _ = _walk_execution_graph(
+        issue,
+        runtime=runtime,
+        fixture_dir=fixture_dir,
+        worktree=issue_worktree,
+        graph=graph,
+        execution=execution,
+    )
+    return walk
 
 
 def _last_thread_id(phase_results: list[PhaseResult]) -> str | None:
@@ -1704,11 +1762,12 @@ def run_batch(
     # Import once: Runtime edits to the fixture are proposed changes and cannot
     # rewrite the active Run definition or weaken its graphs.
     run_definition: RunDefinition = load_run(fixture_dir)
+    # Readiness guarantees both hooks for real Runs.  The fallback keeps the
+    # retained low-level orchestration API usable by historical injected-hook
+    # tests while valid Project fixtures always take the frozen graph path.
     explicit_execution = (
-        ExplicitItemExecution.freeze(fixture_dir, run_id)
-        if any(
-            isinstance(node, GateNode) for node in run_definition.item.nodes.values()
-        )
+        FrozenRunExecution.freeze(fixture_dir, run_id)
+        if all((fixture_dir / name).is_file() for name in (FIXTURE_SETUP, FIXTURE_GATE))
         else None
     )
 
@@ -1748,13 +1807,29 @@ def run_batch(
                     runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
                         fixture_dir, run_id, "before-Run"
                     )
-                before = _walk_run_graph(
-                    run_definition.before,
-                    runtime=runtime,
-                    run=run,
-                    context=render_run_context(run_id, selected, []),
-                    scope="before-Run",
-                )
+                if explicit_execution is not None:
+                    before, _ = _walk_execution_graph(
+                        None,
+                        runtime=runtime,
+                        fixture_dir=fixture_dir,
+                        worktree=run_worktree,
+                        graph=run_definition.before,
+                        execution=explicit_execution,
+                        context=render_run_context(run_id, selected, []),
+                        scope="run",
+                        identity="before-run",
+                        checkpoint=lambda node: _checkpoint_run_phase(
+                            node, run=run, scope="before-Run"
+                        ),
+                    )
+                else:
+                    before = _walk_run_graph(
+                        run_definition.before,
+                        runtime=runtime,
+                        run=run,
+                        context=render_run_context(run_id, selected, []),
+                        scope="before-Run",
+                    )
             else:
                 before = None
     except KeyboardInterrupt:
@@ -1842,22 +1917,40 @@ def run_batch(
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
-                    if explicit_execution is None or run_definition.after is not None:
+                    if explicit_execution is None:
                         setup(run_worktree)
                     if run_definition.after is not None:
                         if verbose:
                             runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
                                 fixture_dir, run_id, "after-Run"
                             )
-                        after = _walk_run_graph(
-                            run_definition.after,
-                            runtime=runtime,
-                            run=run,
-                            context=render_run_context(
-                                run_id, selected, outcome.issues
-                            ),
-                            scope="after-Run",
-                        )
+                        if explicit_execution is not None:
+                            after, run_gate = _walk_execution_graph(
+                                None,
+                                runtime=runtime,
+                                fixture_dir=fixture_dir,
+                                worktree=run_worktree,
+                                graph=run_definition.after,
+                                execution=explicit_execution,
+                                context=render_run_context(
+                                    run_id, selected, outcome.issues
+                                ),
+                                scope="run",
+                                identity="after-run",
+                                checkpoint=lambda node: _checkpoint_run_phase(
+                                    node, run=run, scope="after-Run"
+                                ),
+                            )
+                        else:
+                            after = _walk_run_graph(
+                                run_definition.after,
+                                runtime=runtime,
+                                run=run,
+                                context=render_run_context(
+                                    run_id, selected, outcome.issues
+                                ),
+                                scope="after-Run",
+                            )
                         if after.terminal is HUMAN:
                             outcome.succeeded = False
                             outcome.stopping_point = "after-Run HUMAN"
@@ -2083,9 +2176,17 @@ def _open_pull_request(
     state = "complete" if successful else "draft"
     gate_line = "not run"
     if gate is not None:
+        termination = gate.termination or {}
+        kind = termination.get("kind")
+        if kind == "signaled":
+            result = f"signal {termination.get('signal')}"
+        elif kind == "launch_error":
+            result = f"launch error {termination.get('error_kind', 'unknown')}"
+        else:
+            result = f"exit {termination.get('code', gate.exit_code)}"
         gate_line = (
             f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
-            f"(exit {gate.exit_code}, {gate.duration_seconds:.2f}s)"
+            f"({result}, {gate.duration_seconds:.2f}s)"
         )
     selected_numbers = [issue.number for issue in selected]
     marker = f"<!-- pycastle-run-report:{run.run_id} -->"

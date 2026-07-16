@@ -464,6 +464,114 @@ def test_explicit_execution_record_names_cannot_escape_the_record_directory(
     assert not (tmp_path / "outside-setup-1.json").exists()
 
 
+def test_run_graph_repairs_red_gate_and_passes_directly_to_done(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    for name in ("report", "repair"):
+        (prompts / f"{name}.md").write_text(name)
+    setup = fixture / "setup"
+    setup.write_text("#!/bin/sh\nprintf 'setup\\n' >> timeline\n")
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        "#!/bin/sh\nprintf 'gate\\n' >> timeline\n"
+        "printf 'gate mutation\\n' >> recovery-input\n"
+        "test -f repaired\n"
+    )
+    gate.chmod(0o755)
+    worktree = tmp_path / "run-worktree"
+    worktree.mkdir()
+    graph = orchestrator.PhaseGraph(
+        "report",
+        {
+            "report": orchestrator.RuntimeNode("report", "report.md", "verify"),
+            "verify": orchestrator.GateNode("verify", on_failure="repair"),
+            "repair": orchestrator.RuntimeNode("repair", "repair.md", "report"),
+        },
+    )
+    phases: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            phases.append(phase)
+            if phase == "repair":
+                assert (cwd / "recovery-input").read_text() == "gate mutation\n"
+                (cwd / "repaired").write_text("yes\n")
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    checkpoints: list[str] = []
+    walk, final_gate = orchestrator._walk_execution_graph(
+        None,
+        runtime=Runtime(),
+        fixture_dir=fixture,
+        worktree=worktree,
+        graph=graph,
+        execution=orchestrator.FrozenRunExecution.freeze(fixture, "run-repair"),
+        scope="run",
+        identity="after-run",
+        context="Run facts",
+        checkpoint=lambda node: checkpoints.append(node.name),
+    )
+
+    assert walk.terminal is DONE
+    assert phases == ["report", "repair", "report"]
+    assert checkpoints == phases
+    assert final_gate is not None and final_gate.passed
+    assert (worktree / "timeline").read_text().splitlines() == [
+        "setup",
+        "setup",
+        "gate",
+        "setup",
+        "setup",
+        "setup",
+        "gate",
+    ]
+    records = list((fixture / "runs" / "run-repair" / "executions").glob("*.json"))
+    assert len(records) == 7
+
+
+def test_run_runtime_only_graph_reaches_done_without_hidden_gate(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    (fixture / "prompts").mkdir(parents=True)
+    (fixture / "prompts" / "review.md").write_text("review")
+    for name in ("setup", "gate"):
+        hook = fixture / name
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+    worktree = tmp_path / "run-worktree"
+    worktree.mkdir()
+    phases: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            phases.append(phase)
+            return super().run(prompt, cwd=cwd, phase=phase)
+
+    runtime = Runtime()
+    walk, final_gate = orchestrator._walk_execution_graph(
+        None,
+        runtime=runtime,
+        fixture_dir=fixture,
+        worktree=worktree,
+        graph=orchestrator.PhaseGraph(
+            "review", {"review": orchestrator.RuntimeNode("review", "review.md")}
+        ),
+        execution=orchestrator.FrozenRunExecution.freeze(fixture, "no-gate"),
+        scope="run",
+        identity="after-run",
+        context="Run facts",
+    )
+
+    assert walk.terminal is DONE
+    assert final_gate is None
+    assert phases == ["review"]
+
+
 def _scoped_fixture(
     tmp_path: Path, *, before: bool = False, after: bool = False
 ) -> Path:
