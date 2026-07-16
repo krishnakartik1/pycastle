@@ -1755,6 +1755,14 @@ def run_batch(
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
     selected = tuple(issue.model_copy(deep=True) for issue in selected)
+    frozen_items = getattr(frozen_inputs, "items", None)
+    if frozen_items is not None:
+        if not isinstance(frozen_items, tuple) or not all(
+            isinstance(issue, IssueRef) for issue in frozen_items
+        ):
+            raise ValueError("Frozen readiness Item batch is invalid")
+        if selected != frozen_items:
+            raise ValueError("Selected Items differ from frozen readiness batch")
     frozen_base_commit = getattr(frozen_inputs, "base_commit", None)
     if frozen_base_commit is not None:
         if not isinstance(frozen_base_commit, str) or not re.fullmatch(
@@ -1771,6 +1779,17 @@ def run_batch(
     if not selected:
         return outcome
 
+    frozen_project = getattr(frozen_inputs, "project_fixture", None)
+    if frozen_project is not None:
+        for frozen_file in frozen_project.files:
+            relative_path = Path(frozen_file.relative_path)
+            if (
+                not frozen_file.relative_path
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+            ):
+                raise ValueError("Frozen Project fixture path is invalid")
+
     gate_check = gate_check or _gates_always_pass
     setup = setup or (lambda _worktree: None)
     workspace = workspace or Path.cwd()
@@ -1781,11 +1800,11 @@ def run_batch(
     # non-empty guard. Runtime edits can therefore never rewrite this Run's
     # graphs, prompts, Setup, or Gate.
     project_fixture_dir = fixture_dir
-    frozen_project = getattr(frozen_inputs, "project_fixture", None)
     if frozen_project is not None:
         project_fixture_dir = fixture_dir / "runs" / run_id / "project"
         for frozen_file in frozen_project.files:
-            destination = project_fixture_dir / frozen_file.relative_path
+            relative_path = Path(frozen_file.relative_path)
+            destination = project_fixture_dir / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(frozen_file.content)
             destination.chmod(frozen_file.mode)

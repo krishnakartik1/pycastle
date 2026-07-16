@@ -6,6 +6,7 @@ import json
 import signal
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,7 +14,57 @@ import pytest
 from pycastle import orchestrator
 from pycastle.graph import DONE, HUMAN
 from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
+from pycastle.readiness import FrozenFixtureFile
 from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
+
+
+def test_run_rejects_batch_that_differs_from_frozen_readiness_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    selected = IssueRef(number=1, title="Changed")
+    frozen = IssueRef(number=1, title="Frozen")
+
+    with pytest.raises(ValueError, match="differ from frozen"):
+        orchestrator.run_batch(
+            runtime=MagicMock(),
+            issue_source=MagicMock(),
+            selected=[selected],
+            fixture_dir=tmp_path / ".pycastle",
+            repo="owner/repo",
+            base_branch="main",
+            assignee="octocat",
+            run_id="batch-mismatch",
+            frozen_inputs=SimpleNamespace(items=(frozen,)),
+        )
+
+    assert not (tmp_path / ".pycastle").exists()
+
+
+@pytest.mark.parametrize("relative_path", ["", "../outside", "/tmp/outside"])
+def test_run_rejects_unsafe_frozen_fixture_path_before_side_effects(
+    tmp_path: Path, relative_path: str
+) -> None:
+    item = IssueRef(number=1, title="One")
+    frozen_project = SimpleNamespace(
+        files=(FrozenFixtureFile(relative_path, b"content", 0o644),)
+    )
+
+    with pytest.raises(ValueError, match="fixture path is invalid"):
+        orchestrator.run_batch(
+            runtime=MagicMock(),
+            issue_source=MagicMock(),
+            selected=[item],
+            fixture_dir=tmp_path / ".pycastle",
+            repo="owner/repo",
+            base_branch="main",
+            assignee="octocat",
+            run_id="unsafe-path",
+            frozen_inputs=SimpleNamespace(
+                items=(item,), project_fixture=frozen_project
+            ),
+        )
+
+    assert not (tmp_path / ".pycastle").exists()
 
 
 def test_explicit_item_cycle_repairs_red_gate_with_fresh_runtime_visits(
