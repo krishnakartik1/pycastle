@@ -101,6 +101,47 @@ def test_walk_passes_only_immediate_predecessor_evidence() -> None:
     assert seen == [None, "one"]
 
 
+def test_failure_follows_only_declared_failure_edge() -> None:
+    graph = execution_graph(
+        start="gate",
+        nodes=[
+            gate_node("gate", on_success="wrong", on_failure="repair"),
+            runtime_node("wrong", "wrong.md"),
+            runtime_node("repair", "repair.md"),
+        ],
+    )
+    visited = []
+
+    def visit(entry):
+        visited.append(entry.node.name)
+        return NodeOutcome(entry.node.name != "gate")
+
+    assert walk_execution_graph(graph, visit).terminal is DONE
+    assert visited == ["gate", "repair"]
+
+
+def test_cycle_limit_is_per_node_and_replaces_predecessor_each_edge() -> None:
+    graph = execution_graph(
+        start="gate",
+        nodes=[
+            gate_node("gate", on_failure="repair"),
+            runtime_node("repair", "repair.md", on_success="gate"),
+        ],
+    )
+    seen = []
+
+    def visit(entry):
+        seen.append((entry.node.name, entry.ordinal, entry.predecessor))
+        return NodeOutcome(
+            entry.node.name == "repair", f"{entry.node.name}-{entry.ordinal}"
+        )
+
+    result = walk_execution_graph(graph, visit)
+    assert result.terminal is HUMAN
+    assert len(seen) == 20
+    assert seen[-2:] == [("gate", 10, "repair-9"), ("repair", 10, "gate-10")]
+
+
 def test_load_run_reads_new_fixture_vocabulary(tmp_path: Path) -> None:
     fixture = tmp_path / ".pycastle"
     fixture.mkdir()

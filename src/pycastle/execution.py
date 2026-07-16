@@ -189,6 +189,22 @@ _CONTROL = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\
 _CREDENTIAL = re.compile(
     rb"(?i)(authorization\s*:\s*(?:bearer|basic)\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+"
 )
+_SENSITIVE_ENVIRONMENT_NAME = re.compile(
+    r"(?i)(?:^|_)(?:auth(?:entication|orization)?|credentials?|key|pass(?:word|wd)|secret|token)(?:_|$)"
+)
+
+
+def sensitive_environment_values(environment: dict[str, str]) -> tuple[str, ...]:
+    """Select deterministic, non-trivial secrets from a process environment."""
+    return tuple(
+        sorted(
+            {
+                value
+                for name, value in environment.items()
+                if _SENSITIVE_ENVIRONMENT_NAME.search(name) and len(value) >= 4
+            }
+        )
+    )
 
 
 def sanitize_evidence(value: bytes, *, sensitive_values: tuple[str, ...] = ()) -> str:

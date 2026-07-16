@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import signal
@@ -42,7 +43,11 @@ from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
-from .execution import execute_hook, project_gate_evidence
+from .execution import (
+    execute_hook,
+    project_gate_evidence,
+    sensitive_environment_values,
+)
 from .graph import (
     HUMAN,
     GateNode,
@@ -311,6 +316,7 @@ class ExplicitItemExecution:
     def invoke_gate(
         self, worktree: Path, *, identity: str, node: str, ordinal: int
     ) -> NodeOutcome:
+        environment = dict(os.environ)
         record = execute_hook(
             self.gate,
             cwd=worktree,
@@ -320,8 +326,16 @@ class ExplicitItemExecution:
                 f"{self._record_identity(identity)}-"
                 f"{self._record_identity(node)}-gate-{ordinal}.json"
             ),
+            environment=environment,
         )
-        return NodeOutcome(record.success, project_gate_evidence(record, node=node))
+        return NodeOutcome(
+            record.success,
+            project_gate_evidence(
+                record,
+                node=node,
+                sensitive_values=sensitive_environment_values(environment),
+            ),
+        )
 
 
 def make_fixture_setup(

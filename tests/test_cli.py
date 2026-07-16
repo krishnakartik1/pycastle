@@ -350,6 +350,125 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
+def _run_cycle_from_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, repair: bool
+) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str]]:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "work.md").write_text("work")
+    (prompts / "repair.md").write_text("repair")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md',on_success='verify'),"
+        "gate_node('verify',on_failure='repair'),"
+        "runtime_node('repair','repair.md',on_success='verify')]))\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(f"#!/bin/sh\nprintf 'setup\\n' >> '{timeline}'\n")
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(f"#!/bin/sh\nprintf 'gate\\n' >> '{timeline}'\ntest -f repaired\n")
+    gate.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ):
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    runtime_phases: list[str] = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str):
+            runtime_phases.append(phase)
+            result = super().run(prompt, cwd=cwd, phase=phase)
+            if repair and phase == "repair":
+                (cwd / "repaired").write_text("repaired\n")
+            return result
+
+    source = MagicMock()
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-cycle-135")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    monkeypatch.setattr(
+        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(
+        cli, "make_fixture_setup", lambda *_args, **_kwargs: MagicMock()
+    )
+    original_run_loop = cli.run_loop
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+    code = main(["run", "--sandbox", "host", "--runtime", "stub"])
+    return code, source, process_calls, outcomes, runtime_phases
+
+
+def test_cli_repairs_item_through_explicit_gate_cycle_and_publishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    code, source, calls, outcomes, phases = _run_cycle_from_cli(
+        monkeypatch, tmp_path, repair=True
+    )
+    assert code == 0
+    assert outcomes[0].completed == [1]
+    assert phases == ["work", "repair"]
+    assert (tmp_path / "timeline").read_text().splitlines().count("gate") == 2
+    source.mark_for_human.assert_not_called()
+    assert any(
+        call[:3] == ["gh", "pr", "create"] and "--draft" in call for call in calls
+    )
+    assert any(call[:3] == ["gh", "pr", "ready"] for call in calls)
+
+
+def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    code, source, calls, outcomes, phases = _run_cycle_from_cli(
+        monkeypatch, tmp_path, repair=False
+    )
+    assert code != 0
+    assert outcomes[0].completed == []
+    assert phases == ["work"] + ["repair"] * 10
+    timeline = (tmp_path / "timeline").read_text().splitlines()
+    assert timeline.count("gate") == 10
+    # Run bootstrap, initial work, and ten visits to each cycle node.
+    assert timeline.count("setup") == 22
+    source.mark_for_human.assert_called_once_with(1)
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in calls)
+
+
 @pytest.mark.parametrize(
     ("outcome", "expected"),
     [

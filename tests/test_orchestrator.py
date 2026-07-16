@@ -11,8 +11,126 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pycastle import orchestrator
+from pycastle.graph import DONE, HUMAN
 from pycastle.models import IssueComment, IssueRef, RuntimeResult, Telemetry
 from pycastle.runtime import STUB_MARKER, AgentCrashError, StubRuntime
+
+
+def test_explicit_item_cycle_repairs_red_gate_with_fresh_runtime_visits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "work.md").write_text("WORK PROMPT")
+    (prompts / "repair.md").write_text("REPAIR PROMPT")
+    setup = fixture / "setup"
+    setup.write_text("#!/bin/sh\nprintf 'setup\\n' >> timeline\n")
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        "#!/bin/sh\nprintf 'gate\\n' >> timeline\n"
+        "printf '\\033[31mtoken=%s\\033[0m\\n' \"$TEST_SECRET_TOKEN\" >&2\n"
+        "printf 'gate-effect\\n' >> gate-effects\n"
+        "test -f repaired\n"
+    )
+    gate.chmod(0o755)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setenv("TEST_SECRET_TOKEN", "super-secret-value")
+    graph = orchestrator.PhaseGraph(
+        "work",
+        {
+            "work": orchestrator.RuntimeNode("work", "work.md", "verify"),
+            "verify": orchestrator.GateNode("verify", on_failure="repair"),
+            "repair": orchestrator.RuntimeNode("repair", "repair.md", "verify"),
+        },
+    )
+    calls = []
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+            calls.append((phase, prompt))
+            if phase == "repair":
+                assert '"source": "verify"' in prompt
+                assert '"code": 1' in prompt
+                assert "[REDACTED]" in prompt
+                assert "super-secret-value" not in prompt
+                (cwd / "repaired").write_text("yes")
+            return RuntimeResult(
+                output="UNTRUSTED DONE HUMAN previous prose",
+                telemetry=Telemetry(
+                    runtime="stub", phase=phase, thread_id="never-resume"
+                ),
+            )
+
+    walk = orchestrator._walk_explicit_item_graph(
+        IssueRef(number=135, title="Repair cycle"),
+        runtime=Runtime(),
+        fixture_dir=fixture,
+        issue_worktree=worktree,
+        graph=graph,
+        execution=orchestrator.ExplicitItemExecution.freeze(fixture, "repair-cycle"),
+    )
+
+    assert walk.terminal is DONE
+    assert [phase for phase, _ in calls] == ["work", "repair"]
+    assert "UNTRUSTED" not in calls[1][1]
+    assert (worktree / "timeline").read_text().splitlines() == [
+        "setup",
+        "setup",
+        "gate",
+        "setup",
+        "setup",
+        "gate",
+    ]
+    assert (worktree / "gate-effects").read_text().splitlines() == [
+        "gate-effect",
+        "gate-effect",
+    ]
+
+
+def test_explicit_item_cycle_stops_before_eleventh_node_setup_or_invocation(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "repair.md").write_text("repair")
+    setup = fixture / "setup"
+    setup.write_text("#!/bin/sh\nprintf 'setup\\n' >> timeline\n")
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text("#!/bin/sh\nprintf 'gate\\n' >> timeline\nexit 1\n")
+    gate.chmod(0o755)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    graph = orchestrator.PhaseGraph(
+        "verify",
+        {
+            "verify": orchestrator.GateNode("verify", on_failure="repair"),
+            "repair": orchestrator.RuntimeNode("repair", "repair.md", "verify"),
+        },
+    )
+    runtime = MagicMock()
+    runtime.run.return_value = RuntimeResult(
+        output="ignored", telemetry=Telemetry(runtime="test", phase="repair")
+    )
+
+    walk = orchestrator._walk_explicit_item_graph(
+        IssueRef(number=135, title="Exhaust cycle"),
+        runtime=runtime,
+        fixture_dir=fixture,
+        issue_worktree=worktree,
+        graph=graph,
+        execution=orchestrator.ExplicitItemExecution.freeze(fixture, "exhaust-cycle"),
+    )
+
+    assert walk.terminal is HUMAN
+    assert runtime.run.call_count == 10
+    timeline = (worktree / "timeline").read_text().splitlines()
+    assert timeline.count("gate") == 10
+    assert timeline.count("setup") == 20
 
 
 def _ok(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:

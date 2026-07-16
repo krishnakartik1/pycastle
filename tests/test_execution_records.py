@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pycastle.execution import (
+    EDGE_TAIL_LIMIT,
     HALF_STREAM_LIMIT,
     CapturedStream,
     Exited,
@@ -12,6 +13,7 @@ from pycastle.execution import (
     Signaled,
     execute_hook,
     project_gate_evidence,
+    sensitive_environment_values,
 )
 
 
@@ -92,3 +94,83 @@ def test_gate_evidence_is_bounded_sanitized_and_path_free(tmp_path: Path) -> Non
     assert "[REDACTED]" in evidence["stderr"]
     assert "\x1b" not in evidence["stderr"]
     assert "secret-path" not in repr(evidence)
+
+
+@pytest.mark.parametrize(
+    ("termination", "expected"),
+    [
+        (Exited(37), {"kind": "exited", "code": 37}),
+        (Signaled(9), {"kind": "signaled", "signal": 9}),
+        (
+            LaunchError("ENOENT", 2, "missing"),
+            {
+                "kind": "launch_error",
+                "error_kind": "ENOENT",
+                "errno": 2,
+                "message": "missing",
+            },
+        ),
+    ],
+)
+def test_gate_evidence_preserves_discriminated_termination(
+    termination, expected
+) -> None:
+    from pycastle.execution import ExecutionRecord
+
+    evidence = project_gate_evidence(
+        ExecutionRecord(
+            "/private/frozen/gate",
+            "item",
+            termination,
+            CapturedStream(b""),
+            CapturedStream(b""),
+        ),
+        node="verify",
+    )
+    assert evidence["termination"] == expected
+    assert "/private/frozen/gate" not in repr(evidence)
+
+
+def test_gate_evidence_tails_and_sanitizes_streams_independently() -> None:
+    from pycastle.execution import ExecutionRecord
+
+    stdout = b"discarded-secret" + b"x" * EDGE_TAIL_LIMIT + b"stdout-end"
+    stderr = b"y" * EDGE_TAIL_LIMIT + b"\033]0;title\007\xff password=hunter2"
+    evidence = project_gate_evidence(
+        ExecutionRecord(
+            "/gate",
+            "item",
+            Exited(1),
+            CapturedStream.from_bytes(stdout),
+            CapturedStream.from_bytes(stderr),
+        ),
+        node="verify",
+        sensitive_values=("hunter2",),
+    )
+    assert (
+        evidence["stdout"]
+        == (b"x" * (EDGE_TAIL_LIMIT - len(b"stdout-end")) + b"stdout-end").decode()
+    )
+    assert "[REDACTED]" in evidence["stderr"]
+    assert "\x1b" not in evidence["stderr"]
+    assert "\ufffd" in evidence["stderr"]
+
+
+def test_sensitive_environment_values_selects_only_credential_bearing_names() -> None:
+    assert sensitive_environment_values(
+        {
+            "HOME": "/home/person",
+            "PATH": "/bin",
+            "GITHUB_TOKEN": "github-secret-value",
+            "SERVICE_API_KEY": "api-secret-value",
+            "DATABASE_PASSWORD": "database-secret-value",
+            "AUTH_HEADER": "authorization-secret-value",
+            "EMPTY_SECRET": "",
+            "SHORT_TOKEN": "abc",
+        }
+    ) == (
+        "api-secret-value",
+        "authorization-secret-value",
+        "database-secret-value",
+        "github-secret-value",
+    )
