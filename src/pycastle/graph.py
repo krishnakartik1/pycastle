@@ -82,12 +82,20 @@ def gate_node(
 
 
 def execution_graph(*, start: str, nodes: Sequence[ExecutionNode]) -> ExecutionGraph:
+    if not isinstance(start, str) or not start:
+        raise ValueError("start must name a declared node")
     by_name: dict[str, ExecutionNode] = {}
     for node in nodes:
         if not isinstance(node, RuntimeNode | GateNode):
             raise TypeError("execution graph nodes must be RuntimeNode or GateNode")
-        if not node.name:
-            raise ValueError("Execution node names must not be empty")
+        if not isinstance(node.name, str) or not node.name:
+            raise ValueError("Execution node names must be non-empty strings")
+        if isinstance(node, RuntimeNode) and (
+            not isinstance(node.prompt, str) or not node.prompt
+        ):
+            raise ValueError(
+                f"Runtime node {node.name!r} prompt must be a non-empty string"
+            )
         if node.name in by_name:
             raise ValueError(f"Duplicate node name: {node.name!r}")
         by_name[node.name] = node

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import BinaryIO, Literal, TypeAlias
 
 HALF_STREAM_LIMIT = 8 * 1024 * 1024
 EDGE_TAIL_LIMIT = 16 * 1024
@@ -19,8 +19,14 @@ EDGE_TAIL_LIMIT = 16 * 1024
 @dataclass(frozen=True)
 class CapturedStream:
     first: bytes
-    last: bytes
+    last: bytes = b""
     omitted_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.omitted_bytes < 0:
+            raise ValueError("omitted_bytes must not be negative")
+        if len(self.retained) > 2 * HALF_STREAM_LIMIT:
+            raise ValueError("captured stream exceeds the 16 MiB retention limit")
 
     @classmethod
     def from_bytes(cls, value: bytes) -> CapturedStream:
@@ -37,7 +43,27 @@ class CapturedStream:
         return self.first + self.last
 
     def tail(self, size: int = EDGE_TAIL_LIMIT) -> bytes:
+        if size < 0:
+            raise ValueError("tail size must not be negative")
+        if size == 0:
+            return b""
         return self.retained[-size:]
+
+    @classmethod
+    def from_file(cls, stream: BinaryIO) -> CapturedStream:
+        """Capture the bounded first/final stream regions from a binary file."""
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        if size <= 2 * HALF_STREAM_LIMIT:
+            return cls(stream.read())
+        first = stream.read(HALF_STREAM_LIMIT)
+        stream.seek(-HALF_STREAM_LIMIT, os.SEEK_END)
+        return cls(
+            first,
+            stream.read(HALF_STREAM_LIMIT),
+            size - 2 * HALF_STREAM_LIMIT,
+        )
 
 
 @dataclass(frozen=True)
@@ -126,30 +152,34 @@ def execute_hook(
     """Execute a hook by shebang, with no args and closed standard input."""
     env = dict(environment if environment is not None else os.environ)
     env["PYCASTLE_SCOPE"] = scope
-    try:
-        process = subprocess.run(
-            [str(executable)],
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
-        termination: Termination = _termination(process.returncode)
-        stdout, stderr = process.stdout, process.stderr
-    except OSError as error:
-        termination = LaunchError(
-            errno_module.errorcode.get(error.errno or 0, type(error).__name__),
-            error.errno,
-            str(error),
-        )
-        stdout = stderr = b""
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
+        try:
+            process = subprocess.Popen(
+                [str(executable)],
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+            termination: Termination = _termination(process.wait())
+        except OSError as error:
+            termination = LaunchError(
+                errno_module.errorcode.get(error.errno or 0, type(error).__name__),
+                error.errno,
+                str(error),
+            )
+        stdout = CapturedStream.from_file(stdout_file)
+        stderr = CapturedStream.from_file(stderr_file)
     record = ExecutionRecord(
         str(executable),
         scope,
         termination,
-        CapturedStream.from_bytes(stdout),
-        CapturedStream.from_bytes(stderr),
+        stdout,
+        stderr,
     )
     persist_record(record, record_path)
     return record

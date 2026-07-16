@@ -515,14 +515,6 @@ WORKDIR /home/pycastle
 """
 
 
-def _setup_script(_target_dir: Path) -> str:
-    return _SETUP_NOOP
-
-
-def _dockerfile(*, python: bool) -> str:
-    return _DOCKERFILE
-
-
 _GITIGNORE = """\
 # PyCastle run output (transient): run logs and generated run artifacts.
 logs/
@@ -543,27 +535,23 @@ worktrees/
 """
 
 
-def _fixture_files(
-    sandbox: SandboxChoice, *, python: bool, setup: str
-) -> dict[str, str]:
+def _fixture_files(sandbox: SandboxChoice) -> dict[str, str]:
     """Return the fixture's relative paths mapped to their text content.
 
     The mapping is identical for both choices except the ``sandbox`` marker,
     which records ``host`` or ``docker`` -- the one observable difference
-    between a host-first and a Docker-first scaffold -- and the Dockerfile, whose
-    PROJECT EXTENSION POINT carries the gate toolchain when ``python`` is set.
+    between a host-first and a Docker-first scaffold.
 
     Args:
         sandbox: The host-first/Docker-first choice recorded in the marker file.
-        python: Whether to emit the Python Dockerfile (gate toolchain pre-filled).
     """
     return {
         "main.py": _MAIN_PY,
         "gate": _GATE,
-        "setup": setup,
+        "setup": _SETUP_NOOP,
         SANDBOX_MARKER: f"{sandbox}\n",
         VERSION_MARKER: f"{__version__}\n",
-        "Dockerfile": _dockerfile(python=python),
+        "Dockerfile": _DOCKERFILE,
         ".gitignore": _GITIGNORE,
         "prompts/plan.md": _PLAN_MD,
         "prompts/implement.md": _IMPLEMENT_MD,
@@ -580,11 +568,11 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
 
     ``sandbox`` is the host-first/Docker-first choice the CLI collected; it is
     recorded in the fixture's ``sandbox`` marker file and is the only difference
-    between the two scaffolds. The scaffolded ``main.py`` uses the finalized
-    declarative Builder API (``build(start=, phases=[phase(...)])`` with the
-    ``DONE``/``HUMAN`` terminals) and encodes the conservative default flow
-    ``plan`` -> ``implement`` -> ``review`` -> ``DONE``, which loads and walks
-    end to end before any customization.
+    between the two scaffolds. The scaffolded ``main.py`` uses the declarative
+    Execution graph API with explicit Runtime and Gate nodes and encodes the
+    conservative default flow
+    ``plan`` -> ``implement`` -> ``review`` -> ``verify``, with explicit repair
+    cycles after a red Gate.
 
     Returns the written files (``setup`` and ``gate`` are left executable). Raises
     :class:`FixtureExistsError` if ``target_dir`` already has a ``.pycastle/``
@@ -601,19 +589,8 @@ def scaffold_fixture(target_dir: Path, *, sandbox: SandboxChoice) -> list[Path]:
             "remove it first or scaffold into a fresh repo."
         )
 
-    # Detect a Python project so the agent image can carry the gate toolchain
-    # (#19): the Docker sandbox runs the gate inside the image, and a
-    # toolchain-less image makes a Python project's in-container gate fail loud
-    # (#28). Presence-check only -- an empty/malformed pyproject.toml still counts.
-    python = any(
-        (target_dir / manifest).exists()
-        for manifest in ("pyproject.toml", "requirements.txt")
-    )
-
     written: list[Path] = []
-    for relative, content in _fixture_files(
-        sandbox, python=python, setup=_setup_script(target_dir)
-    ).items():
+    for relative, content in _fixture_files(sandbox).items():
         path = fixture_dir / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)

@@ -48,6 +48,21 @@ def test_graph_rejects_duplicate_and_unknown_destinations() -> None:
         )
 
 
+@pytest.mark.parametrize("name", ["", None, 0])
+def test_graph_rejects_invalid_node_names(name: object) -> None:
+    with pytest.raises(ValueError, match="non-empty strings"):
+        execution_graph(start="gate", nodes=[GateNode(name)])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("prompt", ["", None, 0])
+def test_graph_rejects_invalid_runtime_prompts(prompt: object) -> None:
+    with pytest.raises(ValueError, match="prompt must be a non-empty string"):
+        execution_graph(
+            start="work",
+            nodes=[RuntimeNode("work", prompt)],  # type: ignore[arg-type]
+        )
+
+
 def test_run_requires_item_and_allows_optional_scope_graphs() -> None:
     item = execution_graph(start="item", nodes=[gate_node("item")])
     after = execution_graph(start="after", nodes=[gate_node("after")])

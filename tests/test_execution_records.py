@@ -1,5 +1,8 @@
 import signal
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from pycastle.execution import (
     HALF_STREAM_LIMIT,
@@ -55,6 +58,24 @@ def test_stream_keeps_first_and_last_eight_mib_and_exact_omission() -> None:
     assert stream.first == b"a" * HALF_STREAM_LIMIT
     assert stream.last == b"z" * HALF_STREAM_LIMIT
     assert stream.omitted_bytes == len(b"middle")
+
+
+def test_stream_boundary_and_invalid_limits() -> None:
+    exact = b"x" * (2 * HALF_STREAM_LIMIT)
+    assert CapturedStream.from_bytes(exact).retained == exact
+    assert CapturedStream.from_bytes(exact).omitted_bytes == 0
+    assert CapturedStream(b"value", b"").tail(0) == b""
+    with pytest.raises(ValueError, match="negative"):
+        CapturedStream(b"", b"", omitted_bytes=-1)
+    with pytest.raises(ValueError, match="negative"):
+        CapturedStream(b"value", b"").tail(-1)
+
+
+def test_file_capture_matches_bytes_capture_across_truncation_boundary() -> None:
+    value = b"a" * HALF_STREAM_LIMIT + b"middle" + b"z" * HALF_STREAM_LIMIT
+    with tempfile.TemporaryFile() as stream:
+        stream.write(value)
+        assert CapturedStream.from_file(stream) == CapturedStream.from_bytes(value)
 
 
 def test_gate_evidence_is_bounded_sanitized_and_path_free(tmp_path: Path) -> None:
