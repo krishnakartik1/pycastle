@@ -1306,6 +1306,14 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def snapshot(number: int) -> object:
+        def freeze(config: object, items: tuple[IssueRef, ...]) -> object:
+            frozen = MagicMock()
+            frozen.items = items
+            frozen.sandbox = config.sandbox
+            frozen.runtime = config.runtime
+            frozen.agent_image = config.agent_image
+            return frozen
+
         return evaluate_readiness(
             configuration(),
             ReadinessDependencies(
@@ -1313,14 +1321,13 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
                 eligible_items=lambda _configuration: [
                     IssueRef(number=number, title=f"Item {number}")
                 ],
+                freeze_inputs=freeze,
             ),
         )
 
     evaluations = MagicMock(side_effect=[snapshot(1), snapshot(2)])
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", evaluations)
     monkeypatch.setattr(cli, "_build_runtime", MagicMock())
-    monkeypatch.setattr(cli, "make_fixture_gate_check", MagicMock())
-    monkeypatch.setattr(cli, "make_fixture_setup", MagicMock())
     monkeypatch.setattr(cli, "GitHubIssueSource", MagicMock())
     monkeypatch.setattr(cli, "_make_run_id", lambda: "current")
     run_loop = MagicMock()

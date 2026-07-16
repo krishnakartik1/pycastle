@@ -67,6 +67,79 @@ def test_run_rejects_unsafe_frozen_fixture_path_before_side_effects(
     assert not (tmp_path / ".pycastle").exists()
 
 
+def test_run_bootstraps_then_rechecks_frozen_items_and_skips_stale_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    items = tuple(IssueRef(number=n, title=f"Item {n}") for n in (10, 20, 30))
+    events: list[str] = []
+    source = MagicMock()
+    source.is_still_eligible.side_effect = lambda item, **_kwargs: (
+        events.append(f"recheck:{item.number}") or item.number != 20
+    )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run",
+        lambda _fixture: SimpleNamespace(before=None, item=MagicMock(), after=None),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "create_branch",
+        lambda *_args, **_kwargs: events.append("run-branch"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "add_worktree",
+        lambda *_args, **_kwargs: events.append("run-worktree"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "cleanup_worktree", lambda *_args, **_kwargs: None
+    )
+
+    def work(item: IssueRef, **_kwargs: object) -> orchestrator.IssueOutcome:
+        events.append(f"claim-and-work:{item.number}")
+        return orchestrator.IssueOutcome(item, f"issue-{item.number}", False)
+
+    monkeypatch.setattr(orchestrator, "_work_issue", work)
+
+    outcome = orchestrator.run_batch(
+        runtime=MagicMock(),
+        issue_source=source,
+        selected=items,
+        fixture_dir=tmp_path / ".pycastle",
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="stale-middle",
+        iterations=3,
+        setup=lambda _worktree: events.append("bootstrap-setup"),
+        workspace=tmp_path,
+        frozen_inputs=SimpleNamespace(items=items),
+    )
+
+    assert events == [
+        "run-branch",
+        "run-worktree",
+        "bootstrap-setup",
+        "recheck:10",
+        "claim-and-work:10",
+        "recheck:20",
+        "recheck:30",
+        "claim-and-work:30",
+    ]
+    assert outcome.stale == [20]
+    assert outcome.skipped == [10, 20, 30]
+    assert [item.issue.number for item in outcome.issues] == [10, 30]
+    source.claim.assert_not_called()
+    source.release.assert_not_called()
+    assert (
+        "stale"
+        in (tmp_path / ".pycastle" / "runs" / "stale-middle" / "run.log")
+        .read_text()
+        .lower()
+    )
+
+
 def test_explicit_item_cycle_repairs_red_gate_with_fresh_runtime_visits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -96,6 +96,16 @@ class IssueSource(ABC):
         """Return the open work items ready for an agent."""
 
     @abstractmethod
+    def is_still_eligible(
+        self,
+        frozen_item: IssueRef,
+        *,
+        assignee: str,
+        include_unassigned: bool,
+    ) -> bool:
+        """Recheck one frozen Item's current ownership eligibility."""
+
+    @abstractmethod
     def claim(self, number: int, *, assignee: str) -> None:
         """Claim an issue so a second run does not collide on it."""
 
@@ -222,6 +232,53 @@ class GitHubIssueSource(IssueSource):
                 )
             )
         return issues
+
+    def is_still_eligible(
+        self,
+        frozen_item: IssueRef,
+        *,
+        assignee: str,
+        include_unassigned: bool,
+    ) -> bool:
+        """Recheck only the mutable eligibility facts for one frozen Item."""
+        result = self._run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(frozen_item.number),
+                "-R",
+                self.repo,
+                "--json",
+                "number,state,labels,assignees",
+            ],
+            capture=True,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub Item eligibility recheck failed")
+        try:
+            item = json.loads((result.stdout or "").strip())
+            if not isinstance(item, dict) or item.get("number") != frozen_item.number:
+                raise ValueError("GitHub returned a different Item")
+            state = item["state"]
+            raw_labels = item["labels"]
+            raw_assignees = item["assignees"]
+            if not isinstance(state, str) or not isinstance(raw_labels, list):
+                raise ValueError("GitHub returned malformed eligibility facts")
+            if not isinstance(raw_assignees, list):
+                raise ValueError("GitHub returned malformed eligibility facts")
+            labels = [
+                label["name"] if isinstance(label, dict) else label
+                for label in raw_labels
+            ]
+            current_assignees = assignee_logins(item)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise OSError("GitHub Item eligibility recheck failed") from exc
+
+        ownership_matches = assignee in current_assignees or (
+            include_unassigned and not current_assignees
+        )
+        return state.upper() == "OPEN" and self.label in labels and ownership_matches
 
     def claim(self, number: int, *, assignee: str) -> None:
         """Assign the issue and drop the ready label so other runs skip it."""

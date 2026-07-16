@@ -531,6 +531,7 @@ class RunOutcome:
     run_id: str
     run_branch: str
     selected: list[int] = field(default_factory=list)
+    stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
     pr_ready: bool = False
@@ -1752,6 +1753,7 @@ def run_batch(
     default, so a normal run writes no transcript log and behaves exactly as
     before.
     """
+    fixture_dir = fixture_dir.resolve()
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
     selected = tuple(issue.model_copy(deep=True) for issue in selected)
@@ -1924,6 +1926,30 @@ def run_batch(
     with _sigint_as_keyboard_interrupt():
         try:
             for issue in selected:
+                try:
+                    eligible = issue_source.is_still_eligible(
+                        issue,
+                        assignee=assignee,
+                        include_unassigned=include_unassigned,
+                    )
+                except Exception as exc:
+                    if not outcome.completed:
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        raise
+                    outcome.succeeded = False
+                    outcome.stopping_point = (
+                        f"Item #{issue.number} eligibility recheck failure: {exc}"
+                    )
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    break
+                if not eligible:
+                    outcome.stale.append(issue.number)
+                    _append_log(
+                        fixture_dir,
+                        run_id,
+                        f"Item #{issue.number} is stale; skipped without mutation",
+                    )
+                    continue
                 try:
                     item_outcome = _work_issue(
                         issue,

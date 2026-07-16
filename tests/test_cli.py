@@ -10,15 +10,17 @@ from unittest.mock import MagicMock
 import pytest
 from packaging.version import Version
 
-from pycastle import cli
+from pycastle import cli, readiness
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
+from pycastle.graph import load_run
 from pycastle.issues import IssueRef
 from pycastle.orchestrator import IssueOutcome, RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
     CHECK_IDS,
     EligibleItem,
+    FrozenReadinessInputs,
     ReadinessCheck,
     ReadinessConfiguration,
     ReadinessOutcome,
@@ -65,6 +67,32 @@ def ready_run_preflight(
             include_unassigned=args.include_unassigned,
             item_limit=args.iterations,
         )
+        selected = (IssueRef(number=1, title="One"),)
+        main_file = cli.FIXTURE_DIR / "main.py"
+        if main_file.is_file():
+            project = readiness._freeze_project_fixture(
+                cli.FIXTURE_DIR, load_run(cli.FIXTURE_DIR)
+            )
+            base_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            frozen = FrozenReadinessInputs(
+                base_commit,
+                project,
+                selected,
+                configuration.sandbox,
+                configuration.runtime,
+                configuration.agent_image,
+            )
+        else:
+            frozen = MagicMock()
+            frozen.items = selected
+            frozen.sandbox = configuration.sandbox
+            frozen.runtime = configuration.runtime
+            frozen.agent_image = configuration.agent_image
         return ReadinessReport(
             schema_version=1,
             outcome=ReadinessOutcome.READY,
@@ -74,7 +102,8 @@ def ready_run_preflight(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
             eligible_items=(EligibleItem(1, "One"),),
-            selected_items=(IssueRef(number=1, title="One"),),
+            selected_items=selected,
+            frozen_inputs=frozen,
         )
 
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", ready)
@@ -324,12 +353,6 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-explicit-134")
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: runtime)
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
-    monkeypatch.setattr(
-        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: MagicMock()
-    )
-    monkeypatch.setattr(
-        cli, "make_fixture_setup", lambda *_args, **_kwargs: MagicMock()
-    )
 
     original_run_loop = cli.run_loop
     outcomes: list[RunOutcome] = []
@@ -418,12 +441,6 @@ def _run_cycle_from_cli(
     monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-cycle-135")
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
-    monkeypatch.setattr(
-        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: MagicMock()
-    )
-    monkeypatch.setattr(
-        cli, "make_fixture_setup", lambda *_args, **_kwargs: MagicMock()
-    )
     original_run_loop = cli.run_loop
 
     def run_from_cli(**kwargs: object) -> RunOutcome:
@@ -559,6 +576,20 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
         )
 
     selected = (IssueRef(number=1, title="One"), IssueRef(number=2, title="Two"))
+    frozen = FrozenReadinessInputs(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(),
+        readiness._freeze_project_fixture(fixture, load_run(fixture)),
+        selected,
+        "host",
+        "stub",
+        None,
+    )
     monkeypatch.setattr(
         cli,
         "_evaluate_cli_readiness",
@@ -582,6 +613,7 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
             ),
             eligible_items=tuple(EligibleItem(x.number, x.title) for x in selected),
             selected_items=selected,
+            frozen_inputs=frozen,
         ),
     )
     source = MagicMock()
@@ -991,19 +1023,10 @@ def test_run_host_builds_host_gate_check(
     monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
 
-    sentinel = object()
-    factory_calls: list[dict[str, object]] = []
-
-    def fake_factory(fixture_dir: Path, **kwargs: object) -> object:
-        factory_calls.append({"fixture_dir": fixture_dir, **kwargs})
-        return sentinel
-
-    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
-
     captured: dict[str, object] = {}
 
-    def fake_run_loop(*, gate_check: object, **_kwargs: object) -> MagicMock:
-        captured["gate_check"] = gate_check
+    def fake_run_loop(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
         outcome = MagicMock()
         outcome.issues = []
         return outcome
@@ -1012,12 +1035,8 @@ def test_run_host_builds_host_gate_check(
 
     assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
 
-    assert len(factory_calls) == 1
-    call = factory_calls[0]
-    assert call["fixture_dir"] == cli.FIXTURE_DIR
-    # No docker kwargs on the host path.
-    assert "sandbox" not in call
-    assert captured["gate_check"] is sentinel
+    assert "gate_check" not in captured
+    assert captured["frozen_inputs"] is not None
 
 
 def test_run_docker_builds_docker_gate_check(
@@ -1039,14 +1058,6 @@ def test_run_docker_builds_docker_gate_check(
     monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
 
-    factory_calls: list[dict[str, object]] = []
-
-    def fake_factory(fixture_dir: Path, **kwargs: object) -> object:
-        factory_calls.append({"fixture_dir": fixture_dir, **kwargs})
-        return object()
-
-    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
-
     captured: dict[str, object] = {}
 
     def fake_build_runtime(
@@ -1066,16 +1077,6 @@ def test_run_docker_builds_docker_gate_check(
 
     assert main(["run", "--sandbox", "docker", "--runtime", "claude"]) == 0
 
-    assert len(factory_calls) == 1
-    call = factory_calls[0]
-    assert call["fixture_dir"] == cli.FIXTURE_DIR
-    assert call["sandbox"] == "docker"
-    assert call["runtime_name"] == "claude"
-    assert call["workspace"] == tmp_path
-    assert call["image"] == cli._resolve_agent_image(None, cli.FIXTURE_DIR)
-    # The gate runs in the SAME image the phases run in.
-    assert call["image"] == captured["runtime_image"]
-
 
 def test_run_does_not_repeat_doctor_gate_toolchain_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1085,9 +1086,6 @@ def test_run_does_not_repeat_doctor_gate_toolchain_probe(
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     events: list[str] = []
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: object()
-    )
 
     def resolve_repo() -> str:
         events.append("resolve-repo")

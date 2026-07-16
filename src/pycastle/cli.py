@@ -17,8 +17,6 @@ from .compatibility import FixtureCompatibilityError
 from .issues import GitHubIssueSource
 from .orchestrator import (
     PruneError,
-    make_fixture_gate_check,
-    make_fixture_setup,
     prune_run_branches,
 )
 from .orchestrator import run_batch as run_loop
@@ -428,6 +426,16 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
 
 def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
     """Return whether every eligible Item has matching Run-only content."""
+    frozen = report.frozen_inputs
+    if frozen is None or frozen.items != report.selected_items:
+        return False
+    configuration = report.configuration
+    if (
+        frozen.sandbox != configuration.sandbox
+        or frozen.runtime != configuration.runtime
+        or frozen.agent_image != configuration.agent_image
+    ):
+        return False
     if len(report.selected_items) != len(report.eligible_items):
         return False
     return all(
@@ -440,7 +448,6 @@ def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
-    workspace = Path.cwd()
     # Readiness is deliberately the first Run operation. It may prepare a
     # content-addressed Agent image, but creates no Run ID, record, branch,
     # worktree, claim, phase, Setup invocation, or ordinary Gate invocation.
@@ -454,17 +461,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 logger.error("Readiness %s: %s", check.id, check.summary)
         return 1
     if not _run_has_complete_frozen_batch(report):
-        logger.error("Readiness did not return a complete frozen Item batch.")
+        logger.error("Readiness did not return a complete matching frozen snapshot.")
         return 1
 
     configuration = report.configuration
-    # Resolve the agent image once, before the run loop, so a missing image is
-    # built exactly once rather than per iteration. Resolution is docker-only.
-    # The single --sandbox flag drives BOTH the runtime and the gate onto the
-    # same side (#28): under docker the gate runs inside the SAME resolved agent
-    # image as the phases, wrapped through the same sandbox wrapper; under host it
-    # runs as a host subprocess (unchanged). Building the gate-check here, in the
-    # branch that already resolves the image, keeps them in lockstep.
+    workspace = Path.cwd()
     if configuration.sandbox == "docker":
         image = configuration.agent_image
         if image is None:  # Defensive: a ready Docker report always has an image.
@@ -476,20 +477,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             image=image,
             verbose=args.verbose,
         )
-        gate_check = make_fixture_gate_check(
-            FIXTURE_DIR,
-            sandbox="docker",
-            image=image,
-            runtime_name=configuration.runtime,
-            workspace=workspace,
-        )
-        setup = make_fixture_setup(
-            FIXTURE_DIR,
-            sandbox="docker",
-            image=image,
-            runtime_name=configuration.runtime,
-            workspace=workspace,
-        )
     else:
         runtime = _build_runtime(
             configuration.runtime,
@@ -497,8 +484,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             workspace,
             verbose=args.verbose,
         )
-        gate_check = make_fixture_gate_check(FIXTURE_DIR)
-        setup = make_fixture_setup(FIXTURE_DIR)
     repo = configuration.repository
     base_branch = configuration.base_branch
     assignee = configuration.assignee
@@ -515,8 +500,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=_make_run_id(),
         iterations=configuration.item_limit,
         include_unassigned=configuration.include_unassigned,
-        gate_check=gate_check,
-        setup=setup,
         verbose=args.verbose,
         frozen_inputs=report.frozen_inputs,
     )

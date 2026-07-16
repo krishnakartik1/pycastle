@@ -915,6 +915,11 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     project fixture rather than leaving the always-pass default in place (#14).
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    frozen = MagicMock()
+    frozen.items = (IssueRef(number=1, title="One"),)
+    frozen.sandbox = "host"
+    frozen.runtime = "stub"
+    frozen.agent_image = None
     monkeypatch.setattr(
         cli,
         "_evaluate_cli_readiness",
@@ -930,6 +935,7 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
             ),
             (EligibleItem(1, "One"),),
             (IssueRef(number=1, title="One"),),
+            frozen,
         ),
     )
     monkeypatch.setattr(cli, "_resolve_repo", lambda: "owner/repo")
@@ -937,19 +943,10 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     monkeypatch.setattr(cli, "_resolve_assignee", lambda login: "krishna")
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda repo: MagicMock())
 
-    sentinel = object()
-
-    def fake_factory(fixture_dir: Path) -> object:
-        # The CLI builds the gate from its fixture dir, not a hardcoded command.
-        assert fixture_dir == cli.FIXTURE_DIR
-        return sentinel
-
-    monkeypatch.setattr(cli, "make_fixture_gate_check", fake_factory)
-
     captured: dict[str, object] = {}
 
-    def fake_run_loop(*, gate_check: object, **_kwargs: object) -> MagicMock:
-        captured["gate_check"] = gate_check
+    def fake_run_loop(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
         outcome = MagicMock()
         outcome.issues = []
         return outcome
@@ -957,8 +954,8 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
 
     assert main(["run", "--runtime", "stub"]) == 0
-    # The fixture-sourced gate (not the always-pass default) reached run_batch.
-    assert captured["gate_check"] is sentinel
+    assert "gate_check" not in captured
+    assert captured["frozen_inputs"] is frozen
 
 
 def test_fixture_gate_exhaustion_marks_for_human_through_run_batch(
