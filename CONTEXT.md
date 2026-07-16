@@ -61,6 +61,14 @@ The optional project-owned `.pycastle/setup` executable that prepares runtime
 and test dependencies in a project worktree before phases or a Gate run there.
 It is idempotent and applies at both Item and Run scope.
 
+**Doctor**:
+A non-destructive readiness operation that verifies whether a real Run can start
+for one intended combination of Project fixture, Sandbox, Runtime, Issue source,
+and Item-selection policy. It may prepare local execution caches, but never
+changes the Project fixture, Issue source state, or Run state, and never walks an
+Item or Run phase graph.
+_Avoid_: health check, canary Run, dry Run.
+
 **Handoff**:
 The document a failed attempt leaves for the next attempt, summarizing what was
 tried and what to fix.
