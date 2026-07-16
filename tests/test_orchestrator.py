@@ -464,6 +464,32 @@ def test_explicit_execution_record_names_cannot_escape_the_record_directory(
     assert not (tmp_path / "outside-setup-1.json").exists()
 
 
+def test_explicit_gate_outcome_reports_measured_duration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    for name in ("setup", "gate"):
+        hook = fixture / name
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+    execution = orchestrator.FrozenRunExecution.freeze(fixture, "timed-gate")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    ticks = iter((12.5, 14.75))
+    monkeypatch.setattr(orchestrator.time, "monotonic", lambda: next(ticks))
+
+    _, gate = execution.invoke_gate(
+        worktree,
+        scope="run",
+        identity="after-run",
+        node="verify",
+        ordinal=1,
+    )
+
+    assert gate.duration_seconds == 2.25
+
+
 def test_run_graph_repairs_red_gate_and_passes_directly_to_done(
     tmp_path: Path,
 ) -> None:

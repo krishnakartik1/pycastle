@@ -53,6 +53,7 @@ from .graph import (
     GateNode,
     GraphExecutor,
     NodeOutcome,
+    NodeVisit,
     Phase,
     PhaseGraph,
     PhaseResult,
@@ -324,17 +325,21 @@ class FrozenRunExecution:
         ordinal: int,
     ) -> tuple[NodeOutcome, GateOutcome]:
         environment = dict(os.environ)
-        record = execute_hook(
-            self.gate,
-            cwd=worktree,
-            scope=scope,
-            record_path=self.records
-            / (
-                f"{self._record_identity(identity)}-"
-                f"{self._record_identity(node)}-gate-{ordinal}.json"
-            ),
-            environment=environment,
-        )
+        started_at = time.monotonic()
+        try:
+            record = execute_hook(
+                self.gate,
+                cwd=worktree,
+                scope=scope,
+                record_path=self.records
+                / (
+                    f"{self._record_identity(identity)}-"
+                    f"{self._record_identity(node)}-gate-{ordinal}.json"
+                ),
+                environment=environment,
+            )
+        finally:
+            duration_seconds = time.monotonic() - started_at
         evidence = project_gate_evidence(
             record,
             node=node,
@@ -353,6 +358,7 @@ class FrozenRunExecution:
             record.success,
             "",
             exit_code=exit_code,
+            duration_seconds=duration_seconds,
             termination=termination if isinstance(termination, dict) else None,
         )
 
@@ -1134,7 +1140,7 @@ def _walk_execution_graph(
     identity = identity or f"item-{issue.number}"
     last_gate: GateOutcome | None = None
 
-    def visit(entry: Any) -> NodeOutcome:
+    def visit(entry: NodeVisit) -> NodeOutcome:
         node = entry.node
         execution.invoke_setup(
             worktree,
