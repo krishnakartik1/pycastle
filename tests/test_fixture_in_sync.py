@@ -139,6 +139,27 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
         ), f"{relative} mode has drifted from the scaffolder output"
 
 
+def test_committed_gate_selects_its_declared_development_tools() -> None:
+    """The live Gate resolves every verifier from the project's dev extra.
+
+    Setup is intentionally language-neutral, so the project-owned Gate must
+    select the optional dependency group that declares pytest, Black, and Ruff.
+    Keeping that selection on every invocation also makes the contract behave
+    consistently when no matching executable happens to be installed globally.
+    """
+    gate_lines = {
+        line.strip()
+        for line in (_repo_root() / FIXTURE_DIRNAME / "gate").read_text().splitlines()
+        if line.startswith("uv run")
+    }
+
+    assert gate_lines == {
+        "uv run --extra dev pytest -q",
+        "uv run --extra dev black --check .",
+        "uv run --extra dev ruff check .",
+    }
+
+
 def test_guard_catches_byte_drift(tmp_path: Path) -> None:
     """The byte comparison is not vacuous: it fails when a fixture file drifts.
 
