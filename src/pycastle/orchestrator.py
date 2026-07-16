@@ -1765,13 +1765,14 @@ def run_batch(
             raise ValueError("Frozen readiness Item batch is invalid")
         if selected != frozen_items:
             raise ValueError("Selected Items differ from frozen readiness batch")
+    branch_start = base_branch
     frozen_base_commit = getattr(frozen_inputs, "base_commit", None)
     if frozen_base_commit is not None:
         if not isinstance(frozen_base_commit, str) or not re.fullmatch(
             r"[0-9a-f]{40,64}", frozen_base_commit
         ):
             raise ValueError("Frozen readiness base commit is invalid")
-        base_branch = frozen_base_commit
+        branch_start = frozen_base_commit
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(
         run_id=run_id,
@@ -1834,7 +1835,7 @@ def run_batch(
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
-    create_branch(run_branch, base_branch, runner=runner, cwd=workspace)
+    create_branch(run_branch, branch_start, runner=runner, cwd=workspace)
     # A failed run-worktree add is fatal: no issue can be worked without it, so
     # raise rather than silently drive the batch against a missing directory (#64).
     add_worktree(run_worktree, run_branch, runner=runner, cwd=workspace)
@@ -1849,7 +1850,7 @@ def run_batch(
     _append_log(
         fixture_dir,
         run_id,
-        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
+        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {branch_start})",
     )
 
     cancellation = CancellationState()
@@ -1932,6 +1933,8 @@ def run_batch(
                         assignee=assignee,
                         include_unassigned=include_unassigned,
                     )
+                    if frozen_inputs is not None and not isinstance(eligible, bool):
+                        raise TypeError("Item eligibility recheck did not return bool")
                 except Exception as exc:
                     if not outcome.completed:
                         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)

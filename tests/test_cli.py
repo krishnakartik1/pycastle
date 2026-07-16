@@ -348,6 +348,7 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
         )
 
     source = MagicMock()
+    source.is_still_eligible.return_value = True
     runtime = StubRuntime()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-explicit-134")
@@ -436,6 +437,7 @@ def _run_cycle_from_cli(
             return result
 
     source = MagicMock()
+    source.is_still_eligible.return_value = True
     outcomes: list[RunOutcome] = []
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-cycle-135")
@@ -617,6 +619,7 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
         ),
     )
     source = MagicMock()
+    source.is_still_eligible.return_value = True
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-run-136")
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())

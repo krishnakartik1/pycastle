@@ -292,6 +292,16 @@ def test_github_source_rechecks_only_frozen_item_eligibility(
         subprocess.CompletedProcess(args=[], returncode=1, stdout=""),
         subprocess.CompletedProcess(args=[], returncode=0, stdout="not-json"),
         subprocess.CompletedProcess(args=[], returncode=0, stdout='{"number": 99}'),
+        subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"number": 42, "state": "OPEN", "labels": [null], "assignees": []}',
+        ),
+        subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"number": 42, "state": "OPEN", "labels": [], "assignees": [{}]}',
+        ),
     ],
 )
 def test_github_source_recheck_failure_is_not_stale(result: object) -> None:

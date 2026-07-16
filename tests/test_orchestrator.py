@@ -140,6 +140,101 @@ def test_run_bootstraps_then_rechecks_frozen_items_and_skips_stale_in_order(
     )
 
 
+def test_run_starts_at_frozen_commit_but_publishes_to_configured_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = IssueRef(number=10, title="Item 10")
+    frozen_commit = "a" * 40
+    branch_starts: list[str] = []
+    publication_bases: list[str] = []
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run",
+        lambda _fixture: SimpleNamespace(before=None, item=MagicMock(), after=None),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "create_branch",
+        lambda _branch, start, **_kwargs: branch_starts.append(start),
+    )
+    monkeypatch.setattr(orchestrator, "add_worktree", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "cleanup_worktree", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_work_issue",
+        lambda issue, **_kwargs: orchestrator.IssueOutcome(issue, "issue-10", True),
+    )
+
+    def publish(*, base_branch: str, **_kwargs: object) -> object:
+        publication_bases.append(base_branch)
+        return SimpleNamespace(
+            pr_opened=True,
+            pr_ready=True,
+            final_push_succeeded=True,
+            report_published=True,
+        )
+
+    monkeypatch.setattr(orchestrator, "_open_pull_request", publish)
+
+    orchestrator.run_batch(
+        runtime=MagicMock(),
+        issue_source=source,
+        selected=(item,),
+        fixture_dir=tmp_path / ".pycastle",
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="pinned-base",
+        setup=lambda _worktree: None,
+        workspace=tmp_path,
+        frozen_inputs=SimpleNamespace(items=(item,), base_commit=frozen_commit),
+    )
+
+    assert branch_starts == [frozen_commit]
+    assert publication_bases == ["main"]
+
+
+@pytest.mark.parametrize("invalid_result", [None, 0, "yes"])
+def test_run_rejects_invalid_item_eligibility_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_result: object
+) -> None:
+    item = IssueRef(number=10, title="Item 10")
+    source = MagicMock()
+    source.is_still_eligible.return_value = invalid_result
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run",
+        lambda _fixture: SimpleNamespace(before=None, item=MagicMock(), after=None),
+    )
+    monkeypatch.setattr(orchestrator, "create_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "add_worktree", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "cleanup_worktree", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(TypeError, match="did not return bool"):
+        orchestrator.run_batch(
+            runtime=MagicMock(),
+            issue_source=source,
+            selected=(item,),
+            fixture_dir=tmp_path / ".pycastle",
+            repo="owner/repo",
+            base_branch="main",
+            assignee="krishna",
+            run_id="invalid-eligibility",
+            setup=lambda _worktree: None,
+            workspace=tmp_path,
+            frozen_inputs=SimpleNamespace(items=(item,)),
+        )
+
+    source.claim.assert_not_called()
+
+
 def test_explicit_item_cycle_repairs_red_gate_with_fresh_runtime_visits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

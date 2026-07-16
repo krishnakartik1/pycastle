@@ -271,7 +271,14 @@ class GitHubIssueSource(IssueSource):
                 label["name"] if isinstance(label, dict) else label
                 for label in raw_labels
             ]
-            current_assignees = assignee_logins(item)
+            current_assignees = [
+                entry["login"] if isinstance(entry, dict) else entry
+                for entry in raw_assignees
+            ]
+            if not all(isinstance(label, str) for label in labels) or not all(
+                isinstance(login, str) for login in current_assignees
+            ):
+                raise ValueError("GitHub returned malformed eligibility facts")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise OSError("GitHub Item eligibility recheck failed") from exc
 
