@@ -5,10 +5,10 @@ description: Onboard a project, check readiness, operate a PyCastle Run, and coo
 
 # PyCastle lifecycle
 
-PyCastle release: `0.1.0`
+PyCastle release: `0.1.1`
 
 Use this vendor-neutral workflow to operate PyCastle for the current repository.
-Treat `v0.1.0` as the only compatible runner and skill Git tag.
+Treat `v0.1.1` as the only compatible runner and skill Git tag.
 
 ## Select the Runtime
 
@@ -25,18 +25,18 @@ Call that choice `<runtime>` in the commands below.
 
 Before `init`, Doctor, or Run, execute `pycastle --version`. Parse the command's
 documented `pycastle <version>` output and require the normalized version to equal
-`0.1.0` exactly. A malformed output, prerelease, local version, or any other value
+`0.1.1` exactly. A malformed output, prerelease, local version, or any other value
 is a version mismatch.
 
 On a version mismatch, stop. Reinstall both the runner and this canonical skill
-from `v0.1.0`; do not continue with a merely compatible-looking version:
+from `v0.1.1`; do not continue with a merely compatible-looking version:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.0
-git clone --depth 1 --branch v0.1.0 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.0
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
+git clone --depth 1 --branch v0.1.1 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.1
 ```
 
-Then install or link `/tmp/pycastle-v0.1.0/skills/pycastle/` into the invoking
+Then install or link `/tmp/pycastle-v0.1.1/skills/pycastle/` into the invoking
 host's skill discovery directory and restart/reload that host. Re-run
 `pycastle --version`; do not proceed until it exactly matches this embedded release.
 

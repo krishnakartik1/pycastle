@@ -1,6 +1,7 @@
 """Contract tests for the vendor-neutral PyCastle lifecycle skill."""
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,30 @@ def test_skill_release_matches_the_cli_release() -> None:
 
     assert release == __version__
     assert set(GIT_TAG.findall(text)) == {f"v{release}"}
+
+
+def test_existing_release_tag_contains_the_canonical_skill() -> None:
+    """A published tag must not predate the skill that names its release."""
+    tag = f"v{_embedded_release(_skill_text())}"
+    tag_exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if tag_exists.returncode != 0:
+        pytest.skip(f"{tag} has not been published yet")
+
+    tagged_skill = subprocess.run(
+        ["git", "show", f"{tag}:skills/pycastle/SKILL.md"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        tagged_skill.returncode == 0
+    ), f"{tag} exists but does not contain the canonical lifecycle skill"
+    assert tagged_skill.stdout == _skill_text()
 
 
 @pytest.mark.parametrize(

@@ -1285,15 +1285,10 @@ def _checkpoint_run_phase(
     """Commit a successful Run phase when dirty and attempt a durability push."""
     argv: Sequence[str]
     try:
-        add_argv = [
-            "git",
-            "add",
-            "-A",
-            "--",
-            ".",
-            f":(exclude,top){RUN_REVIEW}",
-            f":(exclude,top){RUN_REPORT}",
-        ]
+        # Run review/report artifacts are part of the Project fixture's ignored
+        # scratch-file contract.  Explicitly naming those ignored paths as
+        # exclusion pathspecs makes real Git reject the otherwise valid add.
+        add_argv = ["git", "add", "-A", "--", "."]
         argv = add_argv
         staged = run.runner(
             add_argv,
@@ -1347,7 +1342,7 @@ def _checkpoint_run_phase(
         )
         raise RunCheckpointError(detail) from exc
 
-    _push_run_branch(run=run, final=False)
+    _push_run_branch(run=run, final=False, scope=scope, phase=phase.name)
 
 
 def _walk_run_graph(
@@ -1407,20 +1402,16 @@ def _record_host_command_failure(
     result: Any,
 ) -> str:
     """Surface and retain all captured diagnostics from a boundary command."""
-    detail = "\n".join(
-        (
-            "Host command failed",
-            f"argv: {json.dumps(list(argv))}",
-            f"exit code: {getattr(result, 'returncode', None)!r}",
-            f"stdout: {getattr(result, 'stdout', None)!r}",
-            f"stderr: {getattr(result, 'stderr', None)!r}",
-        )
+    return _record_host_command_diagnostics(
+        run,
+        scope=scope,
+        phase=phase,
+        argv=argv,
+        headline="Host command failed",
+        exit_code=repr(getattr(result, "returncode", None)),
+        stdout=repr(getattr(result, "stdout", None)),
+        stderr=repr(getattr(result, "stderr", None)),
     )
-    logger.error("%s", detail)
-    sink = _run_transcript_sink(run.fixture_dir, run.run_id, scope)
-    for line in detail.splitlines():
-        sink(phase, "HOST-COMMAND", line)
-    return detail
 
 
 def _record_host_command_exception(
@@ -1432,13 +1423,37 @@ def _record_host_command_exception(
     exc: OSError,
 ) -> str:
     """Surface command identity when a boundary command cannot be launched."""
+    return _record_host_command_diagnostics(
+        run,
+        scope=scope,
+        phase=phase,
+        argv=argv,
+        headline="Host command could not be launched",
+        exit_code="unavailable",
+        stdout="unavailable",
+        stderr=repr(str(exc)),
+    )
+
+
+def _record_host_command_diagnostics(
+    run: RunContext,
+    *,
+    scope: str,
+    phase: str,
+    argv: Sequence[str],
+    headline: str,
+    exit_code: str,
+    stdout: str,
+    stderr: str,
+) -> str:
+    """Write one consistently formatted host-command failure record."""
     detail = "\n".join(
         (
-            "Host command could not be launched",
+            headline,
             f"argv: {json.dumps(list(argv))}",
-            "exit code: unavailable",
-            "stdout: unavailable",
-            f"stderr: {str(exc)!r}",
+            f"exit code: {exit_code}",
+            f"stdout: {stdout}",
+            f"stderr: {stderr}",
         )
     )
     logger.error("%s", detail)
@@ -2037,18 +2052,36 @@ def _push_run_branch(
     *,
     run: RunContext,
     final: bool,
+    scope: str = "Run",
+    phase: str | None = None,
 ) -> bool:
     """Push the current Run checkpoint, logging failures without raising."""
+    argv = ["git", "push", "-u", "origin", run.branch]
+    phase_name = phase or ("final-push" if final else "durability-push")
     try:
         result = run.runner(
-            ["git", "push", "-u", "origin", run.branch],
+            argv,
             capture=True,
             cwd=run.worktree,
         )
         succeeded = getattr(result, "returncode", 1) == 0
+        if not succeeded:
+            _record_host_command_failure(
+                run,
+                scope=scope,
+                phase=phase_name,
+                argv=argv,
+                result=result,
+            )
     except OSError as exc:
         succeeded = False
-        logger.warning("Could not push Run branch %s: %s", run.branch, exc)
+        _record_host_command_exception(
+            run,
+            scope=scope,
+            phase=phase_name,
+            argv=argv,
+            exc=exc,
+        )
 
     if succeeded:
         if not final:

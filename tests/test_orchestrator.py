@@ -643,18 +643,99 @@ def test_successful_run_phase_with_no_changes_pushes_without_empty_commit(
 
     calls = [call.args[0] for call in runner.call_args_list]
     assert calls == [
-        [
-            "git",
-            "add",
-            "-A",
-            "--",
-            ".",
-            ":(exclude,top).pycastle/run-review.md",
-            ":(exclude,top).pycastle/run-report.md",
-        ],
+        ["git", "add", "-A", "--", "."],
         ["git", "diff", "--cached", "--quiet"],
         ["git", "push", "-u", "origin", "pycastle/run-run-101"],
     ]
+
+
+@pytest.mark.parametrize("artifact", [orchestrator.RUN_REVIEW, orchestrator.RUN_REPORT])
+def test_run_phase_checkpoint_respects_ignored_artifacts_with_real_git(
+    tmp_path: Path, artifact: str
+) -> None:
+    """Ignored Run artifacts do not make real Git reject a checkpoint."""
+    worktree = tmp_path / "repo"
+    fixture = worktree / ".pycastle"
+    fixture.mkdir(parents=True)
+    (fixture / ".gitignore").write_text("/run-review.md\n/run-report.md\n/runs/\n")
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.name", "PyCastle Test")
+    git("config", "user.email", "pycastle@example.invalid")
+    (worktree / "tracked.txt").write_text("baseline\n")
+    git("add", ".")
+    git("commit", "-m", "baseline")
+    baseline = git("rev-parse", "HEAD").stdout.strip()
+    target = worktree / artifact
+    target.write_text("No findings\n")
+
+    def runner(argv: list[str], **kwargs: object) -> object:
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.run(
+            argv,
+            cwd=kwargs.get("cwd"),
+            capture_output=True,
+            text=True,
+        )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="review", prompt="run-review.md"),
+        run=_run_context(
+            fixture_dir=fixture,
+            worktree=worktree,
+            runner=runner,
+            run_id="real-git",
+        ),
+        scope="after-Run",
+    )
+
+    assert git("rev-parse", "HEAD").stdout.strip() == baseline
+    assert git("check-ignore", artifact).stdout.strip() == artifact
+    assert git("diff", "--cached", "--name-only").stdout == ""
+
+
+def test_run_phase_checkpoint_push_failure_retains_exact_diagnostics(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """A non-fatal durability failure still leaves complete Run evidence."""
+    runner = MagicMock(
+        side_effect=[
+            _ok(),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess(
+                [], 17, stdout="push stdout", stderr="push stderr"
+            ),
+        ]
+    )
+
+    orchestrator._checkpoint_run_phase(
+        orchestrator.Phase(name="review", prompt="run-review.md"),
+        run=_run_context(
+            fixture_dir=fixture_dir,
+            worktree=tmp_path / "run-worktree",
+            runner=runner,
+            run_id="push-failure",
+        ),
+        scope="after-Run",
+    )
+
+    transcript = (
+        fixture_dir / "runs" / "push-failure" / "run-phase-transcript.log"
+    ).read_text()
+    assert '[after-Run] [review] [HOST-COMMAND] argv: ["git", "push"' in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] exit code: 17" in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] stdout: 'push stdout'" in transcript
+    assert "[after-Run] [review] [HOST-COMMAND] stderr: 'push stderr'" in transcript
 
 
 @pytest.mark.parametrize("failure", ["add", "diff", "commit"])
