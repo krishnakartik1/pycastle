@@ -1,6 +1,17 @@
 # ADR-0008: A Run definition wraps item work with project-owned Run phase graphs
 
-Status: Accepted (2026-07-15)
+Status: Accepted (2026-07-15); partially superseded by ADR-0010 and ADR-0013
+(2026-07-16)
+
+ADR-0010 replaces this ADR's Phase graph vocabulary and declarations, hard-coded
+Gate placement, implement-only retry behavior, automatic Runtime retry context,
+and failed-node worktree rollback. This ADR remains current for the surrounding
+Run lifecycle, scoped worktrees, checkpointing, publication, and non-graph
+failure handling except where they depend on those replaced rules.
+
+ADR-0013 replaces this ADR's startup ordering where image preparation preceded
+Item selection. It also fixes the pre-claim bootstrap Setup record and stale
+frozen-Item handling; the surrounding Run lifecycle remains current.
 
 ## Context
 

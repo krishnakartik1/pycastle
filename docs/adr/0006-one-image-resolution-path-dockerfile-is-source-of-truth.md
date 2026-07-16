@@ -1,6 +1,6 @@
 # ADR-0006: One image-resolution path for setup/build/run — the project Dockerfile is the source of truth
 
-Status: Accepted (2026-06-19)
+Status: Superseded by ADR-0012 (2026-07-16)
 
 ## Context
 

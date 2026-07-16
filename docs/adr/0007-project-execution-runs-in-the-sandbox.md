@@ -1,6 +1,14 @@
 # ADR-0007: Project execution runs in the sandbox — the gate runs where the phases run
 
-Status: Accepted (2026-06-20)
+Status: Accepted (2026-06-20); partially superseded by ADR-0011 and ADR-0012
+(2026-07-16)
+
+ADR-0011 replaces this ADR's scaffolded fail-if-zero Gate, shell-based Gate
+launch, and verbosity-dependent Gate-output persistence. The project-execution
+boundary and rule that Gate runs in the selected Sandbox remain current.
+ADR-0012 replaces this ADR's fixed `node` image identity, image-supplied project
+dependency model, and image-resolution details with a neutral, project-owned
+Docker bootstrap contract. Its one-Sandbox rule remains current.
 
 ## Context
 

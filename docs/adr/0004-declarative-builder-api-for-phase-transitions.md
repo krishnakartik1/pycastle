@@ -1,6 +1,10 @@
 # ADR-0004: Declarative Builder API for phase-graph success/failure transitions
 
-Status: Accepted (2026-06-14)
+Status: Superseded by ADR-0010 (2026-07-16)
+
+ADR-0010 retains declarative, local, order-independent transitions while
+replacing Phase types, the Phase graph API, and special retry behavior with the
+Execution graph model.
 
 ## Context
 

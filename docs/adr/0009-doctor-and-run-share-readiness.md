@@ -1,6 +1,10 @@
 # ADR-0009: Doctor and Run share one readiness boundary
 
-Status: Accepted (2026-07-15)
+Status: Superseded by ADR-0013 (2026-07-16)
+
+ADR-0013 retains one shared Doctor/Run readiness evaluator while replacing this
+ADR's binary readiness result, content-addressed image preparation, disposable
+workspace/cache allowance, Gate toolchain mode, and startup ordering.
 
 ## Context
 
