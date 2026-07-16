@@ -185,23 +185,41 @@ def execute_hook(
     return record
 
 
-_CONTROL = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\))")
+_CONTROL = re.compile(
+    rb"(?:"
+    rb"\x1b(?:"
+    rb"\[[0-?]*[ -/]*[@-~]"  # CSI
+    rb"|\][^\x07\x1b]*(?:\x07|\x1b\\|$)"  # OSC
+    rb"|[PX^_][^\x1b]*(?:\x1b\\|$)"  # DCS, SOS, PM, APC
+    rb"|[@-_]"  # two-byte escape sequences
+    rb")"
+    rb"|\x9b[0-?]*[ -/]*[@-~]"  # eight-bit CSI
+    rb")"
+)
 _CREDENTIAL = re.compile(
     rb"(?i)(authorization\s*:\s*(?:bearer|basic)\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+"
 )
+_KNOWN_CREDENTIAL = re.compile(
+    rb"(?<![A-Za-z0-9_])(?:"
+    rb"gh[pousr]_[A-Za-z0-9]{20,}"
+    rb"|github_pat_[A-Za-z0-9_]{20,}"
+    rb"|AKIA[0-9A-Z]{16}"
+    rb"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    rb")(?![A-Za-z0-9_])"
+)
 _SENSITIVE_ENVIRONMENT_NAME = re.compile(
-    r"(?i)(?:^|_)(?:auth(?:entication|orization)?|credentials?|key|pass(?:word|wd)|secret|token)(?:_|$)"
+    r"(?i)(?:^|_)(?:auth(?:entication|orization)?|credentials?|key|pass(?:word|wd)|secret|token|cookie|jwt)(?:_|$)"
 )
 
 
 def sensitive_environment_values(environment: dict[str, str]) -> tuple[str, ...]:
-    """Select deterministic, non-trivial secrets from a process environment."""
+    """Select deterministic, non-empty secrets from a process environment."""
     return tuple(
         sorted(
             {
                 value
                 for name, value in environment.items()
-                if _SENSITIVE_ENVIRONMENT_NAME.search(name) and len(value) >= 4
+                if _SENSITIVE_ENVIRONMENT_NAME.search(name) and value
             }
         )
     )
@@ -210,6 +228,7 @@ def sensitive_environment_values(environment: dict[str, str]) -> tuple[str, ...]
 def sanitize_evidence(value: bytes, *, sensitive_values: tuple[str, ...] = ()) -> str:
     cleaned = _CONTROL.sub(b"", value)
     cleaned = _CREDENTIAL.sub(lambda match: match.group(1) + b"[REDACTED]", cleaned)
+    cleaned = _KNOWN_CREDENTIAL.sub(b"[REDACTED]", cleaned)
     text = cleaned.decode("utf-8", errors="replace")
     for secret in sorted((x for x in sensitive_values if x), key=len, reverse=True):
         text = text.replace(secret, "[REDACTED]")

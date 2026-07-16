@@ -13,6 +13,7 @@ from pycastle.execution import (
     Signaled,
     execute_hook,
     project_gate_evidence,
+    sanitize_evidence,
     sensitive_environment_values,
 )
 
@@ -167,10 +168,47 @@ def test_sensitive_environment_values_selects_only_credential_bearing_names() ->
             "AUTH_HEADER": "authorization-secret-value",
             "EMPTY_SECRET": "",
             "SHORT_TOKEN": "abc",
+            "SESSION_COOKIE": "x",
         }
     ) == (
+        "abc",
         "api-secret-value",
         "authorization-secret-value",
         "database-secret-value",
         "github-secret-value",
+        "x",
     )
+
+
+def test_evidence_redacts_short_environment_values_without_redacting_empty() -> None:
+    assert (
+        sanitize_evidence(b"short=x empty-stays-visible", sensitive_values=("", "x"))
+        == "short=[REDACTED] empty-stays-visible"
+    )
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        b"ghp_abcdefghijklmnopqrstuvwxyz123456",
+        b"github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        b"AKIAIOSFODNN7EXAMPLE",
+        b"eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",
+    ],
+)
+def test_evidence_redacts_known_unlabelled_credential_patterns(
+    credential: bytes,
+) -> None:
+    assert sanitize_evidence(b"before " + credential + b" after") == (
+        "before [REDACTED] after"
+    )
+
+
+def test_evidence_removes_terminal_sequences_including_unterminated_strings() -> None:
+    value = (
+        b"a\033[31mb\033[0mc"
+        b"\033]0;terminal title\007d"
+        b"\033Pprivate device command\033\\e"
+        b"\033]unterminated title"
+    )
+    assert sanitize_evidence(value) == "abcde"
