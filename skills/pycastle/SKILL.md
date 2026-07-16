@@ -51,19 +51,19 @@ pycastle init --sandbox docker
 Never overwrite an existing Project fixture by initializing it again. Explain and
 review all project-owned customization points directly:
 
-- `.pycastle/main.py` declares the Run definition: its required Item phase graph
-  and optional before-Run and after-Run phase graphs.
-- `.pycastle/prompts/` contains the instructions for Item and Run phases.
-- `.pycastle/setup` is the optional idempotent dependency setup executable used
-  at Item and Run scope.
+- `.pycastle/main.py` declares the Run definition: its required Item Execution
+  graph and optional Before-Run and After-Run Execution graphs. Graphs contain
+  only Runtime nodes and Gate nodes.
+- `.pycastle/prompts/` contains instructions for Runtime nodes.
+- `.pycastle/setup` is the mandatory idempotent Setup executable used at Item
+  and Run scope before every node visit.
 - `.pycastle/gate` defines project success and runs at Item and integrated Run
   scope.
 - `.pycastle/Dockerfile` is the Agent image recipe and must install the selected
-  Runtime plus every tool needed by Setup, phases, and the Gate. PyCastle builds
-  and caches it by content; an explicit `--image` bypasses it and must satisfy the
-  same image contract.
-- `.pycastle/sandbox` records the default Sandbox. This workflow explicitly uses
-  Docker.
+  Runtime plus every tool needed by Setup, Runtime nodes, and the Gate. PyCastle
+  builds this canonical recipe and pins its immutable identity for each Run;
+  Docker owns layer caching.
+- `.pycastle/sandbox` records the required Sandbox choice. This workflow uses Docker.
 - `.pycastle/.gitignore` keeps scratch communication and local Run records out of
   version control; prompts may use those ignored files to pass bounded context.
 
@@ -75,7 +75,7 @@ runner-owned and is reported by Doctor.
 Onboard Docker authentication for the selected Runtime once with:
 
 ```bash
-pycastle sandbox setup --runtime <runtime>
+pycastle runtime login --sandbox docker --runtime <runtime>
 ```
 
 The selected Runtime must be present in the Project's Agent image. Its named auth
@@ -93,9 +93,9 @@ Parse stdout as one complete schema-v1 JSON document. Stop if the command exits
 nonzero, JSON is malformed, the schema is unsupported, the report is not ready,
 or any check is failed or blocked. Report and follow only Doctor-provided facts
 and remediation. Do not reproduce readiness probes, infer fixture compatibility,
-or substitute local inspection for Doctor's result. Doctor may prepare the
-content-addressed Agent image, but it is only a current snapshot: Run re-evaluates readiness
-before side effects.
+or substitute local inspection for Doctor's result. Doctor may build and pin the
+canonical Agent image, but it is only a current snapshot: Run re-evaluates readiness
+before side effects and freezes its own Run-readiness inputs.
 
 Use only the already-eligible `ready-for-agent` Items in Doctor's resolved batch.
 Zero eligible Items is a successful no-op. If fewer than five are eligible, accept

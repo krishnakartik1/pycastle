@@ -233,7 +233,7 @@ The Codex Runtime with the host Sandbox runs under Codex's native
 `workspace-write` sandbox. In that specific combination, a whole-tree Black
 self-check such as `black --check .` can print its successful summary and then
 hang because the sandbox blocks a multiprocessing worker's local socket. This
-is an advisory command started by the Runtime during a phase, not a stalled or
+is an advisory command started by the Runtime during a node, not a stalled or
 failed PyCastle Gate.
 
 Prefer the Docker Sandbox for Codex (`pycastle run --runtime codex --sandbox

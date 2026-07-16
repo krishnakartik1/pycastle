@@ -233,10 +233,9 @@ def test_run_image_flag_parses() -> None:
     assert args.image == "my/agent:dev"
 
 
-def test_run_image_flag_defaults_to_none() -> None:
-    # No --image means "resolve from the Dockerfile, else the default tag".
+def test_run_has_no_image_compatibility_attribute() -> None:
     args = build_parser().parse_args(["run"])
-    assert args.image is None
+    assert not hasattr(args, "image")
 
 
 @pytest.mark.skip(reason="superseded by issue 140 CLI")
@@ -435,10 +434,10 @@ def _run_cycle_from_cli(
     runtime_phases: list[str] = []
 
     class Runtime(StubRuntime):
-        def run(self, prompt: str, *, cwd: Path, phase: str):
-            runtime_phases.append(phase)
-            result = super().run(prompt, cwd=cwd, phase=phase)
-            if repair and phase == "repair":
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            runtime_phases.append(node)
+            result = super().run(prompt, cwd=cwd, node=node)
+            if repair and node == "repair":
                 (cwd / "repaired").write_text("repaired\n")
             return result
 
@@ -464,12 +463,12 @@ def _run_cycle_from_cli(
 def test_cli_repairs_item_through_explicit_gate_cycle_and_publishes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    code, source, calls, outcomes, phases = _run_cycle_from_cli(
+    code, source, calls, outcomes, nodes = _run_cycle_from_cli(
         monkeypatch, tmp_path, repair=True
     )
     assert code == 0
     assert outcomes[0].completed == [1]
-    assert phases == ["work", "repair"]
+    assert nodes == ["work", "repair"]
     assert (tmp_path / "timeline").read_text().splitlines().count("gate") == 2
     source.mark_for_human.assert_not_called()
     assert any(
@@ -481,12 +480,12 @@ def test_cli_repairs_item_through_explicit_gate_cycle_and_publishes(
 def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    code, source, calls, outcomes, phases = _run_cycle_from_cli(
+    code, source, calls, outcomes, nodes = _run_cycle_from_cli(
         monkeypatch, tmp_path, repair=False
     )
     assert code != 0
     assert outcomes[0].completed == []
-    assert phases == ["work"] + ["repair"] * 10
+    assert nodes == ["work"] + ["repair"] * 10
     timeline = (tmp_path / "timeline").read_text().splitlines()
     assert timeline.count("gate") == 10
     # Run bootstrap, initial work, and ten visits to each cycle node.
@@ -614,9 +613,9 @@ def test_cli_setup_failure_preserves_only_safe_run_outcomes(
         )
 
     class Runtime(StubRuntime):
-        def run(self, prompt: str, *, cwd: Path, phase: str):
+        def run(self, prompt: str, *, cwd: Path, node: str):
             (cwd / f"item-{cwd.name.removeprefix('issue-')}.txt").write_text("done\n")
-            return super().run(prompt, cwd=cwd, phase=phase)
+            return super().run(prompt, cwd=cwd, node=node)
 
     source = MagicMock()
     source.is_still_eligible.return_value = True
@@ -696,25 +695,25 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
 
-    phases: list[str] = []
+    nodes: list[str] = []
 
     class Runtime(StubRuntime):
-        def run(self, prompt: str, *, cwd: Path, phase: str):
-            phases.append(phase)
-            result = super().run(prompt, cwd=cwd, phase=phase)
-            if phase == "item-work":
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            nodes.append(node)
+            result = super().run(prompt, cwd=cwd, node=node)
+            if node == "item-work":
                 (cwd / f"item-{cwd.name.removeprefix('issue-')}.txt").write_text(
                     "done\n"
                 )
-            elif phase == "run-review":
+            elif node == "run-review":
                 assert (cwd / "item-1.txt").is_file()
                 assert (cwd / "item-2.txt").is_file()
                 (cwd / "integrated.txt").write_text("reviewed\n")
-            elif phase == "run-report":
+            elif node == "run-report":
                 (cwd / ".pycastle" / "run-report.md").write_text(
                     "# Integrated Run\n\nTwo Items repaired and verified.\n"
                 )
-            elif phase == "run-repair":
+            elif node == "run-repair":
                 assert (cwd / ".pycastle" / "gate-state").is_file()
                 (cwd / "repaired").write_text("yes\n")
             return result
@@ -809,7 +808,7 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
         == 0
     )
     assert outcomes[0].completed == [1, 2]
-    assert phases == [
+    assert nodes == [
         "item-work",
         "item-work",
         "run-review",
@@ -1183,7 +1182,7 @@ def test_run_docker_builds_a_sandboxed_claude_runtime(
     wrapped = runtime.argv_wrapper(["claude", "-p", "x"], worktree)
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-claude-auth:/home/node/.claude" in wrapped
-    # The wrapper threads the per-phase cwd into the container ``-w`` so claude
+    # The wrapper threads the per-node cwd into the container ``-w`` so claude
     # writes in the issue worktree, not the workspace root (#50).
     assert wrapped[wrapped.index("-w") + 1] == str(worktree.resolve())
 
@@ -1267,7 +1266,7 @@ def test_run_docker_builds_docker_gate_check(
     """``run --sandbox docker`` builds a docker gate-check on the resolved image.
 
     The single ``--sandbox`` flag drives the gate inside the SAME image as the
-    phases: ``make_fixture_gate_check`` is called with ``sandbox="docker"``, the
+    nodes: ``make_fixture_gate_check`` is called with ``sandbox="docker"``, the
     runtime name, the resolved image, and the workspace (#28).
     """
     # No Dockerfile here, so image resolution falls back to the default tag and

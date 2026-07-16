@@ -100,7 +100,6 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("-u", "--include-unassigned", action="store_true")
     doctor_parser.add_argument("--sandbox", choices=("host", "docker"), default=None)
     doctor_parser.add_argument("--json", action="store_true")
-    doctor_parser.set_defaults(image=None)
 
     run_parser = sub.add_parser("run", help="Run the autonomous loop")
     run_parser.add_argument(
@@ -133,8 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help=(
-            "Capture and surface the agent's thinking/reasoning trace, live as "
-            "[THINKING:<phase>] lines and persisted under "
+            "Capture and surface the Runtime reasoning trace, live as "
+            "[THINKING:<node>] lines and persisted under "
             ".pycastle/runs/<run_id>/. High-volume; off by default."
         ),
     )
@@ -143,12 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("host", "docker"),
         default=None,
         help=(
-            "Where the runtime runs: on the host or inside the Docker agent "
-            "sandbox. Defaults to the choice recorded in .pycastle/sandbox at "
-            "init time, or host when that marker is absent."
+            "Sandbox for Runtime nodes. When omitted, use the explicit choice "
+            "recorded in .pycastle/sandbox; a missing or invalid marker fails "
+            "Run readiness."
         ),
     )
-    run_parser.set_defaults(image=None)
     return parser
 
 
@@ -198,7 +196,7 @@ def _build_runtime(
 ) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
-    ``--sandbox docker`` wraps each phase's inner agent argv into a
+    ``--sandbox docker`` wraps each node's inner agent argv into a
     ``docker run`` argv, so both the Runtime and the commands it invokes run
     inside the agent container. ``image`` is the already-resolved agent image
     (see :func:`_resolve_agent_image`) and is threaded into the docker wrapper.
@@ -211,7 +209,7 @@ def _build_runtime(
     the ``Runtime.run`` signature stays unchanged. The per-issue transcript sink
     is bound later by the orchestrator (which owns ``run_id`` and the issue
     number); here the runtime is built only with ``verbose`` so live
-    ``[THINKING:<phase>]`` and ``[OUTPUT:<phase>]`` surfacing turns on. With
+    ``[THINKING:<node>]`` and ``[OUTPUT:<node>]`` surfacing turns on. With
     ``verbose`` off the host path stays the bare :func:`make_runtime` runtime, so
     nothing changes.
     """
@@ -260,7 +258,6 @@ def _non_empty(value: str) -> str:
 def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration:
     """Resolve Doctor/Run inputs once using the shared CLI defaults."""
     sandbox_kind = _resolve_sandbox(args.sandbox)
-    image: str | None = None
 
     def resolve(argv: list[str]) -> str:
         try:
@@ -297,7 +294,7 @@ def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration
         github_default_branch=default_branch or None,
         runtime=args.runtime,
         sandbox=sandbox_kind,
-        agent_image=image,
+        agent_image=None,
         assignee=assignee,
         include_unassigned=args.include_unassigned,
         item_limit=args.iterations,
@@ -372,7 +369,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
     # Readiness is deliberately the first Run operation. It may prepare a
     # canonical Agent image, but creates no Run ID, record, branch,
-    # worktree, claim, phase, Setup invocation, or ordinary Gate invocation.
+    # worktree, claim, node, Setup invocation, or ordinary Gate invocation.
     report = _evaluate_cli_readiness(args)
     if report.outcome is ReadinessOutcome.NO_WORK:
         logger.info("Nothing to do.")

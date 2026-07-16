@@ -6,7 +6,6 @@
 # the project's complete verification policy.
 set -eu
 
-echo "ERROR: .pycastle/gate has not been configured." >&2
-echo "Replace this body with the project's verification commands." >&2
-echo "Scope: ${PYCASTLE_SCOPE:-unset}" >&2
-exit 1
+uv run pytest -q
+uv run black --check .
+uv run ruff check .

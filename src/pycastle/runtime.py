@@ -28,16 +28,16 @@ STUB_MARKER = "PYCASTLE_STUB.md"
 class AgentCrashError(RuntimeError):
     """Raised when an agent process exits with a non-zero code.
 
-    The orchestrator catches this to treat a crashed agent as a failed phase
-    rather than letting the raw subprocess failure escape. The ``phase`` and
+    The orchestrator catches this to treat a crashed agent as a failed node
+    rather than letting the raw subprocess failure escape. The ``node`` and
     ``exit_code`` are exposed as attributes so a caller can branch on them
     (retry, skip, escalate) without parsing the message string.
     """
 
-    def __init__(self, message: str, *, phase: str, exit_code: int) -> None:
-        """Record the failing phase and the process exit code."""
+    def __init__(self, message: str, *, node: str, exit_code: int) -> None:
+        """Record the failing node and the process exit code."""
         super().__init__(message)
-        self.phase = phase
+        self.node = node
         self.exit_code = exit_code
 
 
@@ -47,8 +47,8 @@ class Runtime(Protocol):
 
     name: str
 
-    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
-        """Execute the agent for one phase and return its parsed result."""
+    def run(self, prompt: str, *, cwd: Path, node: str) -> RuntimeResult:
+        """Execute the agent for one node and return its parsed result."""
         ...
 
 
@@ -62,15 +62,15 @@ class StubRuntime:
 
     name = "stub"
 
-    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
+    def run(self, prompt: str, *, cwd: Path, node: str) -> RuntimeResult:
         """Write the marker file and return fixed output and telemetry."""
         marker = cwd / STUB_MARKER
         marker.write_text(
-            f"# PyCastle stub runtime\n\nPhase: {phase}\nPrompt bytes: {len(prompt)}\n"
+            f"# PyCastle stub runtime\n\nRuntime node: {node}\nPrompt bytes: {len(prompt)}\n"
         )
         return RuntimeResult(
-            output=f"stub wrote {STUB_MARKER} during {phase}",
-            telemetry=Telemetry(runtime=self.name, phase=phase, num_turns=1),
+            output=f"stub wrote {STUB_MARKER} during {node}",
+            telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
         )
 
 
@@ -103,19 +103,19 @@ class ClaudeRuntime:
         verbose: bool = False,
         transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> None:
-        """Configure the CLI invocation shared across phases.
+        """Configure the CLI invocation shared across nodes.
 
         ``argv_wrapper``, when set, rewrites the inner ``claude …`` argv just
-        before launch; it receives both that argv and the resolved per-phase
+        before launch; it receives both that argv and the resolved per-node
         run ``cwd`` so a Docker wrapper can set the container ``-w`` to the cwd
         (the issue worktree) rather than the fixed workspace root.
 
         ``verbose`` turns on transcript capture (off by default, it is
         high-volume): each ``thinking`` block is surfaced as a
-        ``[THINKING:<phase>]`` log line and each ``text`` block as an
-        ``[OUTPUT:<phase>]`` line, so a verbose run shows what the model did even
-        when a phase emits no thinking (#52). When ``transcript_sink`` is set each
-        chunk is also handed to it as ``(phase, tag, text)`` so a run can persist
+        ``[THINKING:<node>]`` log line and each ``text`` block as an
+        ``[OUTPUT:<node>]`` line, so a verbose run shows what the model did even
+        when a node emits no thinking (#52). When ``transcript_sink`` is set each
+        chunk is also handed to it as ``(node, tag, text)`` so a run can persist
         both streams interleaved. The sink keeps the runtime ignorant of the run
         directory — the orchestrator binds it per issue — so the
         :class:`Runtime` ``run`` signature stays unchanged.
@@ -140,7 +140,7 @@ class ClaudeRuntime:
         verbose: bool = False,
         transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> ClaudeRuntime:
-        """Build a Claude runtime that runs each phase inside the Docker sandbox.
+        """Build a Claude runtime that runs each node inside the Docker sandbox.
 
         The inner ``claude …`` argv is wrapped into a ``docker run`` argv (see
         :func:`pycastle.sandbox.build_run_command`) so the agent runs as
@@ -151,7 +151,7 @@ class ClaudeRuntime:
         container is the isolation boundary (ADR-0003), so the in-agent
         permission prompts are skipped in the container and only there. Without
         this, headless ``claude`` runs under ``permissionMode: default`` and
-        denies every ``Write``, so each phase silently no-ops. This mirrors
+        denies every ``Write``, so each node silently no-ops. This mirrors
         :meth:`CodexRuntime.in_docker` setting ``bypass_sandbox=True`` to carry
         :data:`CODEX_DOCKER_BYPASS`. The host constructor's default stays
         ``False`` so host runs never auto-skip.
@@ -159,7 +159,7 @@ class ClaudeRuntime:
 
         def wrap(inner_argv: list[str], cwd: Path) -> list[str]:
             # The mount source stays the workspace root so a linked worktree's
-            # .git file resolves inside the container; -w follows the per-phase
+            # .git file resolves inside the container; -w follows the per-node
             # cwd (the issue worktree) so the agent writes there, not the root.
             return sandbox.build_run_command(
                 cls.name,
@@ -196,8 +196,8 @@ class ClaudeRuntime:
             cmd.append("--dangerously-skip-permissions")
         return cmd
 
-    def run(self, prompt: str, *, cwd: Path, phase: str) -> RuntimeResult:
-        """Run the agent for one phase and return its parsed result.
+    def run(self, prompt: str, *, cwd: Path, node: str) -> RuntimeResult:
+        """Run the agent for one node and return its parsed result.
 
         Raises :class:`AgentCrashError` when the agent exits non-zero.
 
@@ -222,9 +222,9 @@ class ClaudeRuntime:
         result_info: dict[str, Any] | None = None
         result_text = ""
         emit_thinking = _make_emitter(
-            "THINKING", phase, self.verbose, self.transcript_sink
+            "THINKING", node, self.verbose, self.transcript_sink
         )
-        emit_output = _make_emitter("OUTPUT", phase, self.verbose, self.transcript_sink)
+        emit_output = _make_emitter("OUTPUT", node, self.verbose, self.transcript_sink)
 
         try:
             assert proc.stdout is not None
@@ -256,32 +256,32 @@ class ClaudeRuntime:
         if is_error:
             logger.error(
                 "[%s] claude exited with code %s: %s",
-                phase,
+                node,
                 proc.returncode,
                 stderr_text[:500],
             )
             raise AgentCrashError(
-                f"claude crashed during {phase} (exit code {proc.returncode})",
-                phase=phase,
+                f"claude crashed during {node} (exit code {proc.returncode})",
+                node=node,
                 exit_code=proc.returncode,
             )
 
         output = "".join(output_buf) if output_buf else result_text
-        telemetry = _build_telemetry(self.name, phase, result_info)
+        telemetry = _build_telemetry(self.name, node, result_info)
         return RuntimeResult(output=output, telemetry=telemetry)
 
 
 def _make_emitter(
     tag: str,
-    phase: str,
+    node: str,
     verbose: bool,
     sink: Callable[[str, str, str], None] | None,
 ) -> Callable[[str], None] | None:
     """Build a tagged live+persist emitter, or ``None`` when not verbose.
 
     ``tag`` is ``"THINKING"`` or ``"OUTPUT"``. The emitter is the single place a
-    chunk has a side effect: it logs the ``[<tag>:<phase>]`` line (live surfacing,
-    symmetric across both streams) and forwards ``(phase, tag, text)`` to the sink
+    chunk has a side effect: it logs the ``[<tag>:<node>]`` line (live surfacing,
+    symmetric across both streams) and forwards ``(node, tag, text)`` to the sink
     (run-dir persistence). Returning ``None`` when ``verbose`` is off lets the
     stream parsers skip the chunk with no per-event flag check, so non-verbose
     behaviour is byte-for-byte unchanged.
@@ -292,9 +292,9 @@ def _make_emitter(
     def emit(text: str) -> None:
         if not text:
             return
-        logger.info("[%s:%s] %s", tag, phase, text)
+        logger.info("[%s:%s] %s", tag, node, text)
         if sink is not None:
-            sink(phase, tag, text)
+            sink(node, tag, text)
 
     return emit
 
@@ -308,14 +308,14 @@ def _collect_assistant_text(
 ) -> None:
     """Append assistant ``text`` blocks from one stream-json event.
 
-    ``text`` blocks always accumulate into ``output_buf`` (the handoff output);
+    ``text`` blocks always accumulate into ``output_buf`` (the Runtime output);
     on a verbose run they are *also* surfaced via ``on_output``, so a reader sees
-    what the model said even when the phase emitted no thinking (#52). When
+    what the model said even when the node emitted no thinking (#52). When
     ``on_thinking`` is given it is called with each ``thinking`` block's text.
 
     As a format-shift fallback mirroring Ralph, a ``content_block_delta`` is
     handled too: a ``thinking_delta`` routes to ``on_thinking``; a ``text_delta``
-    both appends to ``output_buf`` (so a delta-only stream still yields handoff
+    both appends to ``output_buf`` (so a delta-only stream still yields edge context
     output) and routes to ``on_output``. A callback left ``None`` drops its
     stream's surfacing, keeping non-verbose behaviour byte-for-byte unchanged.
     """
@@ -356,11 +356,11 @@ def _parse_result_event(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_telemetry(
-    runtime: str, phase: str, result_info: dict[str, Any] | None
+    runtime: str, node: str, result_info: dict[str, Any] | None
 ) -> Telemetry:
     """Turn a parsed result event into a :class:`Telemetry` record."""
     if result_info is None:
-        return Telemetry(runtime=runtime, phase=phase)
+        return Telemetry(runtime=runtime, node=node)
 
     usage_raw = result_info.get("usage")
     usage = None
@@ -374,7 +374,7 @@ def _build_telemetry(
 
     return Telemetry(
         runtime=runtime,
-        phase=phase,
+        node=node,
         cost_usd=result_info.get("cost_usd"),
         duration_ms=result_info.get("duration_ms"),
         num_turns=result_info.get("num_turns"),
@@ -421,8 +421,8 @@ class CodexRuntime:
     Codex reports no cost or duration, so :attr:`Telemetry.duration_ms` stays
     ``None`` and PyCastle's own measured wall time is recorded as
     ``elapsed_ms``. The thread id from ``thread.started`` is surfaced as
-    :attr:`Telemetry.thread_id` and is the handle a later handoff resumes via
-    :meth:`run` with ``resume_thread_id``.
+    :attr:`Telemetry.thread_id` and is the handle a later edge context resumes via
+    :meth:`run` with ``provider thread``.
 
     Like :class:`ClaudeRuntime`, an ``argv_wrapper`` (or :meth:`in_docker`)
     wraps the inner ``codex …`` argv before launch — for the Docker sandbox,
@@ -444,18 +444,18 @@ class CodexRuntime:
         verbose: bool = False,
         transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> None:
-        """Configure the CLI invocation shared across phases.
+        """Configure the CLI invocation shared across nodes.
 
         ``bypass_sandbox`` swaps the scoped host sandbox (``-s``
         :data:`CODEX_HOST_SANDBOX`) for the full :data:`CODEX_DOCKER_BYPASS`;
         :meth:`in_docker` sets it so Codex can write inside the container.
 
         ``verbose`` turns on transcript capture: each ``agent_message`` (the
-        model's prose narration) is surfaced as an ``[OUTPUT:<phase>]`` line so a
+        model's prose narration) is surfaced as an ``[OUTPUT:<node>]`` line so a
         thinking-less codex run is still legible (#52), and if Codex's stream
-        emits a reasoning item it is surfaced as a ``[THINKING:<phase>]`` line,
+        emits a reasoning item it is surfaced as a ``[THINKING:<node>]`` line,
         exactly like Claude. Both are also handed to ``transcript_sink`` as
-        ``(phase, tag, text)`` to persist; when no reasoning item appears the run
+        ``(node, tag, text)`` to persist; when no reasoning item appears the run
         logs once that codex reasoning text is unavailable (the
         ``reasoning_output_tokens`` count still lands in telemetry). Off by
         default.
@@ -477,7 +477,7 @@ class CodexRuntime:
         verbose: bool = False,
         transcript_sink: Callable[[str, str, str], None] | None = None,
     ) -> CodexRuntime:
-        """Build a Codex runtime that runs each phase inside the Docker sandbox.
+        """Build a Codex runtime that runs each node inside the Docker sandbox.
 
         The inner ``codex …`` argv (carrying :data:`CODEX_DOCKER_BYPASS`) is
         wrapped into a ``docker run`` argv (see
@@ -488,7 +488,7 @@ class CodexRuntime:
         """
 
         def wrap(inner_argv: list[str], cwd: Path) -> list[str]:
-            # -w follows the per-phase cwd so it agrees with the inner ``-C``
+            # -w follows the per-node cwd so it agrees with the inner ``-C``
             # (both the resolved worktree); the mount source stays the workspace
             # root so a linked worktree's .git file resolves in the container.
             return sandbox.build_run_command(
@@ -507,14 +507,12 @@ class CodexRuntime:
             transcript_sink=transcript_sink,
         )
 
-    def build_command(
-        self, prompt: str, *, cwd: Path, resume_thread_id: str | None = None
-    ) -> list[str]:
+    def build_command(self, prompt: str, *, cwd: Path) -> list[str]:
         """Build the ``codex exec`` argv for one non-interactive run.
 
-        Without ``resume_thread_id`` this starts a fresh thread
+        Without ``provider thread`` this starts a fresh thread
         (``codex … exec --json <prompt>``); with one it resumes that thread
-        (``codex … exec resume --json <thread_id> <prompt>``) so a handoff
+        (``codex … exec resume --json <thread_id> <prompt>``) so a edge context
         continues the conversation that did the failed attempt.
 
         ``cwd`` is resolved to an absolute path for the ``-C`` value. Codex
@@ -539,18 +537,12 @@ class CodexRuntime:
         cmd = [self.command, "-C", str(Path(cwd).resolve())]
         if self.model is not None:
             cmd += ["--model", self.model]
-        if self.verbose:
-            cmd += ["-c", CODEX_REASONING_SUMMARY_CONFIG]
         if self.bypass_sandbox:
             cmd.append(CODEX_DOCKER_BYPASS)
         else:
             cmd += ["-s", CODEX_HOST_SANDBOX]
         cmd.append("exec")
-        if resume_thread_id is not None:
-            cmd.append("resume")
         cmd.append("--json")
-        if resume_thread_id is not None:
-            cmd.append(resume_thread_id)
         cmd.append(prompt)
         return cmd
 
@@ -559,13 +551,12 @@ class CodexRuntime:
         prompt: str,
         *,
         cwd: Path,
-        phase: str,
-        resume_thread_id: str | None = None,
+        node: str,
     ) -> RuntimeResult:
-        """Run the agent for one phase and return its parsed result.
+        """Run the agent for one node and return its parsed result.
 
-        Pass ``resume_thread_id`` to continue a prior thread (used for
-        handoffs). Raises :class:`AgentCrashError` when the agent exits
+        Pass ``provider thread`` to continue a prior thread (used for
+        edge contexts). Raises :class:`AgentCrashError` when the agent exits
         non-zero.
 
         ``cwd`` is resolved to an absolute path once so the ``-C`` value and the
@@ -573,7 +564,7 @@ class CodexRuntime:
         relative ``-C`` against the process cwd and double the path.
         """
         cwd = Path(cwd).resolve()
-        cmd = self.build_command(prompt, cwd=cwd, resume_thread_id=resume_thread_id)
+        cmd = self.build_command(prompt, cwd=cwd)
         if self.argv_wrapper is not None:
             cmd = self.argv_wrapper(cmd, cwd)
         started_at = time.perf_counter()
@@ -590,9 +581,9 @@ class CodexRuntime:
         usage: dict[str, Any] = {}
         num_turns = 0
         emit_thinking = _make_emitter(
-            "THINKING", phase, self.verbose, self.transcript_sink
+            "THINKING", node, self.verbose, self.transcript_sink
         )
-        emit_output = _make_emitter("OUTPUT", phase, self.verbose, self.transcript_sink)
+        emit_output = _make_emitter("OUTPUT", node, self.verbose, self.transcript_sink)
         saw_reasoning = False
 
         try:
@@ -634,7 +625,7 @@ class CodexRuntime:
             logger.info(
                 "[%s] codex reasoning text is unavailable "
                 "(reasoning_output_tokens=%s in telemetry)",
-                phase,
+                node,
                 usage.get("reasoning_output_tokens", "unavailable"),
             )
 
@@ -644,18 +635,18 @@ class CodexRuntime:
         if proc.returncode != 0:
             logger.error(
                 "[%s] codex exited with code %s: %s",
-                phase,
+                node,
                 proc.returncode,
                 stderr_text[:500],
             )
             raise AgentCrashError(
-                f"codex crashed during {phase} (exit code {proc.returncode})",
-                phase=phase,
+                f"codex crashed during {node} (exit code {proc.returncode})",
+                node=node,
                 exit_code=proc.returncode,
             )
 
         telemetry = _build_codex_telemetry(
-            phase,
+            node,
             thread_id=thread_id,
             usage=usage,
             num_turns=num_turns,
@@ -676,7 +667,7 @@ def _collect_codex_item(
     Codex narrates tool runs and file changes as their own ``item.completed``
     events; only ``agent_message`` items are the model's prose output, so the
     verbose command/file-change items are dropped. The ``agent_message`` text
-    always accumulates into ``output_buf`` (the handoff output); on a verbose run
+    always accumulates into ``output_buf`` (the Runtime output); on a verbose run
     it is *also* routed to ``on_output``, so a thinking-less codex run is still
     legible from the streamed transcript alone (#52).
 
@@ -736,7 +727,7 @@ def _codex_reasoning_text(item: dict[str, Any]) -> str:
 
 
 def _build_codex_telemetry(
-    phase: str,
+    node: str,
     *,
     thread_id: str | None,
     usage: dict[str, Any],
@@ -762,7 +753,7 @@ def _build_codex_telemetry(
         )
     return Telemetry(
         runtime=CodexRuntime.name,
-        phase=phase,
+        node=node,
         cost_usd=None,
         duration_ms=None,
         elapsed_ms=elapsed_ms,

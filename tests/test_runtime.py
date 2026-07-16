@@ -21,12 +21,12 @@ def test_stub_runtime_satisfies_runtime_protocol() -> None:
 
 
 def test_stub_runtime_writes_deterministic_change(tmp_path: Path) -> None:
-    result = StubRuntime().run("a prompt", cwd=tmp_path, phase="implement")
+    result = StubRuntime().run("a prompt", cwd=tmp_path, node="implement")
 
     assert (tmp_path / STUB_MARKER).is_file()
     assert STUB_MARKER in result.output
     assert result.telemetry.runtime == "stub"
-    assert result.telemetry.phase == "implement"
+    assert result.telemetry.node == "implement"
     assert result.telemetry.num_turns == 1
     assert result.telemetry.is_error is False
 

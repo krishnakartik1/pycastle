@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import pycastle.graph as graph_module
 from pycastle.graph import (
     DONE,
     HUMAN,
@@ -150,3 +151,18 @@ def test_load_run_reads_new_fixture_vocabulary(tmp_path: Path) -> None:
         "run=build_run(item=execution_graph(start='g',nodes=[gate_node('g')]))\n"
     )
     assert isinstance(load_run(fixture).item.nodes["g"], GateNode)
+
+
+def test_legacy_graph_surface_is_absent() -> None:
+    for name in (
+        "Phase",
+        "PhaseGraph",
+        "PhaseResult",
+        "phase",
+        "build",
+        "load_graph",
+        "GraphExecutor",
+        "WalkResult",
+        "DEFAULT_VISIT_CAP",
+    ):
+        assert not hasattr(graph_module, name)

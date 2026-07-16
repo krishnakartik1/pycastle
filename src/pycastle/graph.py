@@ -8,9 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
 
-from .models import RuntimeResult
-from .runtime import AgentCrashError, Runtime
-
 
 @dataclass(frozen=True)
 class Terminal:
@@ -23,7 +20,6 @@ class Terminal:
 DONE = Terminal("DONE")
 HUMAN = Terminal("HUMAN")
 MAX_NODE_VISITS = 10
-DEFAULT_VISIT_CAP = MAX_NODE_VISITS
 
 
 @dataclass(frozen=True)
@@ -48,11 +44,6 @@ ExecutionNode: TypeAlias = RuntimeNode | GateNode
 class ExecutionGraph:
     start: str
     nodes: dict[str, ExecutionNode] = field(default_factory=dict)
-
-    @property
-    def phases(self) -> dict[str, ExecutionNode]:
-        """Temporary internal bridge for the surrounding Run lifecycle."""
-        return self.nodes
 
 
 @dataclass(frozen=True)
@@ -145,10 +136,6 @@ def load_run(fixture_dir: Path) -> RunDefinition:
     return run
 
 
-def load_graph(fixture_dir: Path) -> ExecutionGraph:
-    return load_run(fixture_dir).item
-
-
 @dataclass(frozen=True)
 class NodeVisit:
     node: ExecutionNode
@@ -191,82 +178,3 @@ def walk_execution_graph(graph: ExecutionGraph, visit: NodeVisitor) -> Execution
         predecessor = outcome.evidence
         destination = current.on_success if outcome.success else current.on_failure
     return ExecutionWalk(destination, tuple(history))
-
-
-# Internal compatibility while the retained Run lifecycle is moved to Node terms.
-Phase = RuntimeNode
-PhaseGraph = ExecutionGraph
-PhaseResult = dataclass(
-    type(
-        "PhaseResult", (), {"__annotations__": {"phase": str, "result": RuntimeResult}}
-    )
-)
-
-
-def phase(name: str, prompt: str, **edges: object) -> RuntimeNode:
-    return runtime_node(name, prompt, **edges)  # type: ignore[arg-type]
-
-
-def build(*, start: str, phases: Sequence[RuntimeNode]) -> ExecutionGraph:
-    return execution_graph(start=start, nodes=phases)
-
-
-@dataclass
-class WalkResult:
-    results: list[PhaseResult]
-    terminal: Terminal
-
-
-class GraphExecutor:
-    """Compatibility adapter over the new fixed-cap walker."""
-
-    def __init__(
-        self, runtime: Runtime, *, fixture_dir: Path, preamble: str = "", **_: object
-    ):
-        self.runtime = runtime
-        self.fixture_dir = fixture_dir
-        self.preamble = preamble
-
-    def render_prompt(self, node: RuntimeNode, extra: str | None = None) -> str:
-        prompt = (self.fixture_dir / "prompts" / node.prompt).read_text()
-        return "\n\n".join(x for x in (self.preamble, prompt, extra) if x)
-
-    def _default_runner(self, cwd: Path):
-        def run_once(node: RuntimeNode, extra: str | None):
-            try:
-                result = self.runtime.run(
-                    self.render_prompt(node, extra), cwd=cwd, phase=node.name
-                )
-            except AgentCrashError:
-                return False, []
-            return True, [PhaseResult(node.name, result)]
-
-        return run_once
-
-    def execute(
-        self, graph: ExecutionGraph, *, cwd: Path, phase_context=None, phase_runner=None
-    ) -> WalkResult:
-        results: list[PhaseResult] = []
-        context = phase_context or {}
-
-        def invoke(entry: NodeVisit) -> NodeOutcome:
-            node = entry.node
-            if not isinstance(node, RuntimeNode):
-                raise TypeError("GraphExecutor requires an explicit Gate visitor")
-            if phase_runner is not None:
-                passed, produced = phase_runner(node, context.get(node.name))
-                results.extend(produced)
-                return NodeOutcome(passed)
-            try:
-                result = self.runtime.run(
-                    self.render_prompt(node, context.get(node.name)),
-                    cwd=cwd,
-                    phase=node.name,
-                )
-            except AgentCrashError:
-                return NodeOutcome(False)
-            results.append(PhaseResult(node.name, result))
-            return NodeOutcome(True)
-
-        walked = walk_execution_graph(graph, invoke)
-        return WalkResult(results, walked.terminal)

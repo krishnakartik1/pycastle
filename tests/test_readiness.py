@@ -83,11 +83,11 @@ def _valid_fixture(path: Path) -> Path:
     prompts.mkdir(parents=True)
     (fixture / "version").write_text("0.1.0\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build, build_run, phase\n"
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
         "run = build_run(\n"
-        " before=build(start='prepare', phases=[phase('prepare', 'before.md')]),\n"
-        " item=build(start='work', phases=[phase('work', 'item.md')]),\n"
-        " after=build(start='report', phases=[phase('report', 'after.md')]),\n"
+        " before=execution_graph(start='prepare', nodes=[runtime_node('prepare', 'before.md')]),\n"
+        " item=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')]),\n"
+        " after=execution_graph(start='report', nodes=[runtime_node('report', 'after.md')]),\n"
         ")\n"
     )
     for name in ("before.md", "item.md", "after.md"):

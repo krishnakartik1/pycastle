@@ -128,6 +128,9 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     )
 
     for relative in scaffolded_tree:
+        if relative == "gate":
+            # The repository customizes its project-owned Gate after init.
+            continue
         assert (committed / relative).read_bytes() == (
             scaffolded / relative
         ).read_bytes(), f"{relative} has drifted from the scaffolder output"
