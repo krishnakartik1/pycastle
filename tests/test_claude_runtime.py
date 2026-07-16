@@ -416,12 +416,10 @@ def test_in_docker_resolves_relative_workspace(
     runtime = ClaudeRuntime.in_docker(
         image="sha256:" + ("a" * 64), workspace=Path("repo")
     )
-    runtime.run("p", cwd=tmp_path, phase="implement")
+    runtime.run("p", cwd=tmp_path / "repo", phase="implement")
 
     argv = mock_popen.call_args.args[0]
-    # -w now follows the run cwd (covered elsewhere); the relative-workspace
-    # guarantee is about the bind-mount *source*, which must be resolved so the
-    # container does not fail to start on a relative mount.
+    # The relative workspace is resolved for both the bind mount and workdir.
     repo = str((tmp_path / "repo").resolve())
     assert f"{repo}:{repo}" in argv
 

@@ -55,6 +55,18 @@ def auth_volume(runtime_name: str) -> str:
     return f"pycastle-{runtime_name}-auth"
 
 
+def _validate_image(image: str) -> None:
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError("An immutable Agent image identity is required")
+
+
+def _validate_inner_argv(inner_argv: Sequence[str]) -> None:
+    if isinstance(inner_argv, str) or not inner_argv:
+        raise ValueError("A non-empty container process argv is required")
+    if any(not isinstance(argument, str) or not argument for argument in inner_argv):
+        raise ValueError("Container process arguments must be non-empty strings")
+
+
 def _environment_args(
     runtime_name: str, environment: Mapping[str, str] | None = None
 ) -> list[str]:
@@ -82,10 +94,16 @@ def build_run_command(
     environment: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Wrap one process in a disposable container using a pinned image."""
-    if not image.strip():
-        raise ValueError("An immutable Agent image identity is required")
-    workspace_path = str(Path(workspace).resolve())
-    workdir_path = str(Path(workdir).resolve()) if workdir else workspace_path
+    _validate_image(image)
+    _validate_inner_argv(inner_argv)
+    workspace_resolved = Path(workspace).resolve()
+    workdir_resolved = (
+        Path(workdir).resolve() if workdir is not None else workspace_resolved
+    )
+    if not workdir_resolved.is_relative_to(workspace_resolved):
+        raise ValueError("Docker workdir must be within the mounted workspace")
+    workspace_path = str(workspace_resolved)
+    workdir_path = str(workdir_resolved)
     return [
         "docker",
         "run",
@@ -103,6 +121,7 @@ def build_run_command(
 
 
 def build_login_command(runtime_name: str, *, image: str) -> list[str]:
+    _validate_image(image)
     config = _config_for(runtime_name)
     tty = ["-it"] if runtime_name == "claude" else []
     return [
@@ -119,6 +138,7 @@ def build_login_command(runtime_name: str, *, image: str) -> list[str]:
 
 
 def build_status_command(runtime_name: str, *, image: str) -> list[str]:
+    _validate_image(image)
     config = _config_for(runtime_name)
     return [
         "docker",

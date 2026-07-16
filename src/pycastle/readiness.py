@@ -606,10 +606,10 @@ class DefaultReadinessAdapter:
             self._docker_workspace = Path(
                 tempfile.mkdtemp(prefix="pycastle-doctor-")
             ).resolve()
-            # Docker always runs as the canonical ``node`` user, whose uid may
-            # differ from the host caller that owns this directory. This path
-            # holds no repository or credential data, so allow that user to
-            # traverse and write the disposable bind mount.
+            # The image-declared user may have a uid different from the host
+            # caller that owns this directory. This path holds no repository or
+            # credential data, so allow that user to traverse and write the
+            # disposable bind mount.
             self._docker_workspace.chmod(0o777)
         return self._docker_workspace
 

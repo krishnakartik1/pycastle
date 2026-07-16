@@ -75,7 +75,37 @@ def test_environment_is_narrowly_allow_listed(tmp_path: Path) -> None:
 
 
 def test_image_is_required(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="immutable"):
+    builders = (
+        lambda image: sandbox.build_run_command(
+            "claude", inner_argv=["true"], workspace=tmp_path, image=image
+        ),
+        lambda image: sandbox.build_login_command("claude", image=image),
+        lambda image: sandbox.build_status_command("claude", image=image),
+    )
+    for builder in builders:
+        with pytest.raises(ValueError, match="immutable"):
+            builder(" ")
+
+
+@pytest.mark.parametrize("inner_argv", [[], "true", [""], ["true", None]])
+def test_run_requires_non_empty_string_arguments(
+    tmp_path: Path, inner_argv: object
+) -> None:
+    with pytest.raises(ValueError, match="process argv|arguments"):
         sandbox.build_run_command(
-            "claude", inner_argv=["true"], workspace=tmp_path, image=" "
+            "claude",
+            inner_argv=inner_argv,  # type: ignore[arg-type]
+            workspace=tmp_path,
+            image=IMAGE,
+        )
+
+
+def test_workdir_must_be_available_through_workspace_mount(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="within the mounted workspace"):
+        sandbox.build_run_command(
+            "claude",
+            inner_argv=["true"],
+            workspace=tmp_path / "workspace",
+            workdir=tmp_path / "other-worktree",
+            image=IMAGE,
         )

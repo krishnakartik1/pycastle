@@ -1167,9 +1167,8 @@ def test_run_docker_builds_a_sandboxed_codex_runtime(
     runtime = captured["runtime"]
     assert runtime.name == "codex"
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(
-        ["codex", "exec", "--json", "x"], Path("/repo/worktree")
-    )
+    worktree = tmp_path / ".pycastle" / "worktrees" / "issue-1"
+    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"], worktree)
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-codex-auth:/pycastle/auth" in wrapped
 
@@ -1491,9 +1490,8 @@ def test_build_runtime_docker_codex_builds_a_sandboxed_runtime(
     )
     assert runtime.name == "codex"
     assert runtime.argv_wrapper is not None
-    wrapped = runtime.argv_wrapper(
-        ["codex", "exec", "--json", "x"], Path("/repo/worktree")
-    )
+    worktree = tmp_path / ".pycastle" / "worktrees" / "issue-1"
+    wrapped = runtime.argv_wrapper(["codex", "exec", "--json", "x"], worktree)
     assert wrapped[:3] == ["docker", "run", "--rm"]
     assert "pycastle-codex-auth:/pycastle/auth" in wrapped
     assert "CODEX_HOME=/pycastle/auth" in wrapped
