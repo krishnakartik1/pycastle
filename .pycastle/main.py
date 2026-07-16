@@ -1,4 +1,8 @@
-"""Project-owned PyCastle Run definition."""
+"""Project-owned PyCastle Run definition.
+
+Gate placement and recovery are ordinary graph topology. Every Gate node invokes
+the same frozen `.pycastle/gate`; a Gate-node name is identity, not a hook name.
+"""
 
 from pycastle.graph import DONE, build_run, execution_graph, gate_node, runtime_node
 

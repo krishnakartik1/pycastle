@@ -1,16 +1,9 @@
-# PyCastle run output (transient): run logs and generated run artifacts.
-logs/
-runs/
-worktrees/
+# Ignored local Run state and worktrees.
+/logs/
+/runs/
+/worktrees/
 
-# PyCastle Runtime scratch files (transient): the plan a phase leaves for the next,
-# a retried attempt's handoff, and any issue scratch. They land in .pycastle/
-# during a run; excluding them keeps `git add -A` from committing them into an
-# issue branch. Anchored here so they never shadow the tracked prompts/plan.md.
-/handoff.md
+# Runtime-authored scratch artifacts.
 /plan.md
-/issue.md
-/plan-issue-*.md
 /run-review.md
 /run-report.md
-/venv/

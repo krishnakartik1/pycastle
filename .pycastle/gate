@@ -1,32 +1,12 @@
-#!/usr/bin/env bash
-# PyCastle project quality gate.
+#!/bin/sh
+# Project-owned verification policy for the current worktree.
 #
-# PyCastle runs this script inside each issue's worktree after the implement
-# phase. Exit 0 means the gates passed; any non-zero exit means they failed and
-# the attempt is retried with a handoff document (#8, wired through `pycastle
-# run` in #14). The script is project-owned: edit it to change what "passing"
-# means for this repo. `pycastle init` (#11) scaffolds a default gate matching
-# this convention.
-set -euo pipefail
+# PyCastle invokes this executable directly from every Gate node after Setup.
+# PYCASTLE_SCOPE is either "item" or "run". Exit 0 only when this worktree meets
+# the project's complete verification policy.
+set -eu
 
-if [ "${1:-}" = "--check-tools" ]; then
-  missing=()
-  # Preflight validates the agent image contract, not a host checkout's
-  # bind-mounted virtualenv. Per-item worktrees do not contain the ignored
-  # .venv, so accepting it here would let preflight pass and the real gate fail.
-  command -v ruff >/dev/null 2>&1 || missing+=("ruff")
-  command -v black >/dev/null 2>&1 || missing+=("black")
-  command -v pytest >/dev/null 2>&1 || missing+=("pytest")
-  if [ "${#missing[@]}" -ne 0 ]; then
-    echo "Missing gate tools: ${missing[*]}" >&2
-    exit 1
-  fi
-  exit 0
-fi
-
-fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source "$fixture_dir/setup"
-
-python -m ruff check . --exit-non-zero-on-fix
-python -m black --check .
-python -m pytest -q
+echo "ERROR: .pycastle/gate has not been configured." >&2
+echo "Replace this body with the project's verification commands." >&2
+echo "Scope: ${PYCASTLE_SCOPE:-unset}" >&2
+exit 1

@@ -4,14 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from pycastle.graph import GateNode, RuntimeNode, load_run
+from pycastle.graph import DONE, GateNode, RuntimeNode, load_run
 from pycastle.scaffold import FixtureExistsError, scaffold_fixture
 
 
-def _snapshot(root: Path) -> dict[str, bytes]:
+def _snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
     fixture = root / ".pycastle"
     return {
-        str(path.relative_to(fixture)): path.read_bytes()
+        str(path.relative_to(fixture)): (
+            path.read_bytes(),
+            stat.S_IMODE(path.stat().st_mode),
+        )
         for path in fixture.rglob("*")
         if path.is_file()
     }
@@ -33,8 +36,25 @@ def test_scaffold_is_language_neutral_and_sandboxes_only_change_marker(
     assert {name for name in host_files if host_files[name] != docker_files[name]} == {
         "sandbox"
     }
-    assert b"pip install" not in host_files["setup"]
-    assert b"python3 -m venv" not in host_files["setup"]
+    assert b"pip install" not in host_files["setup"][0]
+    assert b"python3 -m venv" not in host_files["setup"][0]
+
+
+def test_scaffold_ignores_all_repository_contents(tmp_path: Path) -> None:
+    clean, noisy = tmp_path / "clean", tmp_path / "noisy"
+    clean.mkdir()
+    noisy.mkdir()
+    (noisy / "package.json").write_text("not json")
+    (noisy / "nested").mkdir()
+    (noisy / "nested/Cargo.toml").write_text("[broken")
+    (noisy / "go.mod").write_text("module unrelated")
+    (noisy / "executable").write_text("#!/bin/sh\n")
+    (noisy / "executable").chmod(0o755)
+
+    scaffold_fixture(clean, sandbox="host")
+    scaffold_fixture(noisy, sandbox="host")
+
+    assert _snapshot(clean) == _snapshot(noisy)
 
 
 @pytest.mark.parametrize("sandbox", ["host", "docker"])
@@ -46,10 +66,23 @@ def test_hooks_are_direct_executables_with_safe_defaults(
     gate = tmp_path / ".pycastle/gate"
     assert stat.S_IMODE(setup.stat().st_mode) == 0o755
     assert stat.S_IMODE(gate.stat().st_mode) == 0o755
-    assert subprocess.run([setup], stdin=subprocess.DEVNULL).returncode == 0
-    assert subprocess.run([gate], stdin=subprocess.DEVNULL).returncode != 0
-    assert "PYCASTLE_SCOPE" in setup.read_text()
-    assert "not been configured" in gate.read_text()
+    for scope in ("item", "run"):
+        environment = {"PYCASTLE_SCOPE": scope}
+        setup_result = subprocess.run(
+            [setup], stdin=subprocess.DEVNULL, env=environment, capture_output=True
+        )
+        gate_result = subprocess.run(
+            [gate], stdin=subprocess.DEVNULL, env=environment, capture_output=True
+        )
+        assert setup_result.returncode == 0
+        assert gate_result.returncode != 0
+        assert scope.encode() in gate_result.stderr
+    setup_text = setup.read_text()
+    assert "repeat" in setup_text.lower()
+    assert "durable" in setup_text.lower()
+    gate_text = gate.read_text()
+    assert "verification" in gate_text.lower()
+    assert "exit 0" in gate_text.lower()
 
 
 def test_initialized_graph_has_explicit_verify_and_repair_topology(
@@ -61,9 +94,22 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
     assert isinstance(run.item.nodes["verify"], GateNode)
     assert isinstance(run.item.nodes["repair"], RuntimeNode)
     assert run.item.nodes["verify"].on_failure == "repair"
+    assert run.item.nodes["verify"].on_success == DONE
+    assert run.item.nodes["repair"].on_success == "verify"
     assert run.after is not None
     assert run.after.nodes["run-verify"].on_failure == "run-repair"
+    assert run.after.nodes["run-verify"].on_success == DONE
     assert run.after.nodes["run-repair"].on_success == "run-report"
+    assert list(run.after.nodes) == [
+        "run-review",
+        "run-report",
+        "run-verify",
+        "run-repair",
+    ]
+    for graph in (run.item, run.after):
+        for node in graph.nodes.values():
+            if isinstance(node, RuntimeNode):
+                assert (tmp_path / ".pycastle/prompts" / node.prompt).is_file()
 
 
 def test_dockerfile_is_neutral_and_has_project_extension(tmp_path: Path) -> None:
@@ -72,6 +118,12 @@ def test_dockerfile_is_neutral_and_has_project_extension(tmp_path: Path) -> None
     assert "PROJECT TOOLCHAIN" in text
     assert "/pycastle/auth" in text
     assert "USER pycastle" in text
+    assert "@anthropic-ai/claude-code" in text
+    assert "@openai/codex" in text
+    assert "ca-certificates" in text
+    assert "git" in text
+    assert "procps" in text
+    assert "HOME=/home/pycastle" in text
     assert "python3" not in text and "ruff" not in text and "pytest" not in text
 
 

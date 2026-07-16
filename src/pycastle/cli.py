@@ -71,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("host", "docker"),
         default=None,
         help=(
-            "Default Sandbox recorded in the Project fixture. When omitted, "
-            "init prompts; an empty answer or unavailable stdin defaults to host."
+            "Sandbox recorded in the Project fixture. When omitted from an "
+            "attached terminal, init requires an explicit host or Docker choice."
         ),
     )
     sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
@@ -481,36 +481,50 @@ def _cmd_runtime_login(args: argparse.Namespace) -> int:
     return 0
 
 
-def _prompt_sandbox() -> SandboxChoice:
-    """Ask whether execution is host-first or Docker-first; default to host.
+class SandboxSelectionError(Exception):
+    """Raised when initialization cannot obtain an explicit Sandbox choice."""
 
-    The default is host-first because it needs no Docker image build to run the
-    scaffolded fixture. An empty answer (Enter) takes the default; ``docker``
-    (or ``d``) picks Docker-first. End-of-file is treated like an empty answer
-    so non-interactive callers retain the host default.
-    """
-    try:
-        answer = (
-            input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
-        )
-    except EOFError:
-        answer = ""
-    return "docker" if answer in {"docker", "d"} else "host"
+
+def _prompt_sandbox() -> SandboxChoice:
+    """Prompt until an attached maintainer explicitly chooses host or Docker."""
+    while True:
+        try:
+            answer = input("Sandbox: [h]ost or [d]ocker? ").strip().lower()
+        except EOFError as exc:
+            raise SandboxSelectionError from exc
+        if answer in {"host", "h"}:
+            return "host"
+        if answer in {"docker", "d"}:
+            return "docker"
+        logger.error("Choose 'host' or 'docker'.")
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle init``: scaffold the Project fixture into the cwd.
 
-    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts for
-    host-first vs Docker-first when omitted. Refuses to clobber an existing
+    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts an
+    attached maintainer for host or Docker when omitted. Refuses to clobber an existing
     ``.pycastle/`` so a project's prompts, gate, and graph shape are never
     silently replaced.
     """
-    choice = (
-        cast(SandboxChoice, args.sandbox)
-        if args.sandbox is not None
-        else _prompt_sandbox()
-    )
+    if args.sandbox is not None:
+        choice = cast(SandboxChoice, args.sandbox)
+    else:
+        if not sys.stdin.isatty():
+            logger.error(
+                "A Sandbox choice is required for non-interactive initialization. "
+                "Run `pycastle init --sandbox host` or "
+                "`pycastle init --sandbox docker`."
+            )
+            return 2
+        try:
+            choice = _prompt_sandbox()
+        except SandboxSelectionError:
+            logger.error(
+                "No Sandbox was selected. Run `pycastle init --sandbox host` or "
+                "`pycastle init --sandbox docker`."
+            )
+            return 2
     try:
         written = scaffold_fixture(Path.cwd(), sandbox=choice)
     except FixtureExistsError as exc:
@@ -518,14 +532,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     logger.info(
-        "Scaffolded the PyCastle Project fixture (%s-first) into .pycastle/:",
+        "Scaffolded the PyCastle Project fixture (Sandbox: %s) into .pycastle/:",
         choice,
     )
     for path in written:
         logger.info("  %s", path.relative_to(Path.cwd()))
     logger.info(
-        "Edit .pycastle/prompts/, .pycastle/gate, and .pycastle/main.py to "
-        "customize the loop, then run `pycastle run`."
+        "Next: configure .pycastle/setup when durable preparation is needed; "
+        "replace the fail-closed .pycastle/gate with the project's verification "
+        "policy; for Docker use, extend .pycastle/Dockerfile at the project "
+        "toolchain section; then review and commit the complete .pycastle/ "
+        "Project fixture."
     )
     return 0
 

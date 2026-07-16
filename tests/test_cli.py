@@ -908,30 +908,38 @@ def test_parses_init() -> None:
 @pytest.mark.parametrize(
     ("answer", "expected"),
     [
-        ("", "host"),
         ("host", "host"),
         ("H", "host"),
         (" d ", "docker"),
         ("DOCKER", "docker"),
-        ("invalid", "host"),
     ],
 )
 def test_prompt_sandbox_resolves_interactive_answers(
     monkeypatch: pytest.MonkeyPatch, answer: str, expected: str
 ) -> None:
-    """The prompt preserves its Docker aliases and host-first default."""
+    """The attached prompt accepts explicit Sandbox names and short forms."""
     monkeypatch.setattr("builtins.input", lambda _prompt: answer)
 
     assert cli._prompt_sandbox() == expected
 
 
-def test_prompt_sandbox_treats_eof_as_the_default(
+def test_prompt_sandbox_reprompts_until_an_explicit_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Closed stdin resolves directly to host without leaking EOFError."""
+    answers = iter(["", "invalid", "docker"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    assert cli._prompt_sandbox() == "docker"
+
+
+def test_prompt_sandbox_rejects_eof_without_guessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closed stdin cannot silently select a Sandbox."""
     monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
 
-    assert cli._prompt_sandbox() == "host"
+    with pytest.raises(cli.SandboxSelectionError):
+        cli._prompt_sandbox()
 
 
 @pytest.mark.parametrize("sandbox", ["host", "docker"])
@@ -950,16 +958,46 @@ def test_init_sandbox_flag_scaffolds_without_reading_stdin(
     assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == sandbox
 
 
-def test_init_with_closed_stdin_defaults_to_host(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_init_completion_message_is_complete_and_sandbox_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """EOF at the interactive prompt behaves like an empty host-first answer."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    caplog.set_level("INFO", logger="pycastle")
+    messages: dict[str, str] = {}
+    for sandbox in ("host", "docker"):
+        root = tmp_path / sandbox
+        root.mkdir()
+        monkeypatch.chdir(root)
+        caplog.clear()
+        assert main(["init", "--sandbox", sandbox]) == 0
+        messages[sandbox] = caplog.text
+
+    assert messages["host"].replace("host", "SANDBOX") == messages["docker"].replace(
+        "docker", "SANDBOX"
+    )
+    for phrase in (
+        "configure .pycastle/setup when",
+        "fail-closed .pycastle/gate",
+        "extend .pycastle/Dockerfile",
+        "commit the complete .pycastle/",
+    ):
+        assert phrase in messages["host"]
+
+
+def test_init_with_closed_stdin_fails_with_actionable_choices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Non-interactive init requires a scripted Sandbox selection."""
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
 
-    assert main(["init"]) == 0
-    assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
+    assert main(["init"]) != 0
+    assert not (tmp_path / ".pycastle").exists()
+    assert "pycastle init --sandbox host" in caplog.text
+    assert "pycastle init --sandbox docker" in caplog.text
 
 
 def test_invalid_init_sandbox_is_rejected_before_writing(
@@ -1029,7 +1067,8 @@ def test_init_scaffolds_the_chosen_sandbox(
     """
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)
-    # The user picks Docker-first at the prompt.
+    monkeypatch.setattr(cli.sys, "stdin", MagicMock(isatty=lambda: True))
+    # The user picks Docker at the prompt.
     monkeypatch.setattr(cli, "_prompt_sandbox", lambda: "docker")
 
     assert main(["init"]) == 0
@@ -1038,18 +1077,19 @@ def test_init_scaffolds_the_chosen_sandbox(
     assert (fixture / "main.py").is_file()
     assert (fixture / "Dockerfile").is_file()
     assert (fixture / ".gitignore").is_file()
-    # The Docker-first choice is recorded in the scaffolded fixture.
+    # The Docker choice is recorded in the scaffolded fixture.
     assert (fixture / "sandbox").read_text().strip() == "docker"
 
 
-def test_init_defaults_the_prompt_to_host(
+def test_init_empty_answer_requires_an_explicit_choice(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An empty answer at the init prompt defaults to host-first."""
+    """An empty answer is rejected and the attached prompt asks again."""
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)
-    # Simulate the user pressing Enter (empty input) by stubbing input().
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    monkeypatch.setattr(cli.sys, "stdin", MagicMock(isatty=lambda: True))
+    answers = iter(["", "host"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
 
     assert main(["init"]) == 0
     assert (tmp_path / ".pycastle" / "sandbox").read_text().strip() == "host"
@@ -1061,6 +1101,7 @@ def test_init_refuses_to_clobber_an_existing_fixture(
     """Running init where ``.pycastle/`` already exists exits non-zero, no clobber."""
     monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.sys, "stdin", MagicMock(isatty=lambda: True))
     monkeypatch.setattr(cli, "_prompt_sandbox", lambda: "host")
 
     assert main(["init"]) == 0
