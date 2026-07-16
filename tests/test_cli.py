@@ -48,14 +48,7 @@ def ready_run_preflight(
 
     def ready(args: object) -> ReadinessReport:
         sandbox_kind = cli._resolve_sandbox(args.sandbox)
-        image = None
-        if sandbox_kind == "docker":
-            dockerfile = cli.FIXTURE_DIR / cli.DOCKERFILE_NAME
-            image = args.image or (
-                cli.sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-                if dockerfile.is_file()
-                else cli.sandbox.DEFAULT_IMAGE
-            )
+        image = "sha256:" + "a" * 64 if sandbox_kind == "docker" else None
         configuration = ReadinessConfiguration(
             repository="owner/repo",
             base_branch="main",

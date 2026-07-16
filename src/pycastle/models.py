@@ -28,9 +28,9 @@ class Telemetry(BaseModel):
 
     ``duration_ms`` is the runtime-reported wall time when it supplies one
     (Claude does); ``elapsed_ms`` is PyCastle's own measured wall time, used by
-    runtimes that do not report duration (Codex). ``thread_id`` is the resumable
-    conversation handle a runtime exposes for edge contexts (Codex's thread id);
-    ``None`` when the runtime has no resume concept.
+    runtimes that do not report duration (Codex). ``thread_id`` is an opaque
+    provider identifier retained only for audit telemetry; PyCastle never uses
+    it to resume a later Runtime-node visit.
     """
 
     runtime: str

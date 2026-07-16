@@ -220,23 +220,9 @@ def prune_run_branches(
     return deleted
 
 
-#: A gate check decides whether an implement attempt's quality gates passed.
-#: It takes the issue worktree and returns a :class:`GateOutcome` whose
-#: ``passed`` is the green/red verdict and whose ``output`` is the captured gate
-#: text. It is injectable so a "gates red" outcome can drive a retry without
-#: hardcoding a specific project gate command here; the default treats every
-#: attempt as passing (the real gate is the project's own and is wired by the
-#: caller).
 @dataclass
 class GateOutcome:
-    """What running an attempt's quality gate produced.
-
-    ``passed`` is the green/red verdict (the gate exited 0); ``output`` is the
-    captured stdout+stderr the orchestrator surfaces (logged on failure, and
-    persisted into the per-issue transcript so a run is auditable). Replaces the
-    bare bool the gate check used to return so the gate's reasoning is no longer
-    discarded (#28).
-    """
+    """The safe publication facts produced by the most recent Gate node."""
 
     passed: bool
     output: str
@@ -245,13 +231,7 @@ class GateOutcome:
     termination: dict[str, object] | None = None
 
 
-#: The optional project-owned quality gate, relative to the Project fixture.
-#: If this file exists it is run (as an executable) inside the issue worktree
-#: after the implement node; exit 0 means the gates passed, any non-zero exit
-#: means they failed and the attempt is follows its declared edge. The file is
-#: project-owned (it lives in and travels with ``.pycastle/``), so each project
-#: decides its own gate without the runner hardcoding a command. ``pycastle
-#: init`` (#11) will scaffold a default ``gate`` file matching this convention.
+#: Mandatory project-owned executables relative to the Project fixture.
 FIXTURE_GATE = "gate"
 FIXTURE_SETUP = "setup"
 
@@ -267,19 +247,11 @@ class SetupFailure:
 class SetupError(RuntimeError):
     """The frozen Setup prerequisite was not durably established."""
 
-    def __init__(
-        self, failure: SetupFailure | str, message: str = "Setup failed"
-    ) -> None:
-        # String construction is retained for the injected-hook compatibility
-        # boundary; canonical frozen Setup always supplies structured facts.
-        if isinstance(failure, str):
-            super().__init__(failure)
-            self.failure = SetupFailure(
-                ".pycastle/setup", {"kind": "orchestration_error"}
-            )
-        else:
-            super().__init__(message)
-            self.failure = failure
+    def __init__(self, failure: SetupFailure, message: str = "Setup failed") -> None:
+        if not isinstance(failure, SetupFailure):
+            raise TypeError("failure must be a SetupFailure")
+        super().__init__(message)
+        self.failure = failure
 
 
 @dataclass
@@ -829,27 +801,6 @@ def _walk_execution_graph(
     return ExecutionResult(results, walked.terminal), last_gate
 
 
-def _walk_item_graph(
-    issue: IssueRef,
-    *,
-    runtime: Runtime,
-    fixture_dir: Path,
-    issue_worktree: Path,
-    graph: ExecutionGraph,
-    execution: FrozenRunExecution,
-) -> ExecutionResult:
-    """Compatibility wrapper for the shared Item/Run graph visitor."""
-    walk, _ = _walk_execution_graph(
-        issue,
-        runtime=runtime,
-        fixture_dir=fixture_dir,
-        worktree=issue_worktree,
-        graph=graph,
-        execution=execution,
-    )
-    return walk
-
-
 def _work_issue(
     issue: IssueRef,
     *,
@@ -867,18 +818,16 @@ def _work_issue(
     """Work one issue in its own worktree and merge it into the run branch.
 
     The issue is claimed, branched off the run branch into its own worktree, and
-    driven by *walking* its node graph (#10): from ``start`` each node runs and
+    driven by walking its Execution graph: from ``start`` each node runs and
     its success/failure outcome follows the node's ``on_success`` /
-    ``on_failure`` edge until a terminal (see :func:`_walk_issue`). The
-    ``implement`` node keeps its bounded retry — a failed attempt (a crash, or
-    prior Gate outcome follows only the declared edge; no retry or automatic context is added.
+    ``on_failure`` edge until a Terminal. A failed node follows only its declared
+    edge; no retry or automatic context is added.
     A walk that reaches
     :data:`~pycastle.graph.DONE` is committed and, on a clean merge, folded into
     the run; the issue worktree and branch are then removed.
 
-    A walk that reaches :data:`~pycastle.graph.HUMAN` (an implement node that
-    exhausted its retries, a crash on a non-retried node, or a runaway cycle
-    hitting the visit cap) labels the issue ``ready-for-human`` and skips it
+    A walk that reaches :data:`~pycastle.graph.HUMAN` (through a declared edge
+    or the visit bound) labels the issue ``ready-for-human`` and skips it
     (recorded as not merged) so the run continues to the next issue — one stuck
     item does not sink the batch. A merge that does not apply cleanly is likewise
     recorded as not merged and skipped, and the issue is labelled
@@ -921,11 +870,11 @@ def _work_issue(
     # directory that was never created (#64).
     add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
 
-    walk = _walk_item_graph(
+    walk, _ = _walk_execution_graph(
         issue,
         runtime=runtime,
         fixture_dir=fixture_dir,
-        issue_worktree=issue_worktree,
+        worktree=issue_worktree,
         graph=item_graph,
         execution=execution,
     )
@@ -933,8 +882,7 @@ def _work_issue(
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
 
     if walk.terminal is HUMAN:
-        # The walk routed to a human (retries exhausted, a non-retried node
-        # crashed, or a runaway cycle hit the visit cap): hand the issue over and
+        # The walk routed to a human or hit the visit bound: hand the issue over and
         # move on. Cleaning up the worktree and branch keeps the batch tidy.
         issue_source.mark_for_human(issue.number)
         _append_log(

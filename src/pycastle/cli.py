@@ -196,10 +196,10 @@ def _build_runtime(
 ) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
-    ``--sandbox docker`` wraps each node's inner agent argv into a
+    ``--sandbox docker`` wraps each node's inner Runtime argv into a
     ``docker run`` argv, so both the Runtime and the commands it invokes run
-    inside the agent container. ``image`` is the already-resolved agent image
-    (see :func:`_resolve_agent_image`) and is threaded into the docker wrapper.
+    inside the Agent image. ``image`` is the immutable identity pinned by Run
+    readiness and is threaded into the Docker wrapper.
     Both Claude and Codex support this; every other combination runs the runtime
     on the host as before. The docker-vs-host choice is orthogonal to which
     runtime runs.

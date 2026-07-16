@@ -1,4 +1,4 @@
-"""The real Codex adapter parses the JSONL event stream and resumes threads."""
+"""The real Codex adapter parses JSONL and starts each node in a fresh thread."""
 
 from __future__ import annotations
 

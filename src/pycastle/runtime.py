@@ -421,8 +421,8 @@ class CodexRuntime:
     Codex reports no cost or duration, so :attr:`Telemetry.duration_ms` stays
     ``None`` and PyCastle's own measured wall time is recorded as
     ``elapsed_ms``. The thread id from ``thread.started`` is surfaced as
-    :attr:`Telemetry.thread_id` and is the handle a later edge context resumes via
-    :meth:`run` with ``provider thread``.
+    :attr:`Telemetry.thread_id` for audit only. Every Runtime-node visit starts a
+    fresh Codex invocation.
 
     Like :class:`ClaudeRuntime`, an ``argv_wrapper`` (or :meth:`in_docker`)
     wraps the inner ``codex …`` argv before launch — for the Docker sandbox,
@@ -510,10 +510,7 @@ class CodexRuntime:
     def build_command(self, prompt: str, *, cwd: Path) -> list[str]:
         """Build the ``codex exec`` argv for one non-interactive run.
 
-        Without ``provider thread`` this starts a fresh thread
-        (``codex … exec --json <prompt>``); with one it resumes that thread
-        (``codex … exec resume --json <thread_id> <prompt>``) so a edge context
-        continues the conversation that did the failed attempt.
+        This always starts a fresh thread (``codex … exec --json <prompt>``).
 
         ``cwd`` is resolved to an absolute path for the ``-C`` value. Codex
         resolves a relative ``-C`` against its own process working directory,
@@ -555,9 +552,8 @@ class CodexRuntime:
     ) -> RuntimeResult:
         """Run the agent for one node and return its parsed result.
 
-        Pass ``provider thread`` to continue a prior thread (used for
-        edge contexts). Raises :class:`AgentCrashError` when the agent exits
-        non-zero.
+        Every call starts a fresh provider thread. Raises
+        :class:`AgentCrashError` when the Runtime exits non-zero.
 
         ``cwd`` is resolved to an absolute path once so the ``-C`` value and the
         subprocess working directory agree; otherwise Codex would re-resolve a
