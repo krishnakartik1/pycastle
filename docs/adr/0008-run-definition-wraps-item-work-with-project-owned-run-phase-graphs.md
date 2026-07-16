@@ -13,6 +13,10 @@ ADR-0013 replaces this ADR's startup ordering where image preparation preceded
 Item selection. It also fixes the pre-claim bootstrap Setup record and stale
 frozen-Item handling; the surrounding Run lifecycle remains current.
 
+ADR-0014 replaces this ADR's Setup scheduling, process, and failure rules. The
+checkpointing and publication rules remain current where later ADRs do not
+replace them.
+
 ## Context
 
 PyCastle currently loads one project-owned phase graph and walks it independently
@@ -98,9 +102,13 @@ their shared worktree using project-owned, ignored scratch files. The default
 Item Plan writes `.pycastle/plan.md`, and the default Item Implement prompt must
 explicitly read it. The default after-Run phases use the same convention:
 
-- `review` writes `.pycastle/run-review.md` with integrated findings;
-- `repair` reads those findings and is a no-op when none need fixing;
-- `report` inspects the repaired diff and writes `.pycastle/run-report.md`.
+- `run-review` fixes and commits integrated defects, then records its findings
+  and fixes in `.pycastle/run-review.md`;
+- `run-repair` responds specifically to a failed Run-scope Gate, using its edge
+  evidence and the review record before regenerating the report;
+- `run-report` describes the candidate integrated diff in
+  `.pycastle/run-report.md`; the following Gate is the final executable node, and
+  PyCastle's factual publication envelope supplies its result.
 
 The report is optional to PyCastle. Projects that require it enforce its presence
 in their Run Gate. PyCastle harvests a generated report into the ignored records
@@ -211,7 +219,9 @@ state: a pull request cannot look ready while its report failed to publish.
 - Graph loading, scaffolding, orchestration, logging, checkpointing, and pull-
   request publication all change around the new Run definition.
 - The scaffold has `before=None`, retains its Item Plan/Implement/Review graph,
-  and adds the default after-Run `review -> repair -> report` graph.
+  and adds `run-review -> run-report -> run-verify`, with a failed `run-verify`
+  visit entering `run-repair -> run-report -> run-verify`. No Runtime node runs
+  after the passing Gate.
 - Existing Project fixtures must adopt the new `run = build_run(...)` declaration.
 - The integrated Run may end as a draft pull request even when some items completed;
   this is deliberate evidence that integration or publication needs attention.

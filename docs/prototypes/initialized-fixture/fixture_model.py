@@ -79,14 +79,14 @@ run = build_run(
     after=execution_graph(
         start="run-review",
         nodes=[
-            runtime_node("run-review", "run-review.md", on_success="run-verify"),
+            runtime_node("run-review", "run-review.md", on_success="run-report"),
+            runtime_node("run-report", "run-report.md", on_success="run-verify"),
             gate_node(
                 "run-verify",
-                on_success="run-report",
+                on_success=DONE,
                 on_failure="run-repair",
             ),
-            runtime_node("run-repair", "run-repair.md", on_success="run-verify"),
-            runtime_node("run-report", "run-report.md"),
+            runtime_node("run-repair", "run-repair.md", on_success="run-report"),
         ],
     ),
 )
@@ -152,20 +152,23 @@ the final verification.
 """,
     "prompts/run-review.md": """# Integrated Run review
 
-Review the integrated Run diff for cross-Item defects. Write actionable findings
-to `.pycastle/run-review.md`, or write `No findings`. Do not mutate GitHub.
+Review the integrated Run diff for cross-Item defects. Fix defects and commit any
+changes. Record the findings and fixes in `.pycastle/run-review.md`, or write
+`No findings`. A fresh Gate node performs verification. Do not mutate GitHub.
 """,
     "prompts/run-repair.md": """# Integrated Run repair
 
 The immediately preceding Run-scope Gate failed. Use its typed termination and
 bounded stdout/stderr evidence, `.pycastle/run-review.md`, and the current
-worktree to repair the integrated Run. Commit any changes. The graph will apply
-the Gate again in a fresh visit.
+worktree to repair the integrated Run. Commit any changes. The graph will
+regenerate the Run report, then apply the Gate again in a fresh visit.
 """,
     "prompts/run-report.md": """# Run report
 
-Summarize the integrated diff and verified result in `.pycastle/run-report.md`.
-Do not mutate GitHub or include secrets or raw unbounded logs.
+Summarize the candidate integrated diff in `.pycastle/run-report.md`. Do not
+claim final verification; PyCastle adds the later Gate result to its factual PR
+envelope. Do not mutate tracked project files, call GitHub, or include secrets or
+raw unbounded logs.
 """,
 }
 

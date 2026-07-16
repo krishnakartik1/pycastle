@@ -55,15 +55,15 @@ nonzero exit, launch failure, timeout, or malformed Runtime result. PyCastle doe
 not interpret generated prose. A Gate node succeeds only on exit zero and fails
 on nonzero exit, signal termination, or launch failure. Setup failure, operator
 cancellation, and host-side orchestration failure are outside graph control flow
-and stop the Run under their lifecycle rules.
+and stop the Run under their lifecycle rules; ADR-0014 defines Setup's rule.
 
 Retry is graph topology, not a second retry subsystem or a `retries=N` property.
 An edge may revisit any Runtime or Gate node. Each graph walk maintains an
 independent visit count for every node identity: Item counters reset for every
 Item, and Before-Run and After-Run walks have separate counters. PyCastle applies
-one fixed safety limit uniformly to both node types. Attempting to enter a node
-beyond that limit terminates the graph at `HUMAN` without running Setup, invoking
-the node, or following another edge.
+one fixed, non-configurable safety limit of 10 visits uniformly to both node
+types. Attempting an eleventh entry terminates the graph at `HUMAN` without
+running Setup, invoking the node, or following another edge.
 
 Filesystem changes survive both successful and failed node outcomes for the rest
 of the graph walk. The worktree and its diff are the durable communication
