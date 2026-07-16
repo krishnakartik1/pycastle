@@ -16,8 +16,10 @@ language-agnostic specification.
 - The default Item graph has one Gate node:
   `plan -> implement -> review -> verify -> DONE`. Review fixes its own findings;
   a failed `verify` visit enters `repair -> verify`.
-- The default After-Run graph likewise has one Gate node and an explicit repair
-  cycle before the Run report.
+- The default After-Run graph likewise has one Gate node. Run review fixes and
+  commits its own findings, then Run report describes the candidate diff before
+  the final Gate. A failed Gate enters Run repair, regenerates the report, and
+  revisits the Gate; no Runtime node runs after a passing Gate.
 - The Gate-node name `verify` is graph identity only; it invokes the one frozen
   `.pycastle/gate` executable.
 - The project Dockerfile contains PyCastle's neutral Runtime bootstrap and a

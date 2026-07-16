@@ -2,6 +2,10 @@
 
 Status: Accepted (2026-07-16)
 
+ADR-0014 defines the canonical Setup process, capture, repetition, and failure
+contract. This ADR owns readiness and the point at which a real Run first invokes
+that protocol.
+
 ## Context
 
 Setup and Gate are now mandatory project-owned executables with no
@@ -73,9 +77,8 @@ ignored local Run record, creates the Run branch from the pinned base commit and
 its Run worktree, then invokes the frozen Setup with
 `PYCASTLE_SCOPE=run`—even when no Before-Run graph exists. This is the first real
 project preparation and occurs before PyCastle claims, relabels, or creates a
-branch for any Item. Setup still runs separately immediately before every
-Runtime-node and Gate-node visit; the bootstrap success is neither cached nor
-treated as authority for a later node.
+branch for any Item. ADR-0014's ordinary per-node Setup rule begins after this
+bootstrap; its success is neither cached nor reused as authority for a node.
 
 A bootstrap Setup failure records the exact typed termination and bounded stdout
 and stderr, removes the Run branch and worktree, retains the ignored local Run
@@ -127,6 +130,9 @@ optimistic rather than turning Doctor or readiness into a reservation system.
 - Host readiness intentionally cannot promise that a project-specific shebang
   interpreter or toolchain exists; the pre-claim bootstrap Setup reports that
   failure exactly.
+- Under ADR-0014, a later Setup failure preserves already integrated work in a
+  draft pull request, but never publishes the active Item's partial work or
+  presents the interrupted Run as ready.
 - Docker builds, Runtime authentication checks, and Image-contract probes remain
   Runtime-aware but language- and project-toolchain-agnostic.
 - The current readiness check inventory, image-resolution paths, Gate-toolchain

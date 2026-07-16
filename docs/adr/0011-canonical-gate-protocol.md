@@ -39,7 +39,7 @@ passed through arguments, standard input, environment, or a record path.
 PyCastle invokes the mandatory Setup as a separate process immediately before
 every Gate-node visit. The Gate neither invokes nor sources Setup and cannot rely
 on Setup shell state surviving. The Gate has no PyCastle-specific mode such as
-`--check-tools`.
+`--check-tools`. ADR-0014 defines that Setup invocation and its failure behavior.
 
 Gate placement and recovery are entirely explicit Execution-graph topology. A
 Gate node succeeds only when the process exits zero. A nonzero exit, signal

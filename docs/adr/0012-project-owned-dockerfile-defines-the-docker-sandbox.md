@@ -2,6 +2,10 @@
 
 Status: Accepted (2026-07-16)
 
+ADR-0014 defines the canonical Setup process. This ADR owns the immutable Docker
+bootstrap, persistence mounts, and host-versus-Docker provisioning boundary in
+which Setup runs.
+
 ## Context
 
 Docker execution currently has three possible image sources, a PyCastle-managed
@@ -30,6 +34,13 @@ resulting immutable image identity. Build failure prevents the Run from
 starting. Every Setup, Runtime-node, and Gate-node process in that Run uses the
 same pinned identity; changes to the Dockerfile or build context take effect on
 the next Run.
+
+PyCastle never rebuilds or reloads fixture files in response to worktree changes
+inside an active Run. A toolchain migration that cannot be prepared or verified
+by the pinned image must therefore be staged: first land the Dockerfile, Setup,
+or Gate change under the current contract (or complete it manually), then let a
+later Run adopt the new frozen fixture and image before landing dependent
+manifest changes.
 
 `pycastle init` always creates the same language-neutral Dockerfile, regardless
 of the initially selected Sandbox. The scaffold supplies the Runtime CLIs
@@ -101,5 +112,7 @@ forwarding prevents the Docker boundary from silently exposing host secrets.
   Runtime CLI is absent.
 - Project dependency environments must live in each target worktree if they
   need to survive between Docker processes.
+- Fixture and toolchain migrations may require two changes because an active Run
+  never rebuilds its pinned image or adopts its own fixture edits.
 - ADR-0013 defines image-contract diagnostics and makes Doctor perform the same
   canonical build as Run when an eligible batch requires Docker execution.
