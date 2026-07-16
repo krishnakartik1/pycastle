@@ -206,11 +206,6 @@ class ReadinessReport:
         default=None, repr=False, compare=False
     )
 
-    @property
-    def ready(self) -> bool:
-        """Compatibility projection; callers should consume ``outcome``."""
-        return self.outcome is ReadinessOutcome.READY
-
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
 ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem | IssueRef]]

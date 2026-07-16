@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -175,7 +174,7 @@ def test_host_stub_production_adapter_reports_complete_ready_snapshot(
 
     report = evaluate_readiness(configuration(), adapter.dependencies())
 
-    assert report.ready
+    assert report.outcome is ReadinessOutcome.READY
     assert [check.id for check in report.checks] == list(CHECK_IDS)
     assert {check.id: check.status for check in report.checks}[
         "agent_image"
@@ -260,45 +259,6 @@ def test_base_branch_fails_when_github_default_could_not_be_resolved(
     assert "default" in result.summary.lower()
 
 
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_doctor_and_run_share_readiness_arguments_and_defaults() -> None:
-    parser = cli.build_parser()
-    doctor = parser.parse_args(["doctor"])
-    run = parser.parse_args(["run"])
-    fields = (
-        "runtime",
-        "sandbox",
-        "image",
-        "assignee",
-        "include_unassigned",
-        "iterations",
-    )
-
-    assert {field: getattr(doctor, field) for field in fields} == {
-        field: getattr(run, field) for field in fields
-    }
-    assert not hasattr(doctor, "verbose")
-
-    arguments = [
-        "--runtime",
-        "stub",
-        "--sandbox",
-        "host",
-        "--image",
-        "fixture/image",
-        "--assignee",
-        "octocat",
-        "--include-unassigned",
-        "--iterations",
-        "3",
-    ]
-    doctor = parser.parse_args(["doctor", *arguments])
-    run = parser.parse_args(["run", *arguments])
-    assert {field: getattr(doctor, field) for field in fields} == {
-        field: getattr(run, field) for field in fields
-    }
-
-
 def test_doctor_human_and_json_outputs_are_complete_and_single_document(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -380,121 +340,6 @@ class DockerRecordingRunner:
         return subprocess.CompletedProcess(argv, returncode, "", "")
 
 
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_explicit_agent_image_is_probed_as_is_without_touching_dockerfile(
-    tmp_path: Path,
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    # A directory at the Dockerfile path makes any attempted recipe read fail.
-    (fixture / "Dockerfile").mkdir()
-    runner = DockerRecordingRunner()
-    config = docker_configuration(image="registry.example/agent:exact")
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        result = adapter.check_agent_image(config)
-
-    assert result.status is Status.PASS
-    assert not any(
-        call[:3] == ("docker", "image", "inspect") for call, _ in runner.calls
-    )
-    assert not any(call[:2] == ("docker", "build") for call, _ in runner.calls)
-    assert any(config.agent_image in call for call, _ in runner.calls)
-
-
-@pytest.mark.parametrize("runtime", ["claude", "codex"])
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_docker_probes_share_isolated_workspace_and_runtime_conventions(
-    tmp_path: Path, runtime: str
-) -> None:
-    fixture = _valid_fixture(tmp_path)
-    runner = DockerRecordingRunner()
-    config = docker_configuration(runtime)
-    repository = tmp_path.resolve()
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        image = adapter.check_agent_image(config)
-        gate = adapter.check_gate_toolchain(config)
-        disposable = adapter._docker_workspace
-        assert disposable is not None and disposable.exists()
-        assert (disposable / "gate").read_text() == (fixture / "gate").read_text()
-        assert stat.S_IMODE(disposable.stat().st_mode) == 0o777
-        assert stat.S_IMODE((disposable / "gate").stat().st_mode) == 0o755
-
-    assert image.status is Status.PASS
-    assert gate.status is Status.PASS
-    assert disposable is not None and not disposable.exists()
-    docker_runs = [call for call, _ in runner.calls if call[:2] == ("docker", "run")]
-    assert len(docker_runs) == 2
-    mount_sources = [
-        next(
-            value.split(":", 1)[0] for value in call if value.endswith(f":{disposable}")
-        )
-        for call in docker_runs
-    ]
-    assert mount_sources == [str(disposable), str(disposable)]
-    assert all(str(repository) not in call for call in docker_runs)
-    runtime_config = sandbox.RUNTIME_CONFIG[runtime]
-    assert all(config.agent_image in call for call in docker_runs)
-    assert all(sandbox.SANDBOX_USER in call for call in docker_runs)
-    assert all(
-        f"{sandbox.auth_volume(runtime)}:{runtime_config.config_dir}" in call
-        for call in docker_runs
-    )
-    assert all(
-        f"{runtime_config.config_env}={runtime_config.config_dir}" in call
-        for call in docker_runs
-    )
-    contract = " ".join(docker_runs[0])
-    assert 'test "$(id -un)" = node' in contract
-    assert 'test "$HOME" = /home/node' in contract
-    assert 'command -v "$runtime"' in contract
-    assert 'auth_file="$config_dir/$auth_name"' in contract
-    assert 'workspace_file="$PWD/$workspace_name"' in contract
-    assert docker_runs[1][-2:] == (str(disposable / "gate"), "--check-tools")
-    assert str((fixture / "gate").resolve()) not in docker_runs[1]
-
-
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_disposable_workspace_is_cleaned_when_docker_gate_fails(tmp_path: Path) -> None:
-    fixture = _valid_fixture(tmp_path)
-    runner = DockerRecordingRunner(fail_gate=True)
-    config = docker_configuration()
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        assert adapter.check_agent_image(config).status is Status.PASS
-        assert adapter.check_gate_toolchain(config).status is Status.FAIL
-        disposable = adapter._docker_workspace
-
-    assert disposable is not None and not disposable.exists()
-
-
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_disposable_workspace_is_cleaned_when_probe_raises(tmp_path: Path) -> None:
-    fixture = _valid_fixture(tmp_path)
-    config = docker_configuration()
-
-    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["docker", "run"]:
-            raise subprocess.TimeoutExpired(argv, 15.0, output="secret")
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    with pytest.raises(subprocess.TimeoutExpired):
-        with DefaultReadinessAdapter(
-            fixture, tmp_path, runner=runner, image_flag=config.agent_image
-        ) as adapter:
-            disposable = adapter._readiness_workspace()
-            adapter.check_agent_image(config)
-
-    assert not disposable.exists()
-
-
 def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -513,45 +358,6 @@ def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
     assert diagnostics == ["Doctor cleanup could not complete."]
     assert str(disposable) not in diagnostics[0]
     assert adapter._docker_workspace is None
-
-
-@pytest.mark.parametrize(
-    ("stream_build", "expected_capture"), [(True, False), (False, True)]
-)
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_agent_image_build_capture_tracks_human_versus_json_mode(
-    tmp_path: Path, stream_build: bool, expected_capture: bool
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    dockerfile = fixture / "Dockerfile"
-    dockerfile.write_text("FROM node:22-slim\n")
-    image = sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-
-    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((tuple(argv), kwargs))
-        returncode = 1 if argv[:3] == ["docker", "image", "inspect"] else 0
-        return subprocess.CompletedProcess(argv, returncode, "secret", "secret")
-
-    with DefaultReadinessAdapter(
-        fixture,
-        tmp_path,
-        runner=runner,
-        stream_image_build=stream_build,
-    ) as adapter:
-        result = adapter.check_agent_image(docker_configuration(image=image))
-
-    assert result.status is Status.PASS
-    inspect = next(
-        entry for entry in calls if entry[0][:3] == ("docker", "image", "inspect")
-    )
-    build = next(entry for entry in calls if entry[0][:2] == ("docker", "build"))
-    assert inspect[1]["capture"] is True
-    assert inspect[1]["timeout"] == 15.0
-    assert build[1]["capture"] is expected_capture
-    assert build[1]["timeout"] == 900.0
-    assert "secret" not in repr(result)
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
@@ -586,22 +392,6 @@ def test_unknown_runtime_authentication_fails_without_running_command(
     assert result.status is Status.FAIL
     assert result.summary == "The selected Runtime has no authentication convention."
     assert runner.calls == []
-
-
-@pytest.mark.skip(reason="superseded by canonical image lifecycle")
-def test_missing_gate_runs_nothing_and_creates_no_disposable_workspace(
-    tmp_path: Path,
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    runner = DockerRecordingRunner()
-    adapter = DefaultReadinessAdapter(fixture, tmp_path, runner=runner)
-
-    result = adapter.check_gate_toolchain(docker_configuration())
-
-    assert result.status is Status.NOT_APPLICABLE
-    assert runner.calls == []
-    assert adapter._docker_workspace is None
 
 
 class ScriptedRuntimeRunner:
@@ -856,7 +646,7 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
         if check_id not in {"eligible_items", "frozen_execution_inputs"}
     ]
     assert [check.id for check in report.checks] == list(CHECK_IDS)
-    assert report.ready is True
+    assert report.outcome is ReadinessOutcome.READY
     document = json.loads(render_json(report))
     assert list(document) == [
         "schema_version",
@@ -896,7 +686,7 @@ def test_failed_prerequisite_blocks_dependents_and_independent_checks_continue()
     assert by_id["sandbox"].status is Status.BLOCKED
     assert by_id["github_authentication"].status is Status.PASS
     assert "github_authentication" in called
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 def test_zero_items_is_a_successful_no_work_outcome() -> None:
@@ -937,7 +727,7 @@ def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
     assert check.id == "eligible_items"
     assert check.status is Status.FAIL
     assert report.eligible_items == ()
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 @pytest.mark.parametrize(
@@ -966,7 +756,7 @@ def test_invalid_item_values_make_doctor_unready(items: object) -> None:
         is Status.FAIL
     )
     assert report.eligible_items == ()
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 def test_invalid_probe_result_becomes_a_failed_check_and_evaluation_continues() -> None:

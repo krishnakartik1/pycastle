@@ -24,18 +24,21 @@ import json
 import logging
 import os
 import re
-import shutil
 import signal
+import subprocess
+import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
 from .execution import (
+    ExecutionRecord,
     execute_hook,
     project_gate_evidence,
     sensitive_environment_values,
@@ -52,6 +55,7 @@ from .graph import (
 )
 from .issues import IssueSource
 from .models import IssueRef, RuntimeResult
+from .readiness import FrozenReadinessInputs
 from .runtime import AgentCrashError, Runtime
 
 logger = logging.getLogger(__name__)
@@ -74,15 +78,17 @@ class ExecutionResult:
 class PromptRenderer:
     """Render a frozen Runtime-node prompt without executing graph policy."""
 
-    def __init__(
-        self, runtime: Runtime | None = None, *, fixture_dir: Path, preamble: str = ""
-    ) -> None:
-        self.runtime = runtime
-        self.fixture_dir = fixture_dir
+    def __init__(self, *, prompts: Mapping[str, str], preamble: str = "") -> None:
+        self.prompts = prompts
         self.preamble = preamble
 
     def render_prompt(self, node: RuntimeNode, extra: str | None = None) -> str:
-        prompt = (self.fixture_dir / "prompts" / node.prompt).read_text()
+        try:
+            prompt = self.prompts[node.prompt]
+        except KeyError:
+            raise ValueError(
+                f"Frozen Runtime prompt is missing: {node.prompt!r}"
+            ) from None
         return "\n\n".join(value for value in (self.preamble, prompt, extra) if value)
 
 
@@ -254,17 +260,25 @@ class SetupError(RuntimeError):
         self.failure = failure
 
 
-@dataclass
+@dataclass(frozen=True)
 class FrozenRunExecution:
     """Frozen Run hooks and deterministic per-graph visit record allocation."""
 
     setup: Path
     gate: Path
     records: Path
+    setup_content: bytes = field(repr=False)
+    setup_mode: int
+    gate_content: bytes = field(repr=False)
+    gate_mode: int
+    prompts: Mapping[str, str] = field(repr=False)
     sandbox: str = "host"
     runtime_name: str = "claude"
     workspace: Path | None = None
     image: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prompts", MappingProxyType(dict(self.prompts)))
 
     def _hook_argv(
         self, executable: Path, cwd: Path, scope: Literal["item", "run"]
@@ -295,14 +309,66 @@ class FrozenRunExecution:
         root = fixture_dir / "runs" / run_id
         frozen = root / "frozen"
         frozen.mkdir(parents=True, exist_ok=True)
-        paths: dict[str, Path] = {}
-        for name in (FIXTURE_SETUP, FIXTURE_GATE):
-            source = fixture_dir / name
-            destination = frozen / name
-            shutil.copyfile(source, destination)
-            destination.chmod(source.stat().st_mode & 0o777)
-            paths[name] = destination
-        return cls(paths[FIXTURE_SETUP], paths[FIXTURE_GATE], root / "executions")
+        setup = fixture_dir / FIXTURE_SETUP
+        gate = fixture_dir / FIXTURE_GATE
+        prompts = {
+            str(path.relative_to(fixture_dir / "prompts")): path.read_text()
+            for path in (fixture_dir / "prompts").rglob("*")
+            if path.is_file()
+        }
+        return cls(
+            frozen / FIXTURE_SETUP,
+            frozen / FIXTURE_GATE,
+            root / "executions",
+            setup.read_bytes(),
+            setup.stat().st_mode & 0o777,
+            gate.read_bytes(),
+            gate.stat().st_mode & 0o777,
+            prompts,
+        )
+
+    @staticmethod
+    def _stage_executable(path: Path, content: bytes, mode: int) -> None:
+        """Atomically stage one frozen hook immediately before invocation."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".hook-")
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _execute_hook(
+        self,
+        executable: Path,
+        content: bytes,
+        mode: int,
+        *,
+        cwd: Path,
+        scope: Literal["item", "run"],
+        record_path: Path,
+        environment: dict[str, str] | None = None,
+    ) -> ExecutionRecord:
+        self._stage_executable(executable, content, mode)
+        try:
+            return execute_hook(
+                executable,
+                cwd=cwd,
+                scope=scope,
+                record_path=record_path,
+                environment=environment,
+                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
+            )
+        finally:
+            executable.unlink(missing_ok=True)
 
     def invoke_setup(
         self,
@@ -312,26 +378,15 @@ class FrozenRunExecution:
         identity: str,
         ordinal: int,
     ) -> None:
-        try:
-            record = execute_hook(
-                self.setup,
-                cwd=worktree,
-                scope=scope,
-                record_path=self.records
-                / f"{self._record_identity(identity)}-setup-{ordinal}.json",
-                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
-            )
-        except Exception as exc:
-            raise SetupError(
-                SetupFailure(
-                    ".pycastle/setup",
-                    {
-                        "kind": "record_persistence_error",
-                        "error_kind": type(exc).__name__,
-                    },
-                ),
-                "Setup record could not be persisted",
-            ) from exc
+        record = self._execute_hook(
+            self.setup,
+            self.setup_content,
+            self.setup_mode,
+            cwd=worktree,
+            scope=scope,
+            record_path=self.records
+            / f"{self._record_identity(identity)}-setup-{ordinal}.json",
+        )
         if not record.success:
             raise SetupError(
                 SetupFailure(".pycastle/setup", dict(record.termination.__dict__))
@@ -349,8 +404,10 @@ class FrozenRunExecution:
         environment = dict(os.environ)
         started_at = time.monotonic()
         try:
-            record = execute_hook(
+            record = self._execute_hook(
                 self.gate,
+                self.gate_content,
+                self.gate_mode,
                 cwd=worktree,
                 scope=scope,
                 record_path=self.records
@@ -359,7 +416,6 @@ class FrozenRunExecution:
                     f"{self._record_identity(node)}-gate-{ordinal}.json"
                 ),
                 environment=environment,
-                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
             )
         finally:
             duration_seconds = time.monotonic() - started_at
@@ -425,7 +481,6 @@ class RunContext:
     worktree: Path
     fixture_dir: Path
     runner: Runner
-    project_fixture_dir: Path | None = None
     remote_checkpoint_succeeded: bool = False
 
 
@@ -738,7 +793,6 @@ def _walk_execution_graph(
     issue: IssueRef | None,
     *,
     runtime: Runtime,
-    fixture_dir: Path,
     worktree: Path,
     graph: ExecutionGraph,
     execution: FrozenRunExecution,
@@ -751,8 +805,7 @@ def _walk_execution_graph(
     if issue is None and context is None:
         raise ValueError("Run graph execution requires factual Run context")
     executor = PromptRenderer(
-        runtime,
-        fixture_dir=fixture_dir,
+        prompts=execution.prompts,
         preamble=context if context is not None else render_issue_context(issue),
     )
     results: list[NodeResult] = []
@@ -790,8 +843,64 @@ def _walk_execution_graph(
                 cwd=worktree,
                 node=node.name,
             )
-        except AgentCrashError:
-            return NodeOutcome(False)
+        except AgentCrashError as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {"kind": "exited", "code": error.exit_code},
+                },
+            )
+        except OSError as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "launch_error",
+                        "error_kind": type(error).__name__,
+                        "errno": error.errno,
+                    },
+                },
+            )
+        except subprocess.TimeoutExpired as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "timeout",
+                        "timeout_seconds": error.timeout,
+                    },
+                },
+            )
+        except (TypeError, ValueError) as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "malformed_result",
+                        "error_kind": type(error).__name__,
+                    },
+                },
+            )
+        if not isinstance(result, RuntimeResult):
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "malformed_result",
+                        "error_kind": type(result).__name__,
+                    },
+                },
+            )
         results.append(NodeResult(node.name, result))
         if checkpoint is not None:
             checkpoint(node)
@@ -834,7 +943,7 @@ def _work_issue(
     ``ready-for-human`` (#9) so a person resolves the conflict while the run
     carries on with the remaining items.
     """
-    fixture_dir = run.project_fixture_dir or run.fixture_dir
+    fixture_dir = run.fixture_dir
     run_id = run.run_id
     run_branch = run.branch
     runner = run.runner
@@ -873,7 +982,6 @@ def _work_issue(
     walk, _ = _walk_execution_graph(
         issue,
         runtime=runtime,
-        fixture_dir=fixture_dir,
         worktree=issue_worktree,
         graph=item_graph,
         execution=execution,
@@ -1251,7 +1359,7 @@ def run_batch(
     include_unassigned: bool = False,
     runner: Runner = run_cmd,
     verbose: bool = False,
-    frozen_inputs: object,
+    frozen_inputs: FrozenReadinessInputs,
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
@@ -1262,15 +1370,11 @@ def run_batch(
     merged. ``run_id`` is injected (not read from a clock) to keep runs
     deterministic for tests.
 
-    A Runtime-node failure follows its declared edge
-    without generated context or provider resumption;
-    prior-attempt context; ``gate_check`` decides whether an attempt's quality
-    gates passed (default: every attempt passes, so no retry fires). An issue
-    that exhausts its retries is labelled ``ready-for-human`` and the run
-    continues to the next issue.
-
-    ``setup`` prepares each newly-created issue worktree before its node graph
-    is walked. It defaults to a no-op for callers and older Project fixtures.
+    Runtime-node and Gate-node outcomes follow only their declared Execution
+    graph edges. Every Runtime visit is fresh, and its successor receives only
+    the immediate predecessor's typed outcome. Frozen Setup runs once at Run
+    bootstrap and again immediately before every executable node; any Setup
+    failure stops the Run outside graph control flow.
 
     ``verbose`` (#48, #52) turns on transcript persistence: before each issue is
     worked the runtime's transcript sink is bound to that issue's transcript log
@@ -1280,25 +1384,21 @@ def run_batch(
     before.
     """
     fixture_dir = fixture_dir.resolve()
+    if not isinstance(frozen_inputs, FrozenReadinessInputs):
+        raise TypeError("Run requires FrozenReadinessInputs")
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
     selected = tuple(issue.model_copy(deep=True) for issue in selected)
-    frozen_items = getattr(frozen_inputs, "items", None)
-    if frozen_items is not None:
-        if not isinstance(frozen_items, tuple) or not all(
-            isinstance(issue, IssueRef) for issue in frozen_items
-        ):
-            raise ValueError("Frozen readiness Item batch is invalid")
-        if selected != frozen_items:
-            raise ValueError("Selected Items differ from frozen readiness batch")
-    branch_start = base_branch
-    frozen_base_commit = getattr(frozen_inputs, "base_commit", None)
-    if frozen_base_commit is not None:
-        if not isinstance(frozen_base_commit, str) or not re.fullmatch(
-            r"[0-9a-f]{40,64}", frozen_base_commit
-        ):
-            raise ValueError("Frozen readiness base commit is invalid")
-        branch_start = frozen_base_commit
+    frozen_items = frozen_inputs.items
+    if not isinstance(frozen_items, tuple) or not all(
+        isinstance(issue, IssueRef) for issue in frozen_items
+    ):
+        raise ValueError("Frozen readiness Item batch is invalid")
+    if selected != frozen_items:
+        raise ValueError("Selected Items differ from frozen readiness batch")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", frozen_inputs.base_commit):
+        raise ValueError("Frozen readiness base commit is invalid")
+    branch_start = frozen_inputs.base_commit
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(
         run_id=run_id,
@@ -1308,45 +1408,56 @@ def run_batch(
     if not selected:
         return outcome
 
-    frozen_project = getattr(frozen_inputs, "project_fixture", None)
-    if frozen_project is not None:
-        for frozen_file in frozen_project.files:
-            relative_path = Path(frozen_file.relative_path)
-            if (
-                not frozen_file.relative_path
-                or relative_path.is_absolute()
-                or ".." in relative_path.parts
-            ):
-                raise ValueError("Frozen Project fixture path is invalid")
-
-    if frozen_inputs is None:
-        raise ValueError("Run requires a frozen Run-readiness snapshot")
+    frozen_project = frozen_inputs.project_fixture
+    for frozen_file in frozen_project.files:
+        relative_path = Path(frozen_file.relative_path)
+        if (
+            not frozen_file.relative_path
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+        ):
+            raise ValueError("Frozen Project fixture path is invalid")
     workspace = workspace or Path.cwd()
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
 
-    # Materialize the evaluator's immutable Project fixture only after the
-    # non-empty guard. Runtime edits can therefore never rewrite this Run's
-    # graphs, prompts, Setup, or Gate.
-    project_fixture_dir = fixture_dir
-    if frozen_project is None:
-        raise ValueError("Run readiness did not freeze a Project fixture")
-    project_fixture_dir = fixture_dir / "runs" / run_id / "project"
-    for frozen_file in frozen_project.files:
-        relative_path = Path(frozen_file.relative_path)
-        destination = project_fixture_dir / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(frozen_file.content)
-        destination.chmod(frozen_file.mode)
+    files = {
+        frozen_file.relative_path: frozen_file for frozen_file in frozen_project.files
+    }
+    try:
+        setup_file = files[FIXTURE_SETUP]
+        gate_file = files[FIXTURE_GATE]
+    except KeyError as error:
+        raise ValueError(
+            f"Frozen Project fixture is missing mandatory executable: {error.args[0]}"
+        ) from None
+    prompts: dict[str, str] = {}
+    for relative_path, frozen_file in files.items():
+        path = Path(relative_path)
+        if not path.parts or path.parts[0] != "prompts":
+            continue
+        prompt_name = str(Path(*path.parts[1:]))
+        try:
+            prompts[prompt_name] = frozen_file.content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(
+                f"Frozen Runtime prompt is not valid UTF-8: {prompt_name}"
+            ) from None
     run_definition = frozen_project.run_definition
+    frozen_dir = fixture_dir / "runs" / run_id / "frozen"
     execution = FrozenRunExecution(
-        project_fixture_dir / FIXTURE_SETUP,
-        project_fixture_dir / FIXTURE_GATE,
+        frozen_dir / FIXTURE_SETUP,
+        frozen_dir / FIXTURE_GATE,
         fixture_dir / "runs" / run_id / "executions",
-        sandbox=getattr(frozen_inputs, "sandbox", "host"),
-        runtime_name=getattr(frozen_inputs, "runtime", "claude"),
+        setup_file.content,
+        setup_file.mode,
+        gate_file.content,
+        gate_file.mode,
+        prompts,
+        sandbox=frozen_inputs.sandbox,
+        runtime_name=frozen_inputs.runtime,
         workspace=workspace,
-        image=getattr(frozen_inputs, "agent_image", None),
+        image=frozen_inputs.agent_image,
     )
 
     # Per-run branch + worktree: the main checkout is left on its branch.
@@ -1361,7 +1472,6 @@ def run_batch(
         worktree=run_worktree,
         fixture_dir=fixture_dir,
         runner=runner,
-        project_fixture_dir=project_fixture_dir,
     )
     _append_log(
         fixture_dir,
@@ -1383,7 +1493,6 @@ def run_batch(
                 before, _ = _walk_execution_graph(
                     None,
                     runtime=runtime,
-                    fixture_dir=project_fixture_dir,
                     worktree=run_worktree,
                     graph=run_definition.before,
                     execution=execution,
@@ -1437,7 +1546,7 @@ def run_batch(
                         assignee=assignee,
                         include_unassigned=include_unassigned,
                     )
-                    if frozen_inputs is not None and not isinstance(eligible, bool):
+                    if not isinstance(eligible, bool):
                         raise TypeError("Item eligibility recheck did not return bool")
                 except Exception as exc:
                     if not outcome.completed:
@@ -1535,7 +1644,6 @@ def run_batch(
                         after, run_gate = _walk_execution_graph(
                             None,
                             runtime=runtime,
-                            fixture_dir=project_fixture_dir,
                             worktree=run_worktree,
                             graph=run_definition.after,
                             execution=execution,
