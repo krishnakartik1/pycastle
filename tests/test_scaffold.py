@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from pycastle.graph import DONE, GateNode, RuntimeNode, load_run
+from pycastle.graph import DONE, HUMAN, GateNode, RuntimeNode, load_run
 from pycastle.scaffold import FixtureExistsError, scaffold_fixture
 
 
@@ -90,7 +90,18 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
 ) -> None:
     scaffold_fixture(tmp_path, sandbox="host")
     run = load_run(tmp_path / ".pycastle")
+    assert run.before is None
     assert list(run.item.nodes) == ["plan", "implement", "review", "verify", "repair"]
+    assert {
+        name: (node.on_success, node.on_failure)
+        for name, node in run.item.nodes.items()
+    } == {
+        "plan": ("implement", HUMAN),
+        "implement": ("review", HUMAN),
+        "review": ("verify", HUMAN),
+        "verify": (DONE, "repair"),
+        "repair": ("verify", HUMAN),
+    }
     assert isinstance(run.item.nodes["verify"], GateNode)
     assert isinstance(run.item.nodes["repair"], RuntimeNode)
     assert run.item.nodes["verify"].on_failure == "repair"
@@ -106,6 +117,15 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
         "run-verify",
         "run-repair",
     ]
+    assert {
+        name: (node.on_success, node.on_failure)
+        for name, node in run.after.nodes.items()
+    } == {
+        "run-review": ("run-report", HUMAN),
+        "run-report": ("run-verify", HUMAN),
+        "run-verify": (DONE, "run-repair"),
+        "run-repair": ("run-report", HUMAN),
+    }
     for graph in (run.item, run.after):
         for node in graph.nodes.values():
             if isinstance(node, RuntimeNode):
@@ -127,9 +147,16 @@ def test_dockerfile_is_neutral_and_has_project_extension(tmp_path: Path) -> None
     assert "python3" not in text and "ruff" not in text and "pytest" not in text
 
 
-def test_scaffold_rejects_invalid_or_existing_fixture(tmp_path: Path) -> None:
-    with pytest.raises(ValueError):
-        scaffold_fixture(tmp_path, sandbox="auto")  # type: ignore[arg-type]
+@pytest.mark.parametrize("sandbox", ["", "auto", "HOST", None, 0])
+def test_scaffold_rejects_invalid_sandbox_without_writing(
+    tmp_path: Path, sandbox: object
+) -> None:
+    with pytest.raises(ValueError, match="sandbox must be 'host' or 'docker'"):
+        scaffold_fixture(tmp_path, sandbox=sandbox)  # type: ignore[arg-type]
+    assert not (tmp_path / ".pycastle").exists()
+
+
+def test_scaffold_rejects_existing_fixture(tmp_path: Path) -> None:
     scaffold_fixture(tmp_path, sandbox="host")
     with pytest.raises(FixtureExistsError):
         scaffold_fixture(tmp_path, sandbox="host")

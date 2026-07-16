@@ -1000,6 +1000,21 @@ def test_init_with_closed_stdin_fails_with_actionable_choices(
     assert "pycastle init --sandbox docker" in caplog.text
 
 
+def test_attached_init_eof_fails_with_actionable_choices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An attached terminal closing at the prompt still cannot imply host."""
+    monkeypatch.setattr(cli, "check_required_commands", lambda _commands: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.sys, "stdin", MagicMock(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=EOFError))
+
+    assert main(["init"]) == 2
+    assert not (tmp_path / ".pycastle").exists()
+    assert "pycastle init --sandbox host" in caplog.text
+    assert "pycastle init --sandbox docker" in caplog.text
+
+
 def test_invalid_init_sandbox_is_rejected_before_writing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
