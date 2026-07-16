@@ -260,8 +260,9 @@ def _run_context(
     )
 
 
+@pytest.mark.parametrize("verbose", [False, True])
 def test_explicit_item_graph_runs_frozen_setup_runtime_setup_gate(
-    tmp_path: Path,
+    tmp_path: Path, verbose: bool
 ) -> None:
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
@@ -304,6 +305,7 @@ def test_explicit_item_graph_runs_frozen_setup_runtime_setup_gate(
         worktree_root=tmp_path / "wt",
         runner=_git_aware_runner(),
         gate_check=legacy_gate,
+        verbose=verbose,
     )
 
     assert outcome.completed == [134]
@@ -317,12 +319,31 @@ def test_explicit_item_graph_runs_frozen_setup_runtime_setup_gate(
     ]
     legacy_gate.assert_not_called()
     records = sorted((fixture / "runs" / "explicit-134" / "executions").glob("*.json"))
-    assert [path.name for path in records] == [
-        "item-134-verify-gate-1.json",
-        "item-134-verify-setup-1.json",
-        "item-134-work-setup-1.json",
-        "run-bootstrap-setup-1.json",
-    ]
+    assert len(records) == 4
+    assert sum(path.name.endswith("gate-1.json") for path in records) == 1
+    assert sum(path.name.endswith("setup-1.json") for path in records) == 3
+
+
+def test_explicit_execution_record_names_cannot_escape_the_record_directory(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / ".pycastle"
+    fixture.mkdir()
+    for name in ("setup", "gate"):
+        hook = fixture / name
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+    execution = orchestrator.ExplicitItemExecution.freeze(fixture, "safe-records")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    execution.invoke_setup(worktree, scope="item", identity="../../outside", ordinal=1)
+    execution.invoke_gate(worktree, identity="item-134", node="../gate/name", ordinal=1)
+
+    records = list(execution.records.glob("*.json"))
+    assert len(records) == 2
+    assert all(path.parent == execution.records for path in records)
+    assert not (tmp_path / "outside-setup-1.json").exists()
 
 
 def _scoped_fixture(

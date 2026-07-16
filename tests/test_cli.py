@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -23,6 +24,7 @@ from pycastle.readiness import (
     ReadinessReport,
     Status,
 )
+from pycastle.runtime import StubRuntime
 from pycastle.upgrade import FixtureMigration
 
 
@@ -265,6 +267,87 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
 
     assert main(["run", "--runtime", "stub"]) == 0
     assert captured["run_id"] == "20260613-101500"
+
+
+def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Drive CLI dispatch, real Git worktrees, and deterministic external adapters."""
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "work.md").write_text("work")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "gate_node('verify'),runtime_node('work','work.md',on_success='verify')]))\n"
+    )
+    timeline = tmp_path / "timeline"
+    for name in ("setup", "gate"):
+        hook = fixture / name
+        hook.write_text(f"#!/bin/sh\nprintf '{name}\\n' >> '{timeline}'\n")
+        hook.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    source = MagicMock()
+    runtime = StubRuntime()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "cli-explicit-134")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: runtime)
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    monkeypatch.setattr(
+        cli, "make_fixture_gate_check", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(
+        cli, "make_fixture_setup", lambda *_args, **_kwargs: MagicMock()
+    )
+
+    original_run_loop = cli.run_loop
+    outcomes: list[RunOutcome] = []
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0, outcomes
+    assert timeline.read_text().splitlines() == ["setup", "setup", "setup", "gate"]
+    source.claim.assert_called_once_with(1, assignee="krishna")
+    assert any(
+        call[:3] == ["gh", "pr", "create"] and "--draft" in call
+        for call in process_calls
+    )
+    assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
 @pytest.mark.parametrize(

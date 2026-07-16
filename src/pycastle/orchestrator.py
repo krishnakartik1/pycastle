@@ -27,6 +27,7 @@ worktrees and no issue stuck in a claimed state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -37,7 +38,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
@@ -267,8 +268,16 @@ class ExplicitItemExecution:
     gate: Path
     records: Path
 
+    @staticmethod
+    def _record_identity(value: str) -> str:
+        """Return a readable, collision-resistant filename component."""
+        readable = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-") or "node"
+        digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+        return f"{readable[:48]}-{digest}"
+
     @classmethod
     def freeze(cls, fixture_dir: Path, run_id: str) -> ExplicitItemExecution:
+        fixture_dir = fixture_dir.resolve()
         root = fixture_dir / "runs" / run_id
         frozen = root / "frozen"
         frozen.mkdir(parents=True, exist_ok=True)
@@ -282,13 +291,19 @@ class ExplicitItemExecution:
         return cls(paths[FIXTURE_SETUP], paths[FIXTURE_GATE], root / "executions")
 
     def invoke_setup(
-        self, worktree: Path, *, scope: str, identity: str, ordinal: int
+        self,
+        worktree: Path,
+        *,
+        scope: Literal["item", "run"],
+        identity: str,
+        ordinal: int,
     ) -> None:
         record = execute_hook(
             self.setup,
             cwd=worktree,
-            scope=scope,  # type: ignore[arg-type]
-            record_path=self.records / f"{identity}-setup-{ordinal}.json",
+            scope=scope,
+            record_path=self.records
+            / f"{self._record_identity(identity)}-setup-{ordinal}.json",
         )
         if not record.success:
             raise SetupError(f"Project setup failed: {record.termination}")
@@ -300,7 +315,11 @@ class ExplicitItemExecution:
             self.gate,
             cwd=worktree,
             scope="item",
-            record_path=self.records / f"{identity}-{node}-gate-{ordinal}.json",
+            record_path=self.records
+            / (
+                f"{self._record_identity(identity)}-"
+                f"{self._record_identity(node)}-gate-{ordinal}.json"
+            ),
         )
         return NodeOutcome(record.success, project_gate_evidence(record, node=node))
 
