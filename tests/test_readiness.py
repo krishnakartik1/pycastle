@@ -19,11 +19,62 @@ from pycastle.readiness import (
     EligibleItem,
     ReadinessConfiguration,
     ReadinessDependencies,
+    ReadinessOutcome,
     Status,
     evaluate_readiness,
     render_human,
     render_json,
 )
+
+
+def test_readiness_has_three_explicit_overall_outcomes() -> None:
+    def passing(_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        return CheckResult(Status.PASS, "ok")
+
+    ready = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=passing,
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+    no_work = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(probe=passing, eligible_items=lambda _configuration: []),
+    )
+    not_ready = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda check_id, _configuration: CheckResult(
+                Status.FAIL if check_id == "working_tree" else Status.PASS, "result"
+            ),
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+
+    assert ready.outcome is ReadinessOutcome.READY
+    assert no_work.outcome is ReadinessOutcome.NO_WORK
+    assert not_ready.outcome is ReadinessOutcome.NOT_READY
+    assert json.loads(render_json(no_work))["outcome"] == "no_work"
+
+
+def test_no_work_skips_execution_coordination_checks() -> None:
+    called: list[str] = []
+
+    def probe(check_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        called.append(check_id)
+        return CheckResult(Status.PASS, "ok")
+
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(probe=probe, eligible_items=lambda _configuration: []),
+    )
+
+    assert report.outcome is ReadinessOutcome.NO_WORK
+    statuses = {check.id: check.status for check in report.checks}
+    for check_id in ("agent_image", "runtime", "runtime_authentication"):
+        assert statuses[check_id] is Status.NOT_APPLICABLE
+        assert check_id not in called
 
 
 def _valid_fixture(path: Path) -> Path:
@@ -44,6 +95,9 @@ def _valid_fixture(path: Path) -> Path:
     gate = fixture / "gate"
     gate.write_text("#!/bin/sh\nexit 0\n")
     gate.chmod(0o755)
+    setup = fixture / "setup"
+    setup.write_text("#!/bin/sh\nexit 0\n")
+    setup.chmod(0o755)
     return fixture
 
 
@@ -70,6 +124,13 @@ class RecordingRunner:
             ("git", "symbolic-ref", "--quiet", "--short", "HEAD"): "main\n",
             ("git", "status", "--porcelain", "--untracked-files=all"): "",
             ("gh", "api", "repos/owner/repo", "--jq", ".permissions.push"): "true\n",
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                "refs/heads/main",
+            ): "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n",
         }
         if call[:3] == ("gh", "repo", "view"):
             output = '{"nameWithOwner":"owner/repo"}\n'
@@ -123,7 +184,18 @@ def test_host_stub_production_adapter_reports_complete_ready_snapshot(
         "runtime_authentication"
     ] is Status.NOT_APPLICABLE
     assert report.eligible_items == (EligibleItem(2, "Two"), EligibleItem(9, "Nine"))
-    assert any(call[-1] == "--check-tools" for call in runner.calls)
+    assert report.frozen_inputs is not None
+    assert (
+        report.frozen_inputs.base_commit == "0123456789abcdef0123456789abcdef01234567"
+    )
+    frozen_setup = next(
+        file
+        for file in report.frozen_inputs.project_fixture.files
+        if file.relative_path == "setup"
+    )
+    (fixture / "setup").write_text("#!/bin/sh\nexit 9\n")
+    assert frozen_setup.content == b"#!/bin/sh\nexit 0\n"
+    assert not any(call[-1] == "--check-tools" for call in runner.calls)
     assert not (fixture / "__pycache__").exists()
     assert sys.dont_write_bytecode is False
 
@@ -233,9 +305,9 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
         configuration(),
         ReadinessDependencies(
             probe=lambda check_id, _configuration: CheckResult(
-                Status.FAIL if check_id == "gate_toolchain" else Status.PASS,
-                "toolchain missing" if check_id == "gate_toolchain" else "ready",
-                remediation="install tools" if check_id == "gate_toolchain" else None,
+                Status.FAIL if check_id == "working_tree" else Status.PASS,
+                "checkout dirty" if check_id == "working_tree" else "ready",
+                remediation="clean checkout" if check_id == "working_tree" else None,
             ),
             eligible_items=lambda _configuration: [EligibleItem(4, "Unicode ✓")],
         ),
@@ -246,7 +318,7 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
     human = capsys.readouterr().out
     assert human == render_human(report) + "\n"
     assert all(check_id in human for check_id in CHECK_IDS)
-    assert "Fix: install tools" in human
+    assert "Fix: clean checkout" in human
     assert "#4 Unicode ✓" in human
 
     assert cli.main(["doctor", "--runtime", "stub", "--sandbox", "host", "--json"]) == 1
@@ -771,13 +843,17 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
         ),
     )
 
-    assert calls == list(CHECK_IDS[:-1])
+    assert calls == [
+        check_id
+        for check_id in CHECK_IDS
+        if check_id not in {"eligible_items", "frozen_execution_inputs"}
+    ]
     assert [check.id for check in report.checks] == list(CHECK_IDS)
     assert report.ready is True
     document = json.loads(render_json(report))
     assert list(document) == [
         "schema_version",
-        "ready",
+        "outcome",
         "runner_version",
         "configuration",
         "checks",
@@ -816,7 +892,7 @@ def test_failed_prerequisite_blocks_dependents_and_independent_checks_continue()
     assert report.ready is False
 
 
-def test_zero_items_is_a_failure_with_actionable_remediation() -> None:
+def test_zero_items_is_a_successful_no_work_outcome() -> None:
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
@@ -824,11 +900,10 @@ def test_zero_items_is_a_failure_with_actionable_remediation() -> None:
             eligible_items=lambda _configuration: [],
         ),
     )
-    check = report.checks[-1]
+    check = next(check for check in report.checks if check.id == "eligible_items")
     assert check.id == "eligible_items"
-    assert check.status is Status.FAIL
-    assert check.remediation
-    assert report.ready is False
+    assert check.status is Status.PASS
+    assert report.outcome is ReadinessOutcome.NO_WORK
 
 
 @pytest.mark.parametrize(
@@ -851,7 +926,7 @@ def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
         ),
     )
 
-    check = report.checks[-1]
+    check = next(check for check in report.checks if check.id == "eligible_items")
     assert check.id == "eligible_items"
     assert check.status is Status.FAIL
     assert report.eligible_items == ()
@@ -879,7 +954,10 @@ def test_invalid_item_values_make_doctor_unready(items: object) -> None:
         ),
     )
 
-    assert report.checks[-1].status is Status.FAIL
+    assert (
+        next(check for check in report.checks if check.id == "eligible_items").status
+        is Status.FAIL
+    )
     assert report.eligible_items == ()
     assert report.ready is False
 
@@ -1142,7 +1220,7 @@ def test_external_item_resolution_failures_are_not_empty_batch_noops(
 
     assert eligible.status is Status.FAIL
     assert eligible.facts.get("count") is None
-    assert not cli._run_can_preserve_empty_batch_noop(report)
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 @pytest.mark.parametrize(

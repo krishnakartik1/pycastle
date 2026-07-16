@@ -57,7 +57,6 @@ from .graph import (
     Phase,
     PhaseGraph,
     PhaseResult,
-    RunDefinition,
     RuntimeNode,
     WalkResult,
     load_run,
@@ -559,6 +558,7 @@ class RunContext:
     worktree: Path
     fixture_dir: Path
     runner: Runner
+    project_fixture_dir: Path | None = None
     remote_checkpoint_succeeded: bool = False
 
 
@@ -1254,7 +1254,7 @@ def _work_issue(
     ``ready-for-human`` (#9) so a person resolves the conflict while the run
     carries on with the remaining items.
     """
-    fixture_dir = run.fixture_dir
+    fixture_dir = run.project_fixture_dir or run.fixture_dir
     run_id = run.run_id
     run_branch = run.branch
     runner = run.runner
@@ -1566,7 +1566,11 @@ def _walk_run_graph(
     scope: str = "Run",
 ) -> WalkResult:
     """Walk one Run phase graph, checkpointing each successful visit."""
-    executor = GraphExecutor(runtime, fixture_dir=run.fixture_dir, preamble=context)
+    executor = GraphExecutor(
+        runtime,
+        fixture_dir=run.project_fixture_dir or run.fixture_dir,
+        preamble=context,
+    )
     default = executor._default_runner(run.worktree)
 
     def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
@@ -1720,6 +1724,7 @@ def run_batch(
     include_unassigned: bool = False,
     runner: Runner = run_cmd,
     verbose: bool = False,
+    frozen_inputs: object | None = None,
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
@@ -1750,6 +1755,13 @@ def run_batch(
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
     selected = tuple(issue.model_copy(deep=True) for issue in selected)
+    frozen_base_commit = getattr(frozen_inputs, "base_commit", None)
+    if frozen_base_commit is not None:
+        if not isinstance(frozen_base_commit, str) or not re.fullmatch(
+            r"[0-9a-f]{40,64}", frozen_base_commit
+        ):
+            raise ValueError("Frozen readiness base commit is invalid")
+        base_branch = frozen_base_commit
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(
         run_id=run_id,
@@ -1765,16 +1777,38 @@ def run_batch(
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
 
-    # Import once: Runtime edits to the fixture are proposed changes and cannot
-    # rewrite the active Run definition or weaken its graphs.
-    run_definition: RunDefinition = load_run(fixture_dir)
+    # Materialize the evaluator's immutable Project fixture only after the
+    # non-empty guard. Runtime edits can therefore never rewrite this Run's
+    # graphs, prompts, Setup, or Gate.
+    project_fixture_dir = fixture_dir
+    frozen_project = getattr(frozen_inputs, "project_fixture", None)
+    if frozen_project is not None:
+        project_fixture_dir = fixture_dir / "runs" / run_id / "project"
+        for frozen_file in frozen_project.files:
+            destination = project_fixture_dir / frozen_file.relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(frozen_file.content)
+            destination.chmod(frozen_file.mode)
+        run_definition = frozen_project.run_definition
+    else:
+        run_definition = load_run(fixture_dir)
     # Readiness guarantees both hooks for real Runs.  The fallback keeps the
     # retained low-level orchestration API usable by historical injected-hook
     # tests while valid Project fixtures always take the frozen graph path.
     explicit_execution = (
-        FrozenRunExecution.freeze(fixture_dir, run_id)
-        if all((fixture_dir / name).is_file() for name in (FIXTURE_SETUP, FIXTURE_GATE))
-        else None
+        FrozenRunExecution(
+            project_fixture_dir / FIXTURE_SETUP,
+            project_fixture_dir / FIXTURE_GATE,
+            fixture_dir / "runs" / run_id / "executions",
+        )
+        if frozen_project is not None
+        else (
+            FrozenRunExecution.freeze(fixture_dir, run_id)
+            if all(
+                (fixture_dir / name).is_file() for name in (FIXTURE_SETUP, FIXTURE_GATE)
+            )
+            else None
+        )
     )
 
     # Per-run branch + worktree: the main checkout is left on its branch.
@@ -1789,6 +1823,7 @@ def run_batch(
         worktree=run_worktree,
         fixture_dir=fixture_dir,
         runner=runner,
+        project_fixture_dir=project_fixture_dir,
     )
     _append_log(
         fixture_dir,
@@ -1817,7 +1852,7 @@ def run_batch(
                     before, _ = _walk_execution_graph(
                         None,
                         runtime=runtime,
-                        fixture_dir=fixture_dir,
+                        fixture_dir=project_fixture_dir,
                         worktree=run_worktree,
                         graph=run_definition.before,
                         execution=explicit_execution,
@@ -1934,7 +1969,7 @@ def run_batch(
                             after, run_gate = _walk_execution_graph(
                                 None,
                                 runtime=runtime,
-                                fixture_dir=fixture_dir,
+                                fixture_dir=project_fixture_dir,
                                 worktree=run_worktree,
                                 graph=run_definition.after,
                                 execution=explicit_execution,

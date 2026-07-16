@@ -21,6 +21,7 @@ from pycastle.readiness import (
     EligibleItem,
     ReadinessCheck,
     ReadinessConfiguration,
+    ReadinessOutcome,
     ReadinessReport,
     Status,
 )
@@ -66,7 +67,7 @@ def ready_run_preflight(
         )
         return ReadinessReport(
             schema_version=1,
-            ready=True,
+            outcome=ReadinessOutcome.READY,
             runner_version="0.1.0",
             configuration=configuration,
             checks=tuple(
@@ -563,7 +564,7 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
         "_evaluate_cli_readiness",
         lambda _args: ReadinessReport(
             schema_version=1,
-            ready=True,
+            outcome=ReadinessOutcome.READY,
             runner_version="0.1.0",
             configuration=ReadinessConfiguration(
                 repository="owner/repo",
@@ -1271,9 +1272,9 @@ def test_resolve_sandbox_prefers_explicit_flag(
 def test_resolve_sandbox_reads_marker_when_flag_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """With no flag, ``_resolve_sandbox`` reads the marker; missing -> host."""
+    """With no flag, only an exact marker resolves a Sandbox."""
     monkeypatch.chdir(tmp_path)
-    assert cli._resolve_sandbox(None) == "host"  # no marker
+    assert cli._resolve_sandbox(None) == ""  # no marker: evaluator reports not_ready
 
     _write_marker(tmp_path, "docker\n")
     assert cli._resolve_sandbox(None) == "docker"

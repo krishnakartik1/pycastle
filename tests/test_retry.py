@@ -25,6 +25,7 @@ from pycastle.readiness import (
     EligibleItem,
     ReadinessCheck,
     ReadinessConfiguration,
+    ReadinessOutcome,
     ReadinessReport,
     Status,
 )
@@ -919,7 +920,7 @@ def test_cli_run_wires_the_fixture_gate_into_run_batch(
         "_evaluate_cli_readiness",
         lambda _args: ReadinessReport(
             1,
-            True,
+            ReadinessOutcome.READY,
             "0.1.0",
             ReadinessConfiguration(
                 "owner/repo", "main", "main", "stub", "host", None, "krishna", False, 1

@@ -30,6 +30,7 @@ from .readiness import (
     AgentImagePreparationError,
     DefaultReadinessAdapter,
     ReadinessConfiguration,
+    ReadinessOutcome,
     ReadinessReport,
     Status,
     evaluate_readiness,
@@ -205,19 +206,13 @@ def _resolve_assignee(login: str) -> str:
 
 
 def _resolve_sandbox(flag: str | None) -> str:
-    """Resolve the effective sandbox for a run: flag, then marker, then host.
-
-    An explicit ``--sandbox`` flag wins. With no flag, the choice
-    ``pycastle init`` recorded in ``.pycastle/sandbox`` is used. A missing,
-    empty, or unrecognised marker falls back to ``host`` so a run never crashes
-    on a garbled marker -- only ``host`` and ``docker`` are honoured.
-    """
+    """Resolve an explicit flag or exact fixture marker, without a default."""
     if flag is not None:
         return flag
     recorded = read_sandbox(FIXTURE_DIR)
     if recorded in ("host", "docker"):
         return recorded
-    return "host"
+    return ""
 
 
 def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
@@ -393,7 +388,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     report = _evaluate_cli_readiness(args)
     output = render_json(report) if args.json else render_human(report)
     print(output)
-    return 0 if report.ready else 1
+    return 0 if report.outcome is not ReadinessOutcome.NOT_READY else 1
 
 
 def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
@@ -431,20 +426,6 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
         )
 
 
-def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
-    """Return whether the sole readiness failure is Run's intentional empty no-op."""
-    failures = [
-        check
-        for check in report.checks
-        if check.status in {Status.FAIL, Status.BLOCKED}
-    ]
-    return (
-        len(failures) == 1
-        and failures[0].id == "eligible_items"
-        and failures[0].facts.get("count") == 0
-    )
-
-
 def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
     """Return whether every eligible Item has matching Run-only content."""
     if len(report.selected_items) != len(report.eligible_items):
@@ -464,10 +445,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # content-addressed Agent image, but creates no Run ID, record, branch,
     # worktree, claim, phase, Setup invocation, or ordinary Gate invocation.
     report = _evaluate_cli_readiness(args)
-    if _run_can_preserve_empty_batch_noop(report):
+    if report.outcome is ReadinessOutcome.NO_WORK:
         logger.info("Nothing to do.")
         return 0
-    if not report.ready:
+    if report.outcome is ReadinessOutcome.NOT_READY:
         for check in report.checks:
             if check.status in {Status.FAIL, Status.BLOCKED}:
                 logger.error("Readiness %s: %s", check.id, check.summary)
@@ -537,6 +518,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         gate_check=gate_check,
         setup=setup,
         verbose=args.verbose,
+        frozen_inputs=report.frozen_inputs,
     )
     if not outcome.selected:
         logger.info("Nothing to do.")
@@ -754,9 +736,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     required = ["git", "gh"]
     if args.command in {"run", "doctor"}:
-        # Resolve the effective sandbox (flag -> .pycastle/sandbox marker ->
-        # host) before preflight so the required-command set matches where the
-        # run will actually execute. The resolved value is written back onto
+        # Resolve the effective sandbox (flag -> .pycastle/sandbox marker)
+        # before readiness so the command inventory matches where the
+        # Run will execute. Invalid or missing selection remains empty and is
+        # reported by the shared evaluator. The value is written back onto
         # args so _cmd_run reads the same decision.
         args.sandbox = _resolve_sandbox(args.sandbox)
         if args.sandbox == "docker":

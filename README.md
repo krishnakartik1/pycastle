@@ -212,11 +212,15 @@ inspect. PyCastle performs no self-update or update discovery, and it does not
 create a commit, branch, pull request, or merge authorization.
 
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
-agent image. An unchanged recipe reuses its content-addressed image; editing the
-recipe causes a new image to be built. `--image IMAGE` is the bring-your-own-image
-escape hatch and bypasses the Dockerfile, but that image must provide the
-runtime CLI, project gate toolchain, `git`, and the expected non-root `node` user
-with home `/home/node`.
+Agent image. Doctor and Run build it with the clean repository root as context
+and pin the resulting immutable image identity for that one readiness snapshot.
+PyCastle probes only its language-neutral launch, workspace, authentication, and
+Runtime boundary; project interpreters and toolchains remain behind Setup.
+
+`pycastle doctor` reports `ready`, `no_work`, or `not_ready`. It never executes
+Setup, Gate, an Execution graph, or a Runtime prompt. A later Run always takes a
+fresh snapshot. Select a Sandbox explicitly with `--sandbox`, or record exactly
+`host` or `docker` in `.pycastle/sandbox`; there is no implicit host default.
 
 ## Troubleshooting Codex host Black checks
 

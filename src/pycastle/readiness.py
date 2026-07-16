@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,15 +36,15 @@ CHECK_IDS = (
     "fixture_compatibility",
     "fixture_structure",
     "sandbox",
-    "agent_image",
-    "runtime",
-    "runtime_authentication",
-    "gate_toolchain",
     "github_authentication",
     "github_repository",
     "github_permissions",
     "workflow_labels",
     "eligible_items",
+    "frozen_execution_inputs",
+    "agent_image",
+    "runtime",
+    "runtime_authentication",
 )
 
 
@@ -106,6 +109,12 @@ class Status(StrEnum):
     NOT_APPLICABLE = "not_applicable"
 
 
+class ReadinessOutcome(StrEnum):
+    READY = "ready"
+    NO_WORK = "no_work"
+    NOT_READY = "not_ready"
+
+
 @dataclass(frozen=True)
 class ReadinessConfiguration:
     repository: str
@@ -123,6 +132,30 @@ class ReadinessConfiguration:
 class EligibleItem:
     number: int
     title: str
+
+
+@dataclass(frozen=True)
+class FrozenFixtureFile:
+    relative_path: str
+    content: bytes = field(repr=False)
+    mode: int
+
+
+@dataclass(frozen=True)
+class FrozenProjectFixture:
+    identity: str
+    run_definition: RunDefinition = field(repr=False, compare=False)
+    files: tuple[FrozenFixtureFile, ...] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class FrozenReadinessInputs:
+    base_commit: str
+    project_fixture: FrozenProjectFixture
+    items: tuple[IssueRef, ...] = field(repr=False)
+    sandbox: str
+    runtime: str
+    agent_image: str | None
 
 
 @dataclass(frozen=True)
@@ -148,7 +181,7 @@ class ReadinessCheck:
 @dataclass(frozen=True)
 class ReadinessReport:
     schema_version: int
-    ready: bool
+    outcome: ReadinessOutcome
     runner_version: str
     configuration: ReadinessConfiguration
     checks: tuple[ReadinessCheck, ...]
@@ -157,10 +190,21 @@ class ReadinessReport:
     selected_items: tuple[IssueRef, ...] = field(
         default_factory=tuple, repr=False, compare=False
     )
+    frozen_inputs: FrozenReadinessInputs | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def ready(self) -> bool:
+        """Compatibility projection; callers should consume ``outcome``."""
+        return self.outcome is ReadinessOutcome.READY
 
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
 ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem | IssueRef]]
+InputFreezer = Callable[
+    [ReadinessConfiguration, tuple[IssueRef, ...]], FrozenReadinessInputs
+]
 Progress = Callable[[str, str, Status | None], None]
 
 
@@ -168,6 +212,7 @@ Progress = Callable[[str, str, Status | None], None]
 class ReadinessDependencies:
     probe: Probe
     eligible_items: ItemLoader
+    freeze_inputs: InputFreezer | None = None
 
 
 _PREREQUISITES: dict[str, tuple[str, ...]] = {
@@ -175,14 +220,24 @@ _PREREQUISITES: dict[str, tuple[str, ...]] = {
     "base_branch": ("git_repository",),
     "fixture_structure": ("fixture_compatibility",),
     "sandbox": ("fixture_compatibility",),
-    "agent_image": ("fixture_compatibility", "sandbox"),
-    "runtime": ("sandbox", "agent_image"),
-    "runtime_authentication": ("runtime",),
-    "gate_toolchain": ("fixture_structure", "sandbox", "agent_image"),
     "github_repository": ("github_authentication", "git_repository"),
     "github_permissions": ("github_authentication", "github_repository"),
     "workflow_labels": ("github_authentication", "github_repository"),
     "eligible_items": ("github_authentication", "github_repository"),
+    "agent_image": (
+        "fixture_compatibility",
+        "fixture_structure",
+        "sandbox",
+        "eligible_items",
+    ),
+    "frozen_execution_inputs": (
+        "base_branch",
+        "fixture_structure",
+        "sandbox",
+        "eligible_items",
+    ),
+    "runtime": ("sandbox", "agent_image", "frozen_execution_inputs", "eligible_items"),
+    "runtime_authentication": ("runtime", "eligible_items"),
 }
 
 
@@ -197,6 +252,8 @@ def evaluate_readiness(
     outcomes: dict[str, Status] = {}
     items: list[EligibleItem] = []
     selected_items: tuple[IssueRef, ...] = ()
+    frozen_inputs: FrozenReadinessInputs | None = None
+    no_work = False
     for check_id in CHECK_IDS:
         if progress is not None:
             progress("start", check_id, None)
@@ -210,13 +267,45 @@ def evaluate_readiness(
                 and configuration.sandbox == "docker"
             )
         ]
-        if failed:
+        if no_work and check_id in {
+            "frozen_execution_inputs",
+            "agent_image",
+            "runtime",
+            "runtime_authentication",
+        }:
+            result = CheckResult(
+                Status.NOT_APPLICABLE,
+                "No eligible Items require execution coordination.",
+            )
+        elif failed:
             result = CheckResult(
                 Status.BLOCKED,
                 "Blocked by failed prerequisite(s): " + ", ".join(failed),
                 {"prerequisites": failed},
                 "Resolve the prerequisite checks, then run Doctor again.",
             )
+        elif check_id == "frozen_execution_inputs":
+            if dependencies.freeze_inputs is None:
+                result = CheckResult(Status.PASS, "Execution inputs are frozen.")
+            else:
+                try:
+                    frozen_inputs = dependencies.freeze_inputs(
+                        configuration, selected_items
+                    )
+                    result = CheckResult(
+                        Status.PASS,
+                        "Exact base, Project fixture, Item batch, and host configuration are frozen.",
+                        {
+                            "base_commit": frozen_inputs.base_commit,
+                            "fixture_identity": frozen_inputs.project_fixture.identity,
+                        },
+                    )
+                except (OSError, TypeError, ValueError):
+                    result = CheckResult(
+                        Status.FAIL,
+                        "Execution inputs could not be frozen safely.",
+                        remediation="Resolve the failed identity checks and retry Doctor.",
+                    )
         elif check_id == "eligible_items":
             try:
                 loaded_items = dependencies.eligible_items(configuration)
@@ -234,20 +323,12 @@ def evaluate_readiness(
                 items = [safe_items[index] for index in order]
                 if len(full_items) == len(loaded_items):
                     selected_items = tuple(full_items[index] for index in order)
-                result = (
-                    CheckResult(
-                        Status.PASS,
-                        f"{len(items)} eligible Item(s) selected.",
-                        {"count": len(items)},
-                    )
-                    if items
-                    else CheckResult(
-                        Status.FAIL,
-                        "No eligible Items match the resolved Run configuration.",
-                        {"count": 0},
-                        "Assign or label an Item ready-for-agent, or adjust the assignee policy.",
-                    )
+                result = CheckResult(
+                    Status.PASS,
+                    f"{len(items)} eligible Item(s) selected.",
+                    {"count": len(items)},
                 )
+                no_work = not items
             except (
                 AttributeError,
                 KeyError,
@@ -290,15 +371,23 @@ def evaluate_readiness(
         outcomes[check_id] = result.status
         if progress is not None:
             progress("complete", check_id, result.status)
-    ready = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
+    successful = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
+    outcome = (
+        ReadinessOutcome.NO_WORK
+        if successful and no_work
+        else ReadinessOutcome.READY
+        if successful
+        else ReadinessOutcome.NOT_READY
+    )
     return ReadinessReport(
         SCHEMA_VERSION,
-        ready,
+        outcome,
         __version__,
         configuration,
         tuple(checks),
         tuple(items),
         selected_items,
+        frozen_inputs,
     )
 
 
@@ -314,6 +403,10 @@ _FACT_KEYS: dict[str, dict[str, str]] = {
     "runtime": {"version": "text"},
     "workflow_labels": {"missing": "list"},
     "eligible_items": {"count": "integer"},
+    "frozen_execution_inputs": {
+        "base_commit": "text",
+        "fixture_identity": "text",
+    },
 }
 
 
@@ -391,7 +484,7 @@ def report_document(report: ReadinessReport) -> dict[str, Any]:
     }
     return {
         "schema_version": report.schema_version,
-        "ready": report.ready,
+        "outcome": report.outcome.value,
         "runner_version": report.runner_version,
         "configuration": configuration,
         "checks": [
@@ -446,7 +539,7 @@ def render_human(report: ReadinessReport) -> str:
         else ""
     )
     lines = [
-        f"PyCastle Doctor: {'ready' if report.ready else 'not ready'}",
+        f"PyCastle Doctor: {report.outcome.value.replace('_', ' ')}",
         f"Repository: {repository}",
         f"Base branch: {base_branch} "
         f"(GitHub default: {github_default or 'unknown'})",
@@ -485,6 +578,8 @@ class DefaultReadinessAdapter:
         self.stream_image_build = stream_image_build
         self.cleanup_reporter = cleanup_reporter
         self._docker_workspace: Path | None = None
+        self._base_commit: str | None = None
+        self._project_fixture: FrozenProjectFixture | None = None
 
     def __enter__(self) -> DefaultReadinessAdapter:
         return self
@@ -626,12 +721,26 @@ class DefaultReadinessAdapter:
                 f"refs/heads/{config.base_branch}",
             ]
         )
+        lines = (getattr(result, "stdout", "") or "").splitlines()
+        expected_ref = f"refs/heads/{config.base_branch}"
+        parsed = [line.split() for line in lines]
+        exact = [
+            parts for parts in parsed if len(parts) == 2 and parts[1] == expected_ref
+        ]
+        commit = exact[0][0] if len(exact) == 1 else ""
+        valid_commit = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", commit))
+        if self._ok(result) and valid_commit:
+            self._base_commit = commit.lower()
         return (
-            CheckResult(Status.PASS, "Selected base branch exists on origin.", facts)
-            if self._ok(result)
+            CheckResult(
+                Status.PASS,
+                "Selected remote base resolved to one exact commit.",
+                {**facts, "commit": self._base_commit},
+            )
+            if self._base_commit
             else CheckResult(
                 Status.FAIL,
-                "Selected base branch is not reachable on origin.",
+                "Selected base branch did not resolve to one exact remote commit.",
                 facts,
                 "Push the selected base branch or choose an existing remote branch.",
             )
@@ -664,6 +773,9 @@ class DefaultReadinessAdapter:
             sys.dont_write_bytecode = True
             definition = load_run(self.fixture_dir)
             _validate_run_definition(definition, self.fixture_dir)
+            self._project_fixture = _freeze_project_fixture(
+                self.fixture_dir, definition
+            )
         finally:
             sys.dont_write_bytecode = old
         return CheckResult(
@@ -966,23 +1078,67 @@ test -w "$workspace_file"
         if not config.assignee:
             raise ValueError("GitHub assignee could not be resolved")
         source = GitHubIssueSource(config.repository, runner=self.runner)
-        issues = (
-            source.list_ready(timeout=SHORT_TIMEOUT)
-            if self.include_item_content
-            else source.list_ready_metadata(timeout=SHORT_TIMEOUT)
-        )
+        # Doctor and Run freeze the same complete authoritative Item snapshot;
+        # renderers project only number/title from these private copies.
+        issues = source.list_ready(timeout=SHORT_TIMEOUT)
         selected = select_batch(
             issues,
             assignee=config.assignee,
             include_unassigned=config.include_unassigned,
             limit=config.item_limit,
         )
-        if self.include_item_content:
-            return selected
-        return [EligibleItem(issue.number, issue.title) for issue in selected]
+        return selected
 
     def dependencies(self) -> ReadinessDependencies:
-        return ReadinessDependencies(self.probe, self.eligible_items)
+        return ReadinessDependencies(
+            self.probe, self.eligible_items, self.frozen_inputs
+        )
+
+    def frozen_inputs(
+        self, config: ReadinessConfiguration, items: tuple[IssueRef, ...]
+    ) -> FrozenReadinessInputs:
+        if self._base_commit is None or self._project_fixture is None:
+            raise ValueError("Readiness identities are incomplete")
+        return FrozenReadinessInputs(
+            self._base_commit,
+            self._project_fixture,
+            tuple(item.model_copy(deep=True) for item in items),
+            config.sandbox,
+            config.runtime,
+            config.agent_image,
+        )
+
+
+def _freeze_project_fixture(
+    fixture_dir: Path, definition: RunDefinition
+) -> FrozenProjectFixture:
+    paths = {fixture_dir / "main.py", fixture_dir / "setup", fixture_dir / "gate"}
+    for marker in ("version", "sandbox", "Dockerfile"):
+        candidate = fixture_dir / marker
+        if candidate.is_file() and not candidate.is_symlink():
+            paths.add(candidate)
+    for graph in (definition.before, definition.item, definition.after):
+        if graph is not None:
+            paths.update(
+                fixture_dir / "prompts" / node.prompt
+                for node in graph.nodes.values()
+                if isinstance(node, RuntimeNode)
+            )
+    frozen: list[FrozenFixtureFile] = []
+    digest = hashlib.sha256()
+    for path in sorted(
+        paths, key=lambda value: value.relative_to(fixture_dir).as_posix()
+    ):
+        relative = path.relative_to(fixture_dir).as_posix()
+        content = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+        digest.update(relative.encode())
+        digest.update(mode.to_bytes(2, "big"))
+        digest.update(content)
+        frozen.append(FrozenFixtureFile(relative, content, mode))
+    return FrozenProjectFixture(
+        digest.hexdigest(), copy.deepcopy(definition), tuple(frozen)
+    )
 
 
 def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> None:
@@ -1018,7 +1174,17 @@ def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> No
                 raise ValueError(f"Invalid prompt path in {scope} graph")
     for name in ("setup", "gate"):
         path = fixture_dir / name
-        if path.exists() and (
-            not path.is_file() or path.is_symlink() or not path.stat().st_mode & 0o111
+        if (
+            not path.exists()
+            or not path.is_file()
+            or path.is_symlink()
+            or not path.stat().st_mode & 0o111
         ):
             raise ValueError(f"Invalid {name} executable")
+        try:
+            first_line = path.read_bytes().splitlines()[0].decode("utf-8")
+            words = shlex.split(first_line[2:]) if first_line.startswith("#!") else []
+        except (IndexError, OSError, UnicodeDecodeError, ValueError):
+            words = []
+        if not words or not words[0].startswith("/") or len(words) > 2:
+            raise ValueError(f"Invalid {name} shebang")
