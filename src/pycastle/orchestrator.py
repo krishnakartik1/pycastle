@@ -262,8 +262,30 @@ FIXTURE_GATE = "gate"
 FIXTURE_SETUP = "setup"
 
 
+@dataclass(frozen=True)
+class SetupFailure:
+    """Allow-listed Setup facts safe to expose outside the local record."""
+
+    command: str
+    termination: dict[str, object]
+
+
 class SetupError(RuntimeError):
-    """The project-owned setup hook could not prepare an issue worktree."""
+    """The frozen Setup prerequisite was not durably established."""
+
+    def __init__(
+        self, failure: SetupFailure | str, message: str = "Setup failed"
+    ) -> None:
+        # String construction is retained for the injected-hook compatibility
+        # boundary; canonical frozen Setup always supplies structured facts.
+        if isinstance(failure, str):
+            super().__init__(failure)
+            self.failure = SetupFailure(
+                ".pycastle/setup", {"kind": "orchestration_error"}
+            )
+        else:
+            super().__init__(message)
+            self.failure = failure
 
 
 @dataclass
@@ -304,15 +326,29 @@ class FrozenRunExecution:
         identity: str,
         ordinal: int,
     ) -> None:
-        record = execute_hook(
-            self.setup,
-            cwd=worktree,
-            scope=scope,
-            record_path=self.records
-            / f"{self._record_identity(identity)}-setup-{ordinal}.json",
-        )
+        try:
+            record = execute_hook(
+                self.setup,
+                cwd=worktree,
+                scope=scope,
+                record_path=self.records
+                / f"{self._record_identity(identity)}-setup-{ordinal}.json",
+            )
+        except Exception as exc:
+            raise SetupError(
+                SetupFailure(
+                    ".pycastle/setup",
+                    {
+                        "kind": "record_persistence_error",
+                        "error_kind": type(exc).__name__,
+                    },
+                ),
+                "Setup record could not be persisted",
+            ) from exc
         if not record.success:
-            raise SetupError(f"Project setup failed: {record.termination}")
+            raise SetupError(
+                SetupFailure(".pycastle/setup", dict(record.termination.__dict__))
+            )
 
     def invoke_gate(
         self,
@@ -537,6 +573,7 @@ class RunOutcome:
     pr_ready: bool = False
     succeeded: bool = True
     stopping_point: str | None = None
+    setup_failure: SetupFailure | None = None
 
     @property
     def completed(self) -> list[int]:
@@ -782,6 +819,15 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
         cwd=cwd,
     )
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
+
+
+def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
+    """Remove Git state that cannot represent a publishable Run checkpoint."""
+    result = runner(["git", "branch", "-D", branch], capture=True, cwd=cwd)
+    if getattr(result, "returncode", 1) != 0:
+        raise BranchError(
+            f"git branch deletion failed for {branch}{_git_failure_detail(result)}"
+        )
 
 
 @contextmanager
@@ -1906,8 +1952,11 @@ def run_batch(
         raise
     except SetupError as exc:
         outcome.succeeded = False
-        outcome.stopping_point = f"before-Run Setup: {exc}"
+        outcome.stopping_point = "Run bootstrap Setup"
+        outcome.setup_failure = exc.failure
+        _append_log(fixture_dir, run_id, outcome.stopping_point)
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        delete_local_branch(run_branch, runner=runner, cwd=workspace)
         return outcome
     except RunCheckpointError as exc:
         outcome.succeeded = False
@@ -1970,6 +2019,26 @@ def run_batch(
                         cancellation=cancellation,
                         verbose=verbose,
                     )
+                except SetupError as exc:
+                    cleanup_worktree(
+                        worktree_root / f"issue-{issue.number}",
+                        runner=runner,
+                        cwd=workspace,
+                    )
+                    issue_source.release(issue.number)
+                    cancellation.in_flight = None
+                    delete_local_branch(
+                        issue_branch_name(issue), runner=runner, cwd=workspace
+                    )
+                    outcome.succeeded = False
+                    outcome.stopping_point = f"Item #{issue.number} Setup"
+                    outcome.setup_failure = exc.failure
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    if not outcome.completed:
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        delete_local_branch(run_branch, runner=runner, cwd=workspace)
+                        return outcome
+                    break
                 except Exception as exc:  # handled infrastructure boundary
                     cleanup_worktree(
                         worktree_root / f"issue-{issue.number}",
@@ -2056,6 +2125,7 @@ def run_batch(
             if outcome.succeeded:
                 outcome.succeeded = False
                 outcome.stopping_point = "after-Run Setup"
+                outcome.setup_failure = exc.failure
             _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
             try:
                 _discard_incomplete_run_scope(run)
@@ -2096,6 +2166,7 @@ def run_batch(
             publication_error=publication_error,
             successful=outcome.succeeded,
             stopping_point=outcome.stopping_point,
+            setup_failure=outcome.setup_failure,
         )
         outcome.pr_opened = publication.pr_opened
         outcome.pr_ready = publication.pr_ready
@@ -2131,6 +2202,7 @@ def _open_pull_request(
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
+    setup_failure: SetupFailure | None = None,
 ) -> PublicationOutcome:
     """Final-push, draft-create, report, then ready a successful Run PR."""
     if not _push_run_branch(run=run, final=True):
@@ -2289,6 +2361,20 @@ def _open_pull_request(
     )
     if stopping_point:
         comment += f"- Stopping point: {stopping_point}\n"
+    if setup_failure is not None:
+        termination = setup_failure.termination
+        kind = termination.get("kind")
+        if kind == "exited":
+            setup_result = f"exit {termination.get('code')}"
+        elif kind == "signaled":
+            setup_result = f"signal {termination.get('signal')}"
+        elif kind == "launch_error":
+            setup_result = f"launch error {termination.get('error_kind', 'unknown')}"
+        elif kind == "record_persistence_error":
+            setup_result = "record persistence error"
+        else:
+            setup_result = "orchestration error"
+        comment += f"- Setup: `{setup_failure.command}` — {setup_result}\n"
     if publication_error:
         comment += f"\n> Run report validation error: {publication_error}\n"
     elif report is not None:

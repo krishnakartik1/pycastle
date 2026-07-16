@@ -1840,6 +1840,151 @@ def test_second_run_setup_failure_discards_dirty_scope_and_keeps_draft(
     assert "Stopping point: after-Run Setup" in comment
 
 
+def test_frozen_setup_failure_exposes_only_typed_safe_metadata(
+    tmp_path: Path,
+) -> None:
+    hook = tmp_path / "setup"
+    hook.write_text("#!/bin/sh\nprintf secret-output\nexit 23\n")
+    hook.chmod(0o755)
+    execution = orchestrator.FrozenRunExecution(hook, hook, tmp_path / "records")
+
+    with pytest.raises(orchestrator.SetupError) as raised:
+        execution.invoke_setup(tmp_path, scope="run", identity="bootstrap", ordinal=1)
+
+    assert raised.value.failure.command == ".pycastle/setup"
+    assert raised.value.failure.termination == {"kind": "exited", "code": 23}
+    assert "secret-output" not in str(raised.value)
+    record = json.loads(next((tmp_path / "records").iterdir()).read_text())
+    assert bytes.fromhex(record["stdout"]["first"]) == b"secret-output"
+
+
+def test_setup_failure_publication_contains_safe_metadata_only(tmp_path: Path) -> None:
+    runner = MagicMock(side_effect=_git_aware_runner())
+    run = orchestrator.RunContext(
+        run_id="safe-setup",
+        branch="pycastle/run-safe-setup",
+        worktree=tmp_path,
+        fixture_dir=tmp_path / ".pycastle",
+        runner=runner,
+    )
+
+    orchestrator._open_pull_request(
+        repo="owner/repo",
+        base_branch="main",
+        run=run,
+        completed=[1],
+        selected=[IssueRef(number=1, title="One")],
+        skipped=[],
+        gate=None,
+        report=None,
+        publication_error=None,
+        successful=False,
+        stopping_point="Item #2 Setup",
+        setup_failure=orchestrator.SetupFailure(
+            command=".pycastle/setup",
+            termination={"kind": "signaled", "signal": 9},
+        ),
+    )
+
+    comment_call = next(
+        call.args[0]
+        for call in runner.call_args_list
+        if call.args[0][:3] == ["gh", "pr", "comment"]
+    )
+    comment = comment_call[comment_call.index("--body") + 1]
+    assert "Setup: `.pycastle/setup` — signal 9" in comment
+    assert "stdout" not in comment
+    assert "stderr" not in comment
+
+
+def test_bootstrap_setup_failure_removes_run_git_state_before_item_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    for name, body in (("setup", "exit 7"), ("gate", "exit 0")):
+        hook = fixture / name
+        hook.write_text(f"#!/bin/sh\n{body}\n")
+        hook.chmod(0o755)
+    issue = IssueRef(number=1, title="One")
+    source = MagicMock()
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=[issue],
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="bootstrap-red",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert not outcome.succeeded and outcome.completed == []
+    assert outcome.setup_failure is not None
+    assert outcome.setup_failure.termination == {"kind": "exited", "code": 7}
+    source.is_still_eligible.assert_not_called()
+    source.claim.assert_not_called()
+    source.release.assert_not_called()
+    assert _calls_containing(runner, "git", "branch", "-D", outcome.run_branch)
+    assert not _calls_containing(runner, "git", "push")
+    assert not _calls_containing(runner, "gh", "pr", "create")
+
+
+def test_item_setup_failure_releases_only_active_item_and_publishes_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _scoped_fixture(tmp_path)
+    item_count = tmp_path / "item-count"
+    setup = fixture / "setup"
+    setup.write_text(
+        "#!/bin/sh\n"
+        'test "$PYCASTLE_SCOPE" = run && exit 0\n'
+        f"count=$(cat '{item_count}' 2>/dev/null || printf 0)\n"
+        "count=$((count + 1))\n"
+        f"printf %s \"$count\" > '{item_count}'\n"
+        'test "$count" -eq 1\n'
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text("#!/bin/sh\nexit 0\n")
+    gate.chmod(0o755)
+    issues = [IssueRef(number=n, title=str(n)) for n in (1, 2)]
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+    runner = _git_aware_runner()
+
+    outcome = orchestrator.run_batch(
+        runtime=StubRuntime(),
+        issue_source=source,
+        selected=issues,
+        fixture_dir=fixture,
+        repo="owner/repo",
+        base_branch="main",
+        assignee="krishna",
+        run_id="item-red",
+        workspace=tmp_path,
+        worktree_root=tmp_path / "wt",
+        runner=runner,
+    )
+
+    assert outcome.completed == [1]
+    assert not outcome.succeeded and outcome.pr_opened and not outcome.pr_ready
+    source.release.assert_called_once_with(2)
+    source.mark_for_human.assert_not_called()
+    merges = [
+        call.args[0][2]
+        for call in runner.call_args_list
+        if call.args[0][:2] == ["git", "merge"] and "--abort" not in call.args[0]
+    ]
+    assert merges == [orchestrator.issue_branch_name(issues[0])]
+    assert _calls_containing(runner, "gh", "pr", "create")
+    assert not _calls_containing(runner, "gh", "pr", "ready")
+
+
 def test_second_run_setup_cleanup_failure_still_publishes_durable_work(
     tmp_path: Path,
 ) -> None:
