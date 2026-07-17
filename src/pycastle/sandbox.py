@@ -1,112 +1,21 @@
-"""Pure builders for the Docker agent sandbox argv.
+"""Pure Docker Sandbox command builders.
 
-Docker is the isolation boundary (ADR-0003): both the Runtime and the commands
-it invokes run inside the container, never on the host. Auth is a Docker volume
-holding the agent's subscription login (ADR-0002) rather than an API key or a
-host credential bind-mount.
-
-Every function here is a *pure* function of its arguments: it returns the
-``docker`` argv as a list of strings and runs nothing. Side effects (actually
-invoking ``docker``) live in the CLI and the Runtime, which keeps these
-builders trivial to unit-test by asserting the argv.
-
-Encoded decisions, shared by every builder:
-
-* Run as the non-root user ``node`` with home ``/home/node``. The ``claude``
-  CLI refuses to run as root, and bind-mounted files written as ``node`` stay
-  owned by a real user rather than root.
-* The agent image is based on ``node:22`` (see :data:`DEFAULT_IMAGE`); the
-  project Dockerfile that builds it is scaffolded by a later slice.
-* One auth volume *per Runtime*, shared across every project (see
-  :func:`auth_volume`). You log in once per agent, not once per repo.
-* Runtime state is pinned per runtime to the mount point of its auth volume,
-  so the CLI reads and writes credentials there inside the container. Claude
-  uses ``CLAUDE_CONFIG_DIR=/home/node/.claude``; Codex uses
-  ``CODEX_HOME=/home/node/.codex`` (see :data:`RUNTIME_CONFIG`).
-
-Credential file contents are never read, printed, or copied by any builder.
-Auth is proved only by the runtime's own ``status`` subcommand (see
-:func:`build_status_command`), never by ``cat``-ing the volume.
-
-Headless fallback
------------------
-:func:`build_login_command` performs the *interactive* browser login, which
-needs a TTY. On a headless host (CI, a server with no browser) run the login on
-a machine that has a browser, then move the resulting credentials into the same
-named volume the host uses.
+The project-owned image is already pinned before these builders are called.
+Every invocation is a fresh container which keeps only the repository workspace
+and the selected Runtime's authentication volume.
 """
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-#: The default agent-runtime image, based on ``node:22`` so the bundled
-#: ``claude`` CLI is available. The project Dockerfile that publishes this image
-#: under this tag is scaffolded by a later slice.
-DEFAULT_IMAGE = "pycastle/agent:node22"
-
-#: The Docker repo every content-addressed agent image is tagged under (see
-#: :func:`image_tag_for_dockerfile`). The default image lives here too.
-AGENT_IMAGE_REPO = "pycastle/agent"
-
-
-def image_tag_for_dockerfile(dockerfile_text: str) -> str:
-    """Return the content-addressed agent-image tag for a Dockerfile's text.
-
-    The tag is ``pycastle/agent:<sha256(text)[:12]>`` (ADR-0005): a 12-char
-    lowercase-hex slice of the recipe's SHA-256. Identical text always yields
-    the same tag, so an unchanged Dockerfile skips the build, and any edit
-    changes the tag and triggers exactly one rebuild.
-
-    The hash covers the *recipe text*, not the upstream base it pulls. A moving
-    base tag such as ``FROM node:22-slim`` is deliberately not tracked: identical
-    text means the same tag and no rebuild even if the base has changed upstream
-    (catching base drift is a separate, deliberate ``--pull`` — out of scope).
-    """
-    digest = hashlib.sha256(dockerfile_text.encode("utf-8")).hexdigest()[:12]
-    return f"{AGENT_IMAGE_REPO}:{digest}"
-
-
-#: The non-root user the agent runs as inside the container.
-SANDBOX_USER = "node"
-
-#: ``node``'s home inside the container; the auth volume mounts here.
-SANDBOX_HOME = "/home/node"
-
-#: Where the Claude auth volume is mounted and where the ``claude`` CLI keeps
-#: state. Kept as a module constant for the Claude tests and call sites.
-CLAUDE_CONFIG_DIR = "/home/node/.claude"
-
-#: Where the Codex auth volume is mounted and where the ``codex`` CLI keeps
-#: state. Pinned via ``CODEX_HOME`` rather than ``CLAUDE_CONFIG_DIR``.
-CODEX_HOME = "/home/node/.codex"
-
-#: The stable PyCastle bot git identity pinned for in-container commits. The
-#: ``implement`` and ``review`` prompts tell the runtime to commit its work, but
-#: the agent image gives the ``node`` user no git author. Without an identity
-#: ``git commit`` either aborts ("Author identity unknown") or synthesises a junk
-#: ``node@<container-id>.(none)`` author that rides into the run branch and PR.
-#: One identity serves as both author and committer.
-GIT_AUTHOR_NAME = "PyCastle"
-GIT_AUTHOR_EMAIL = "pycastle@users.noreply.github.com"
+AUTH_DIR = "/pycastle/auth"
 
 
 @dataclass(frozen=True)
 class RuntimeSandboxConfig:
-    """How one runtime pins its credentials inside the container.
-
-    Each runtime mounts its per-Runtime auth volume at ``config_dir`` and pins
-    that path through the environment variable named ``config_env``, so the CLI
-    reads and writes credentials there. ``cli`` is the in-container binary,
-    ``login_args`` is the argv that onboards a login into the mounted volume, and
-    ``status_args`` is the argv that asks the runtime's own CLI whether the
-    volume holds working credentials. Both run the runtime's own binary, so a
-    Codex status check never shells out to ``claude`` (and vice versa).
-    """
-
     cli: str
     config_dir: str
     config_env: str
@@ -114,78 +23,65 @@ class RuntimeSandboxConfig:
     status_args: tuple[str, ...]
 
 
-#: Per-runtime sandbox configuration. Claude pins ``CLAUDE_CONFIG_DIR`` and logs
-#: in via the interactive ``claude auth login --claudeai`` browser flow; Codex
-#: pins ``CODEX_HOME`` and logs in via the device-authorization flow
-#: (``codex login --device-auth``), which prints a code and a URL instead of
-#: opening a localhost callback or needing a TTY. These subcommands match the
-#: installed CLIs (Claude Code 2.1.177, Codex 0.139.0).
 RUNTIME_CONFIG: dict[str, RuntimeSandboxConfig] = {
     "claude": RuntimeSandboxConfig(
-        cli="claude",
-        config_dir=CLAUDE_CONFIG_DIR,
-        config_env="CLAUDE_CONFIG_DIR",
-        login_args=("claude", "auth", "login", "--claudeai"),
-        status_args=("claude", "auth", "status"),
+        "claude",
+        AUTH_DIR,
+        "CLAUDE_CONFIG_DIR",
+        ("claude", "auth", "login", "--claudeai"),
+        ("claude", "auth", "status"),
     ),
     "codex": RuntimeSandboxConfig(
-        cli="codex",
-        config_dir=CODEX_HOME,
-        config_env="CODEX_HOME",
-        login_args=("codex", "login", "--device-auth"),
-        status_args=("codex", "login", "status"),
+        "codex",
+        AUTH_DIR,
+        "CODEX_HOME",
+        ("codex", "login", "--device-auth"),
+        ("codex", "login", "status"),
     ),
 }
 
 
 def _config_for(runtime_name: str) -> RuntimeSandboxConfig:
-    """Return the sandbox config for ``runtime_name`` or raise for an unknown one."""
     try:
         return RUNTIME_CONFIG[runtime_name]
     except KeyError:
-        raise ValueError(f"No sandbox config for runtime: {runtime_name!r}") from None
+        raise ValueError(
+            f"No Docker convention for Runtime: {runtime_name!r}"
+        ) from None
 
 
 def auth_volume(runtime_name: str) -> str:
-    """Return the stable, per-Runtime Docker auth volume name.
-
-    The name depends only on ``runtime_name`` — never on a repo or workspace —
-    so a single login is shared across every project a Runtime works.
-    """
+    _config_for(runtime_name)
     return f"pycastle-{runtime_name}-auth"
 
 
-def _auth_mount_args(runtime_name: str) -> list[str]:
-    """Mount the per-Runtime auth volume at that runtime's config dir."""
-    config_dir = _config_for(runtime_name).config_dir
-    return ["-v", f"{auth_volume(runtime_name)}:{config_dir}"]
+def _validate_image(image: str) -> None:
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError("An immutable Agent image identity is required")
 
 
-def _config_env_args(runtime_name: str) -> list[str]:
-    """Pin the runtime's config-dir env var to the auth volume's mount point."""
+def _validate_inner_argv(inner_argv: Sequence[str]) -> None:
+    if isinstance(inner_argv, str) or not inner_argv:
+        raise ValueError("A non-empty container process argv is required")
+    if any(not isinstance(argument, str) or not argument for argument in inner_argv):
+        raise ValueError("Container process arguments must be non-empty strings")
+
+
+def _environment_args(
+    runtime_name: str, environment: Mapping[str, str] | None = None
+) -> list[str]:
     config = _config_for(runtime_name)
-    return ["-e", f"{config.config_env}={config.config_dir}"]
-
-
-def _git_identity_args() -> list[str]:
-    """Pin the PyCastle bot git identity for in-container commits.
-
-    Returns the four ``-e GIT_*`` pairs setting both the author and the
-    committer to the same bot identity. Git honours these environment variables
-    above any ``git config`` and auto-detects the committer separately from the
-    author, so all four must be set for a config-less container to commit
-    deterministically — regardless of what the image did or didn't configure.
-    """
-    return [
-        "-e",
-        f"GIT_AUTHOR_NAME={GIT_AUTHOR_NAME}",
-        "-e",
-        f"GIT_AUTHOR_EMAIL={GIT_AUTHOR_EMAIL}",
-        "-e",
-        f"GIT_COMMITTER_NAME={GIT_AUTHOR_NAME}",
-        "-e",
-        f"GIT_COMMITTER_EMAIL={GIT_AUTHOR_EMAIL}",
-    ]
+    values = {config.config_env: AUTH_DIR}
+    for name, value in (environment or {}).items():
+        if name != "PYCASTLE_SCOPE":
+            raise ValueError(f"Docker environment value is not allow-listed: {name}")
+        if value not in {"item", "run"}:
+            raise ValueError("PYCASTLE_SCOPE must be 'item' or 'run'")
+        values[name] = value
+    result: list[str] = []
+    for name, value in values.items():
+        result.extend(("-e", f"{name}={value}"))
+    return result
 
 
 def build_run_command(
@@ -193,120 +89,64 @@ def build_run_command(
     *,
     inner_argv: Sequence[str],
     workspace: Path,
+    image: str,
     workdir: Path | None = None,
-    image: str = DEFAULT_IMAGE,
+    environment: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Wrap an inner agent argv into a ``docker run`` argv.
-
-    ``inner_argv`` is the command the Runtime would otherwise run on the host
-    (for Claude, the ``claude …`` argv from ``ClaudeRuntime.build_command``;
-    for Codex, the ``codex …`` argv from ``CodexRuntime.build_command``, which
-    already carries its own ``--dangerously-bypass-approvals-and-sandbox`` flag
-    — this wrapper stays runtime-agnostic and adds no runtime-specific flags).
-    The container runs as non-root ``node``, mounts the per-Runtime auth volume,
-    bind-mounts ``workspace`` at the same path so the agent reads and writes the
-    real tree, and pins the runtime's config-dir env var
-    (``CLAUDE_CONFIG_DIR`` for Claude, ``CODEX_HOME`` for Codex).
-
-    It also pins a stable PyCastle bot git identity (both author and committer,
-    via ``-e GIT_*``; see :func:`_git_identity_args`) so the in-container commits
-    the ``implement`` and ``review`` prompts ask for have a deterministic author
-    rather than aborting or synthesising a junk ``node@<container-id>`` one. The
-    auth-only ``login``/``status`` builders never commit and so carry no
-    identity.
-
-    The bind-mount source stays ``workspace`` — the repo (or workspace) root —
-    *not* the in-container working directory. ``workdir`` is the ``-w`` value,
-    the cwd the agent actually runs in; it defaults to ``workspace`` so every
-    existing caller behaves exactly as before. Under Docker the orchestrator
-    passes the per-issue git worktree as ``workdir`` while keeping the mount at
-    the workspace root, so a *linked* worktree's ``.git`` FILE (which points at
-    ``<root>/.git/worktrees/<name>``) still resolves back to the parent repo
-    inside the container. Mounting only the worktree would orphan that link and
-    the agent's commits would land nowhere the orchestrator can see — which is
-    exactly the phantom-empty-diff bug (#50) this guards against.
-
-    Both ``workspace`` and ``workdir`` are resolved to absolute paths first:
-    Docker rejects a relative bind-mount source, and a relative ``-w`` would
-    likewise produce a silently broken ``docker run`` argv. Resolving ``workdir``
-    independently also keeps it in agreement with Codex's own resolved ``-C``.
-    """
-    workspace_path = str(Path(workspace).resolve())
-    workdir_path = (
-        str(Path(workdir).resolve()) if workdir is not None else workspace_path
+    """Wrap one process in a disposable container using a pinned image."""
+    _validate_image(image)
+    _validate_inner_argv(inner_argv)
+    workspace_resolved = Path(workspace).resolve()
+    workdir_resolved = (
+        Path(workdir).resolve() if workdir is not None else workspace_resolved
     )
+    if not workdir_resolved.is_relative_to(workspace_resolved):
+        raise ValueError("Docker workdir must be within the mounted workspace")
+    workspace_path = str(workspace_resolved)
+    workdir_path = str(workdir_resolved)
     return [
         "docker",
         "run",
         "--rm",
-        "-u",
-        SANDBOX_USER,
         "-w",
         workdir_path,
-        *_auth_mount_args(runtime_name),
         "-v",
         f"{workspace_path}:{workspace_path}",
-        *_config_env_args(runtime_name),
-        *_git_identity_args(),
+        "-v",
+        f"{auth_volume(runtime_name)}:{AUTH_DIR}",
+        *_environment_args(runtime_name, environment),
         image,
         *inner_argv,
     ]
 
 
-def build_login_command(
-    runtime_name: str,
-    *,
-    image: str = DEFAULT_IMAGE,
-) -> list[str]:
-    """Build the login argv that writes auth into the per-Runtime volume.
-
-    For Claude this runs ``claude auth login --claudeai`` with a TTY (``-it``)
-    so the browser-based login can complete. For Codex it runs
-    ``codex login --device-auth``: the device-authorization flow prints a code
-    and a verification URL to stdout and polls in the background, so it needs no
-    localhost callback and no TTY — the ``-it`` flag is omitted. Either way the
-    credentials land in the runtime's auth volume. No workspace is mounted:
-    login only touches auth state.
-    """
+def build_login_command(runtime_name: str, *, image: str) -> list[str]:
+    _validate_image(image)
     config = _config_for(runtime_name)
-    tty_args = ["-it"] if runtime_name == "claude" else []
+    tty = ["-it"] if runtime_name == "claude" else []
     return [
         "docker",
         "run",
         "--rm",
-        *tty_args,
-        "-u",
-        SANDBOX_USER,
-        *_auth_mount_args(runtime_name),
-        *_config_env_args(runtime_name),
+        *tty,
+        "-v",
+        f"{auth_volume(runtime_name)}:{AUTH_DIR}",
+        *_environment_args(runtime_name),
         image,
         *config.login_args,
     ]
 
 
-def build_status_command(
-    runtime_name: str,
-    *,
-    image: str = DEFAULT_IMAGE,
-) -> list[str]:
-    """Build a fresh-container auth status-check argv.
-
-    Spins up a clean container against the same auth volume and runs the
-    runtime's own status subcommand (``claude auth status`` for Claude,
-    ``codex login status`` for Codex), never a hardcoded ``claude``. A zero exit
-    proves the volume holds working credentials. The subcommand reports auth
-    state without reading or printing the credential file, so auth is never
-    confirmed by ``cat``-ing the volume.
-    """
+def build_status_command(runtime_name: str, *, image: str) -> list[str]:
+    _validate_image(image)
     config = _config_for(runtime_name)
     return [
         "docker",
         "run",
         "--rm",
-        "-u",
-        SANDBOX_USER,
-        *_auth_mount_args(runtime_name),
-        *_config_env_args(runtime_name),
+        "-v",
+        f"{auth_volume(runtime_name)}:{AUTH_DIR}",
+        *_environment_args(runtime_name),
         image,
         *config.status_args,
     ]

@@ -81,29 +81,29 @@ def validate_fixture(fixture_dir: Path) -> None:
         ) from exc
     finally:
         sys.dont_write_bytecode = previous_bytecode
-    scoped_graphs = [("Item phase", definition.item)]
+    scoped_graphs = [("Item node", definition.item)]
     scoped_graphs.extend(
         (scope, graph)
         for scope, graph in (
-            ("before-Run phase", definition.before),
-            ("after-Run phase", definition.after),
+            ("before-Run node", definition.before),
+            ("after-Run node", definition.after),
         )
         if graph is not None
     )
     for scope, graph in scoped_graphs:
-        for phase in graph.phases.values():
+        for node in graph.nodes.values():
             prompts_dir = (fixture_dir / "prompts").resolve()
-            prompt = (prompts_dir / phase.prompt).resolve()
+            prompt = (prompts_dir / node.prompt).resolve()
             try:
                 prompt.relative_to(prompts_dir)
             except ValueError as exc:
                 raise FixtureUpgradeError(
-                    f"{scope} {phase.name!r} references prompt outside prompts/: "
-                    f"{phase.prompt}"
+                    f"{scope} {node.name!r} references prompt outside prompts/: "
+                    f"{node.prompt}"
                 ) from exc
             if not _regular_file(prompt):
                 raise FixtureUpgradeError(
-                    f"{scope} {phase.name!r} references missing prompt {phase.prompt}."
+                    f"{scope} {node.name!r} references missing prompt {node.prompt}."
                 )
 
 

@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from pycastle import orchestrator
-from pycastle.models import IssueRef
 from pycastle.runtime import (
     AgentCrashError,
     ClaudeRuntime,
@@ -116,9 +113,9 @@ def test_host_build_command_does_not_skip_permissions() -> None:
 def test_in_docker_build_command_skips_permissions(tmp_path: Path) -> None:
     # The Docker container is the isolation boundary (ADR-0003), so the inner
     # claude argv skips permissions there; otherwise headless claude denies
-    # every Write and each phase silently no-ops (issue #44). This mirrors
+    # every Write and each node silently no-ops (issue #44). This mirrors
     # CodexRuntime.in_docker carrying CODEX_DOCKER_BYPASS.
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
     assert "--dangerously-skip-permissions" in runtime.build_command("hi")
 
 
@@ -135,13 +132,13 @@ def test_parses_stream_json_into_output_and_telemetry(
 ) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    result = ClaudeRuntime().run("a prompt", cwd=tmp_path, phase="implement")
+    result = ClaudeRuntime().run("a prompt", cwd=tmp_path, node="implement")
 
     assert result.output == "Implemented the feature."
 
     telemetry = result.telemetry
     assert telemetry.runtime == "claude"
-    assert telemetry.phase == "implement"
+    assert telemetry.node == "implement"
     assert telemetry.cost_usd == 0.1234
     assert telemetry.duration_ms == 4567
     assert telemetry.num_turns == 3
@@ -157,7 +154,7 @@ def test_parses_stream_json_into_output_and_telemetry(
 def test_run_invokes_correct_argv(mock_popen: MagicMock, tmp_path: Path) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    ClaudeRuntime().run("a prompt", cwd=tmp_path, phase="implement")
+    ClaudeRuntime().run("a prompt", cwd=tmp_path, node="implement")
 
     assert mock_popen.call_args.args[0] == [
         "claude",
@@ -185,7 +182,7 @@ def test_falls_back_to_result_text_without_assistant_text(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="plan")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="plan")
 
     assert result.output == "summary only"
     assert result.telemetry.usage is None
@@ -205,7 +202,7 @@ def test_ignores_unparseable_lines(mock_popen: MagicMock, tmp_path: Path) -> Non
     proc.wait.return_value = 0
     mock_popen.return_value = proc
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "Implemented the feature."
     assert result.telemetry.num_turns == 3
@@ -225,10 +222,10 @@ def test_result_event_is_error_raises_crash(
     mock_popen.return_value = _fake_proc(events, returncode=0)
 
     with pytest.raises(AgentCrashError) as exc_info:
-        ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+        ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     # A result event flagged is_error is a crash even on a zero process exit.
-    assert exc_info.value.phase == "implement"
+    assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 0
 
 
@@ -238,11 +235,11 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
     mock_popen.return_value = proc
 
     with pytest.raises(AgentCrashError) as exc_info:
-        ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+        ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
-    # The crash carries the failing phase and the process exit code so a caller
+    # The crash carries the failing node and the process exit code so a caller
     # can branch on them without parsing the message string.
-    assert exc_info.value.phase == "implement"
+    assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 1
 
 
@@ -257,7 +254,7 @@ def test_nonzero_exit_reads_stderr_for_logging(
 
     with caplog.at_level("ERROR", logger="pycastle.runtime"):
         with pytest.raises(AgentCrashError):
-            ClaudeRuntime().run("p", cwd=tmp_path, phase="review")
+            ClaudeRuntime().run("p", cwd=tmp_path, node="review")
 
     assert "permission denied" in caplog.text
     proc.wait.assert_called_once()
@@ -270,11 +267,11 @@ def test_empty_stream_with_clean_exit_does_not_crash(
     # the output is empty rather than raising.
     mock_popen.return_value = _fake_proc([], returncode=0)
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="plan")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="plan")
 
     assert result.output == ""
     assert result.telemetry.runtime == "claude"
-    assert result.telemetry.phase == "plan"
+    assert result.telemetry.node == "plan"
     assert result.telemetry.cost_usd is None
     assert result.telemetry.num_turns is None
     assert result.telemetry.usage is None
@@ -294,7 +291,7 @@ def test_assistant_text_without_result_event_degrades_gracefully(
     ]
     mock_popen.return_value = _fake_proc(events, returncode=0)
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "partial work"
     assert result.telemetry.cost_usd is None
@@ -330,7 +327,7 @@ def test_multiple_assistant_events_concatenate_in_order(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "first second third fourth"
 
@@ -354,7 +351,7 @@ def test_result_event_with_non_dict_usage_does_not_throw(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.telemetry.usage is None
     assert result.telemetry.cost_usd == 0.02
@@ -369,21 +366,20 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     The inner ``claude …`` argv is unchanged; the sandbox wraps it. The same
     stream-json parsing applies to the container's stdout.
     """
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
-    result = runtime.run("a prompt", cwd=tmp_path, phase="implement")
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    result = runtime.run("a prompt", cwd=tmp_path, node="implement")
 
     argv = mock_popen.call_args.args[0]
     # The whole command is a docker invocation wrapping the claude argv.
     assert argv[:3] == ["docker", "run", "--rm"]
-    assert sandbox.DEFAULT_IMAGE in argv
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert "sha256:" + ("a" * 64) in argv
+    image_idx = argv.index("sha256:" + ("a" * 64))
     assert argv[image_idx + 1 : image_idx + 4] == ["claude", "-p", "a prompt"]
-    assert "pycastle-claude-auth:/home/node/.claude" in argv
-    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" in argv
+    assert "pycastle-claude-auth:/pycastle/auth" in argv
+    assert "CLAUDE_CONFIG_DIR=/pycastle/auth" in argv
     # Same stream-json parsing as the host path.
     assert result.output == "Implemented the feature."
     assert result.telemetry.num_turns == 3
@@ -392,11 +388,11 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
 def test_docker_runtime_runs_both_runtime_and_commands_in_container(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:
-    # Every phase the Runtime drives is wrapped: there is no host-side claude.
+    # Every node the Runtime drives is wrapped: there is no host-side claude.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
-    runtime.run("p", cwd=tmp_path, phase="implement")
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    runtime.run("p", cwd=tmp_path, node="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[0] == "docker"
@@ -414,13 +410,13 @@ def test_in_docker_resolves_relative_workspace(
     (tmp_path / "repo").mkdir()
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=Path("repo"))
-    runtime.run("p", cwd=tmp_path, phase="implement")
+    runtime = ClaudeRuntime.in_docker(
+        image="sha256:" + ("a" * 64), workspace=Path("repo")
+    )
+    runtime.run("p", cwd=tmp_path / "repo", node="implement")
 
     argv = mock_popen.call_args.args[0]
-    # -w now follows the run cwd (covered elsewhere); the relative-workspace
-    # guarantee is about the bind-mount *source*, which must be resolved so the
-    # container does not fail to start on a relative mount.
+    # The relative workspace is resolved for both the bind mount and workdir.
     repo = str((tmp_path / "repo").resolve())
     assert f"{repo}:{repo}" in argv
 
@@ -437,8 +433,8 @@ def test_docker_workdir_is_run_cwd_not_workspace(
     worktree = root / ".pycastle" / "worktrees" / "issue-3"
     worktree.mkdir(parents=True)
 
-    runtime = ClaudeRuntime.in_docker(workspace=root)
-    runtime.run("p", cwd=worktree, phase="implement")
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=root)
+    runtime.run("p", cwd=worktree, node="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[argv.index("-w") + 1] == str(worktree.resolve())
@@ -457,8 +453,8 @@ def test_docker_resolves_relative_run_cwd_for_w(
     (tmp_path / "worktree").mkdir()
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = ClaudeRuntime.in_docker(workspace=tmp_path)
-    runtime.run("p", cwd=Path("worktree"), phase="implement")
+    runtime = ClaudeRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    runtime.run("p", cwd=Path("worktree"), node="implement")
 
     argv = mock_popen.call_args.args[0]
     workdir = argv[argv.index("-w") + 1]
@@ -472,7 +468,7 @@ def test_host_runtime_still_invokes_bare_claude(
     # Without a sandbox wrapper the runtime runs claude directly on the host.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    ClaudeRuntime().run("p", cwd=tmp_path, phase="implement")
+    ClaudeRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert mock_popen.call_args.args[0][0] == "claude"
 
@@ -481,12 +477,12 @@ def test_verbose_surfaces_thinking_live(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # With --verbose on, the thinking block in the stream is emitted as a
-    # [THINKING:<phase>] log line; the output still equals only the text block,
+    # [THINKING:<node>] log line; the output still equals only the text block,
     # so thinking is never folded into the returned prose.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, node="implement")
 
     assert "[THINKING:implement] planning the change" in caplog.text
     assert result.output == "Implemented the feature."
@@ -495,13 +491,13 @@ def test_verbose_surfaces_thinking_live(
 def test_verbose_surfaces_output_live(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # With --verbose on, the text block is also surfaced as an [OUTPUT:<phase>]
+    # With --verbose on, the text block is also surfaced as an [OUTPUT:<node>]
     # line so a reader sees what the model did; the returned output still equals
     # only the text block (surfacing is additive, never folded into handoff).
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, node="implement")
 
     assert "[OUTPUT:implement] Implemented the feature." in caplog.text
     assert result.output == "Implemented the feature."
@@ -511,14 +507,14 @@ def test_verbose_persists_thinking_to_sink(
     mock_popen: MagicMock, tmp_path: Path
 ) -> None:
     # The transcript sink (which the orchestrator binds to the run dir) receives
-    # each thinking chunk as (phase, tag, text) so a finished run is auditable.
+    # each thinking chunk as (node, tag, text) so a finished run is auditable.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
     captured: list[tuple[str, str, str]] = []
 
     ClaudeRuntime(
         verbose=True,
-        transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text)),
-    ).run("p", cwd=tmp_path, phase="implement")
+        transcript_sink=lambda node, tag, text: captured.append((node, tag, text)),
+    ).run("p", cwd=tmp_path, node="implement")
 
     assert ("implement", "THINKING", "planning the change") in captured
 
@@ -532,8 +528,8 @@ def test_verbose_persists_output_to_sink(mock_popen: MagicMock, tmp_path: Path) 
 
     ClaudeRuntime(
         verbose=True,
-        transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text)),
-    ).run("p", cwd=tmp_path, phase="implement")
+        transcript_sink=lambda node, tag, text: captured.append((node, tag, text)),
+    ).run("p", cwd=tmp_path, node="implement")
 
     assert ("implement", "OUTPUT", "Implemented the feature.") in captured
     thinking_idx = captured.index(("implement", "THINKING", "planning the change"))
@@ -557,7 +553,7 @@ def test_verbose_surfaces_thinking_delta_fallback(
     mock_popen.return_value = _fake_proc(events)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="plan")
+        ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, node="plan")
 
     assert "[THINKING:plan] delta reasoning" in caplog.text
 
@@ -579,7 +575,7 @@ def test_verbose_surfaces_text_delta_fallback(
     mock_popen.return_value = _fake_proc(events)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, phase="plan")
+        result = ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, node="plan")
 
     assert "[OUTPUT:plan] delta out" in caplog.text
     assert result.output == "delta out"
@@ -596,8 +592,8 @@ def test_non_verbose_drops_thinking_and_output_surfacing(
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = ClaudeRuntime(
-            transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text))
-        ).run("p", cwd=tmp_path, phase="implement")
+            transcript_sink=lambda node, tag, text: captured.append((node, tag, text))
+        ).run("p", cwd=tmp_path, node="implement")
 
     assert "[THINKING:" not in caplog.text
     assert "[OUTPUT:" not in caplog.text
@@ -610,54 +606,10 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # docker run captures the transcript just like the host path.
     sink = MagicMock()
     runtime = ClaudeRuntime.in_docker(
-        workspace=tmp_path, verbose=True, transcript_sink=sink
+        image="sha256:" + ("a" * 64),
+        workspace=tmp_path,
+        verbose=True,
+        transcript_sink=sink,
     )
     assert runtime.verbose is True
     assert runtime.transcript_sink is sink
-
-
-def test_run_works_one_issue_end_to_end_via_claude(
-    mock_popen: MagicMock, fixture_dir: Path, tmp_path: Path
-) -> None:
-    """The orchestrator completes an issue using the real Claude adapter.
-
-    The agent is mocked at the subprocess boundary, and every git/gh call is
-    mocked through the orchestrator's runner — no real agent runs.
-    """
-    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
-
-    def _ok(
-        argv: list[str], *_args: object, **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        # A non-empty diff (exit 1) for the post-commit no-change check, so the
-        # mocked agent's work is treated as a real change rather than a no-op.
-        if argv[:3] == ["git", "diff", "--quiet"]:
-            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
-        if argv[:3] == ["gh", "pr", "list"]:
-            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
-
-    issue = IssueRef(number=7, title="Wire claude", assignees=["krishna"])
-    source = MagicMock()
-    source.list_ready.return_value = [issue]
-    runner = MagicMock(side_effect=_ok)
-
-    outcome = orchestrator.run_batch(
-        runtime=make_runtime("claude"),
-        issue_source=source,
-        selected=source.list_ready(),
-        fixture_dir=fixture_dir,
-        repo="owner/repo",
-        base_branch="main",
-        assignee="krishna",
-        run_id="20260613-090000",
-        iterations=1,
-        workspace=tmp_path,
-        worktree_root=tmp_path / "wt",
-        runner=runner,
-    )
-
-    assert outcome.completed == [7]
-    assert outcome.pr_opened is True
-    # The real adapter ran through the graph: the claude CLI was invoked.
-    assert mock_popen.call_args.args[0][0] == "claude"

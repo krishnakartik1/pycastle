@@ -1,7 +1,12 @@
-#!/usr/bin/env bash
-# PyCastle project dependency setup. This file is project-owned; edit it freely.
-set -euo pipefail
-python3 -m venv --system-site-packages .pycastle/venv
-source .pycastle/venv/bin/activate
-export UV_PROJECT_ENVIRONMENT=.pycastle/venv
-uv sync --all-extras
+#!/bin/sh
+# Project-owned preparation for the current worktree.
+#
+# PyCastle invokes this executable directly before every Runtime node and Gate
+# node. PYCASTLE_SCOPE is either "item" or "run". Only durable filesystem or
+# external-system effects survive; shell activation and exported variables do
+# not. Keep this safe to run repeatedly.
+#
+# Add commands when this project needs preparation. PyCastle does not inspect
+# dependency manifests or choose a language toolchain.
+set -eu
+:

@@ -17,7 +17,7 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
 
     for command in (
         "pycastle init",
-        "pycastle sandbox setup --runtime claude",
+        "pycastle runtime login --runtime claude",
         "pycastle run --runtime claude",
         "pycastle prune",
     ):
@@ -26,6 +26,7 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
     for fixture_entry in (
         ".pycastle/main.py",
         ".pycastle/prompts/",
+        ".pycastle/setup",
         ".pycastle/gate",
         ".pycastle/Dockerfile",
         ".pycastle/sandbox",
@@ -36,7 +37,11 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
     assert "gh issue edit" in readme
     assert "pycastle init --sandbox host" in readme
     assert "pycastle init --sandbox docker" in readme
-    assert "end-of-file" in readme.lower()
+    assert "non-interactive use" in readme.lower()
+    assert "fails rather than guessing" in readme.lower()
+    assert "starts as a no-op" in readme.lower()
+    assert "fail-closed" in readme.lower()
+    assert "detected Python" not in readme
 
 
 def test_readme_documents_codex_host_black_workaround() -> None:

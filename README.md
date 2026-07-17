@@ -2,11 +2,11 @@
 
 A reusable, installable autonomous development loop for any repository.
 
-PyCastle owns the runner while each project owns its prompts, gate, and phase
-graph. It selects ready GitHub issues, gives each issue an isolated worktree,
-runs a plan → implement → review Item phase graph, retries failed implementation
-attempts with a handoff, reviews the integrated Run, applies its final Gate, and
-publishes verified Run evidence to one pull request for the successful batch.
+PyCastle owns the runner while each project owns its prompts, Setup, Gate, and
+Execution graphs. It selects ready GitHub issues, gives each Item an isolated
+worktree, walks the project-owned Item and Run-scope graphs, and publishes the
+integrated Run in one pull request. Verification and recovery are visible Gate
+and Runtime nodes in those graphs.
 Claude Code and Codex are supported as runtimes, on the host or in Docker.
 
 ## Requirements
@@ -72,41 +72,46 @@ From the repository you want PyCastle to work on, scaffold its project fixture:
 pycastle init
 ```
 
-`init` asks whether phases should run on the host or in Docker, records that
-default, and creates `.pycastle/` without overwriting an existing fixture. The
-choice can be scripted with `pycastle init --sandbox host` or
-`pycastle init --sandbox docker`, which skips the prompt. If standard input is
-unavailable and the prompt reaches end-of-file, `init` uses the host default.
-The fixture contains all of the project-owned behavior:
+`init` asks whether project execution should use the host or Docker Sandbox,
+records that selection, and creates `.pycastle/` without overwriting an existing
+fixture. The choice can be scripted with `pycastle init --sandbox host` or
+`pycastle init --sandbox docker`, which skips the prompt. Non-interactive use
+without one of those explicit choices fails rather than guessing. Repository
+manifests and contents do not affect the generated fixture. The fixture contains
+all of the project-owned behavior:
 
 - `.pycastle/main.py` — the Run definition containing its Item graph and optional
   before-Run and after-Run graphs.
-- `.pycastle/prompts/` — instructions for Item and integrated Run phases.
-- `.pycastle/gate` — the quality gate run after an implementation attempt.
-- `.pycastle/Dockerfile` — the agent image recipe, including the project gate
-  toolchain for detected Python projects.
-- `.pycastle/sandbox` — the default `host` or `docker` sandbox choice.
+- `.pycastle/prompts/` — instructions for Runtime nodes at Item and Run scope.
+- `.pycastle/setup` — repeatable preparation whose durable effects establish
+  prerequisites for the next Runtime or Gate node; it starts as a no-op.
+- `.pycastle/gate` — the fail-closed project verification policy invoked by
+  every Gate node; it must be configured before verification can pass.
+- `.pycastle/Dockerfile` — the language-neutral Agent image recipe with shipped
+  Runtime CLIs and a visible extension point for the project toolchain.
+- `.pycastle/sandbox` — the selected `host` or `docker` Sandbox.
 - `.pycastle/version` — the installed PyCastle release that initialized or last
   migrated the fixture; `run` checks it before starting any Run side effects.
 - `.pycastle/.gitignore` — Run artifacts and runtime scratch files that should
   stay out of version control.
 
-Review and commit this directory. In particular, make `.pycastle/gate` express
-what “passing” means for the project and extend `.pycastle/Dockerfile` with any
-toolchain the phases and gate need. The Docker sandbox runs both the runtime and
-the gate in that image; PyCastle builds it on demand and reuses it while the
-Dockerfile is unchanged.
+Review and commit the complete directory. Configure `.pycastle/setup` when the
+project needs preparation, make `.pycastle/gate` express the complete passing
+policy, and extend `.pycastle/Dockerfile` with any tools Setup, Runtime nodes, or
+the Gate need. The Docker Sandbox runs all three in that image. Readiness builds
+it from the repository root, pins the resulting immutable identity, and reuses
+that identity for the whole Run.
 
 For a Docker run, authenticate the runtime once. The login is stored in a named
 Docker volume and reused across projects:
 
 ```bash
-pycastle sandbox setup --runtime claude
+pycastle runtime login --runtime claude --sandbox docker
 ```
 
-Use `--runtime codex` instead for Codex. Host runs do not need `sandbox setup`,
-but the selected runtime CLI must already be installed, authenticated, and
-available on `PATH`.
+Use `--runtime codex` instead for Codex. Host authentication uses
+`pycastle runtime login --runtime claude --sandbox host`; the selected Runtime
+CLI must already be installed and available on `PATH`.
 
 PyCastle reads GitHub Issues carrying the `ready-for-agent` label. By default it
 only selects issues assigned to your authenticated `gh` user, so prepare an
@@ -171,19 +176,19 @@ the remote branches from pull-request history.
   whose PRs are merged or closed. By default no-PR recovery branches are kept;
   opt in to deleting them with `--include-no-pr`. Open-PR branches are always
   preserved.
-- `pycastle sandbox setup --runtime claude` — authenticate a runtime in its
-  shared Docker auth volume.
-- `pycastle sandbox build` — explicitly build the content-addressed image from
-  `.pycastle/Dockerfile`; normal Docker runs build it on demand.
+- `pycastle runtime login --runtime claude [--sandbox host|docker]` — explicitly
+  authenticate a Runtime. Without the flag, use the `.pycastle/sandbox` marker.
+- Docker Doctor and Run build the canonical `.pycastle/Dockerfile`; there is no
+  image override or separate Sandbox build lifecycle.
 
 ## Customize the project fixture
 
 The fixture is regular project code, not hidden PyCastle configuration. Edit
-`.pycastle/prompts/` to change phase instructions, `.pycastle/gate` to run the
-project's real checks, and `.pycastle/main.py` to add phases or redirect their
-success and failure transitions. Every phase and the gate runs in the selected
-sandbox; orchestration such as `git`, `gh`, worktree management, and image
-building stays on the host.
+`.pycastle/prompts/` to change Runtime-node instructions, `.pycastle/setup` to
+prepare durable prerequisites, `.pycastle/gate` to define verification, and
+`.pycastle/main.py` to add nodes or redirect their success and failure edges.
+Setup, Runtime nodes, and Gate nodes run in the selected Sandbox; orchestration
+such as `git`, `gh`, worktree management, and image building stays on the host.
 
 ## Upgrade a Project fixture
 
@@ -212,11 +217,15 @@ inspect. PyCastle performs no self-update or update discovery, and it does not
 create a commit, branch, pull request, or merge authorization.
 
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
-agent image. An unchanged recipe reuses its content-addressed image; editing the
-recipe causes a new image to be built. `--image IMAGE` is the bring-your-own-image
-escape hatch and bypasses the Dockerfile, but that image must provide the
-runtime CLI, project gate toolchain, `git`, and the expected non-root `node` user
-with home `/home/node`.
+Agent image. Doctor and Run build it with the clean repository root as context
+and pin the resulting immutable image identity for that one readiness snapshot.
+PyCastle probes only its language-neutral launch, workspace, authentication, and
+Runtime boundary; project interpreters and toolchains remain behind Setup.
+
+`pycastle doctor` reports `ready`, `no_work`, or `not_ready`. It never executes
+Setup, Gate, an Execution graph, or a Runtime prompt. A later Run always takes a
+fresh snapshot. Select a Sandbox explicitly with `--sandbox`, or record exactly
+`host` or `docker` in `.pycastle/sandbox`; there is no implicit host default.
 
 ## Troubleshooting Codex host Black checks
 
@@ -224,7 +233,7 @@ The Codex Runtime with the host Sandbox runs under Codex's native
 `workspace-write` sandbox. In that specific combination, a whole-tree Black
 self-check such as `black --check .` can print its successful summary and then
 hang because the sandbox blocks a multiprocessing worker's local socket. This
-is an advisory command started by the Runtime during a phase, not a stalled or
+is an advisory command started by the Runtime during a node, not a stalled or
 failed PyCastle Gate.
 
 Prefer the Docker Sandbox for Codex (`pycastle run --runtime codex --sandbox

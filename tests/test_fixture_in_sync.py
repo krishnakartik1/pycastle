@@ -46,17 +46,6 @@ from pycastle.scaffold import (
     scaffold_fixture,
 )
 
-#: Files the committed fixture may legitimately customize away from the
-#: scaffolder, so the guard only checks they exist rather than matching bytes.
-_EXEMPT_FROM_BYTES = {
-    "gate",
-    "setup",
-    "prompts/plan.md",
-    "prompts/implement.md",
-    "prompts/review.md",
-    "Dockerfile",
-}
-
 
 def _repo_root() -> Path:
     """Return the repo root by walking up from this test file to ``.pycastle/``."""
@@ -69,7 +58,7 @@ def _repo_root() -> Path:
 def _tree(fixture_dir: Path) -> set[str]:
     """Return fixture-relative paths, pruning ignored transient directories."""
     ignored_directories = {
-        line.removesuffix("/")
+        line.strip("/")
         for line in (fixture_dir / ".gitignore").read_text().splitlines()
         if line and not line.startswith(("#", "!")) and line.endswith("/")
     }
@@ -138,73 +127,37 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
         f"missing {sorted(missing)}, unexpected {sorted(extra)}"
     )
 
-    # Byte-identical for everything except the project's own setup/gate/prompts.
-    for relative in scaffolded_tree - _EXEMPT_FROM_BYTES:
+    for relative in scaffolded_tree:
+        if relative == "gate":
+            # The repository customizes its project-owned Gate after init.
+            continue
         assert (committed / relative).read_bytes() == (
             scaffolded / relative
         ).read_bytes(), f"{relative} has drifted from the scaffolder output"
+        assert stat.S_IMODE((committed / relative).stat().st_mode) == stat.S_IMODE(
+            (scaffolded / relative).stat().st_mode
+        ), f"{relative} mode has drifted from the scaffolder output"
 
-    # The exempt files must still be present (a repo customizes, never drops them).
-    for relative in _EXEMPT_FROM_BYTES:
-        assert (committed / relative).is_file(), f"{relative} is missing"
 
+def test_committed_gate_selects_its_declared_development_tools() -> None:
+    """The live Gate resolves every verifier from the project's dev extra.
 
-def test_exempt_files_are_real_fixture_paths(tmp_path: Path) -> None:
-    """Every exempt path is a path the scaffolder actually writes.
-
-    The byte-equality skip list (:data:`_EXEMPT_FROM_BYTES`) is maintained by
-    hand. If the scaffolder ever renamed or dropped one of those files, a stale
-    entry here would silently exempt nothing -- and a real drift in the renamed
-    file would slip through. Pinning the set to the scaffolded shape keeps the
-    skip list honest.
+    Setup is intentionally language-neutral, so the project-owned Gate must
+    select the optional dependency group that declares pytest, Black, and Ruff.
+    Keeping that selection on every invocation also makes the contract behave
+    consistently when no matching executable happens to be installed globally.
     """
-    scaffold_fixture(tmp_path, sandbox="host")
-    scaffolded = _tree(tmp_path / FIXTURE_DIRNAME)
-    stale = _EXEMPT_FROM_BYTES - scaffolded
-    assert not stale, (
-        f"_EXEMPT_FROM_BYTES names paths the scaffolder no longer writes: "
-        f"{sorted(stale)}"
-    )
+    gate_lines = {
+        line.strip()
+        for line in (_repo_root() / FIXTURE_DIRNAME / "gate").read_text().splitlines()
+        if line.startswith("uv run")
+    }
 
-
-def test_committed_setup_syncs_pycastle_from_uv_lockfile() -> None:
-    """PyCastle's project-owned Setup keeps its uv-locked environment pinned."""
-    repo = _repo_root()
-    setup = repo / FIXTURE_DIRNAME / "setup"
-    commands = [
-        line
-        for line in setup.read_text().splitlines()
-        if line and not line.startswith("#")
-    ]
-
-    assert (repo / "uv.lock").is_file()
-    assert commands == [
-        "set -euo pipefail",
-        "python3 -m venv --system-site-packages .pycastle/venv",
-        "source .pycastle/venv/bin/activate",
-        "export UV_PROJECT_ENVIRONMENT=.pycastle/venv",
-        "uv sync --all-extras",
-    ]
-    assert stat.S_IMODE(setup.stat().st_mode) == 0o755
-
-
-def test_committed_gate_sources_setup_and_uses_its_canonical_environment() -> None:
-    fixture = _repo_root() / FIXTURE_DIRNAME
-    setup = fixture / "setup"
-    gate = fixture / "gate"
-    gate_text = gate.read_text()
-
-    assert stat.S_IMODE(gate.stat().st_mode) == 0o755
-    assert "${BASH_SOURCE[0]}" in gate_text
-    assert 'source "$fixture_dir/setup"' in gate_text
-    assert ".venv/bin" not in gate_text
-    assert "source .pycastle/venv/bin/activate" in setup.read_text()
-    for command in (
-        "python -m ruff check . --exit-non-zero-on-fix",
-        "python -m black --check .",
-        "python -m pytest -q",
-    ):
-        assert command in gate_text
+    assert gate_lines == {
+        "uv run --extra dev pytest -q",
+        "uv run --extra dev black --check .",
+        "uv run --extra dev ruff check .",
+    }
 
 
 def test_guard_catches_byte_drift(tmp_path: Path) -> None:
@@ -223,7 +176,6 @@ def test_guard_catches_byte_drift(tmp_path: Path) -> None:
 
     # Pick a non-exempt file and confirm a fresh scaffold matches byte for byte.
     target = "main.py"
-    assert target not in _EXEMPT_FROM_BYTES
     assert (pristine / target).read_bytes() == (drifted / target).read_bytes()
 
     # Now drift it and confirm the comparison the guard uses would flag it.
@@ -257,10 +209,6 @@ def test_tree_ignores_transient_directories_from_fixture_gitignore(
         artifact = fixture / directory / "fake-run" / "artifact.log"
         artifact.parent.mkdir(parents=True)
         artifact.write_text("transient\n")
-
-        nested_artifact = fixture / "nested" / directory / "artifact.log"
-        nested_artifact.parent.mkdir(parents=True, exist_ok=True)
-        nested_artifact.write_text("transient\n")
 
     assert _tree(fixture) == pristine
 

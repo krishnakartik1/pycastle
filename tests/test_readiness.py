@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -19,11 +18,62 @@ from pycastle.readiness import (
     EligibleItem,
     ReadinessConfiguration,
     ReadinessDependencies,
+    ReadinessOutcome,
     Status,
     evaluate_readiness,
     render_human,
     render_json,
 )
+
+
+def test_readiness_has_three_explicit_overall_outcomes() -> None:
+    def passing(_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        return CheckResult(Status.PASS, "ok")
+
+    ready = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=passing,
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+    no_work = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(probe=passing, eligible_items=lambda _configuration: []),
+    )
+    not_ready = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(
+            probe=lambda check_id, _configuration: CheckResult(
+                Status.FAIL if check_id == "working_tree" else Status.PASS, "result"
+            ),
+            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+        ),
+    )
+
+    assert ready.outcome is ReadinessOutcome.READY
+    assert no_work.outcome is ReadinessOutcome.NO_WORK
+    assert not_ready.outcome is ReadinessOutcome.NOT_READY
+    assert json.loads(render_json(no_work))["outcome"] == "no_work"
+
+
+def test_no_work_skips_execution_coordination_checks() -> None:
+    called: list[str] = []
+
+    def probe(check_id: str, _configuration: ReadinessConfiguration) -> CheckResult:
+        called.append(check_id)
+        return CheckResult(Status.PASS, "ok")
+
+    report = evaluate_readiness(
+        configuration(),
+        ReadinessDependencies(probe=probe, eligible_items=lambda _configuration: []),
+    )
+
+    assert report.outcome is ReadinessOutcome.NO_WORK
+    statuses = {check.id: check.status for check in report.checks}
+    for check_id in ("agent_image", "runtime", "runtime_authentication"):
+        assert statuses[check_id] is Status.NOT_APPLICABLE
+        assert check_id not in called
 
 
 def _valid_fixture(path: Path) -> Path:
@@ -32,11 +82,11 @@ def _valid_fixture(path: Path) -> Path:
     prompts.mkdir(parents=True)
     (fixture / "version").write_text("0.1.0\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build, build_run, phase\n"
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
         "run = build_run(\n"
-        " before=build(start='prepare', phases=[phase('prepare', 'before.md')]),\n"
-        " item=build(start='work', phases=[phase('work', 'item.md')]),\n"
-        " after=build(start='report', phases=[phase('report', 'after.md')]),\n"
+        " before=execution_graph(start='prepare', nodes=[runtime_node('prepare', 'before.md')]),\n"
+        " item=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')]),\n"
+        " after=execution_graph(start='report', nodes=[runtime_node('report', 'after.md')]),\n"
         ")\n"
     )
     for name in ("before.md", "item.md", "after.md"):
@@ -44,6 +94,9 @@ def _valid_fixture(path: Path) -> Path:
     gate = fixture / "gate"
     gate.write_text("#!/bin/sh\nexit 0\n")
     gate.chmod(0o755)
+    setup = fixture / "setup"
+    setup.write_text("#!/bin/sh\nexit 0\n")
+    setup.chmod(0o755)
     return fixture
 
 
@@ -70,6 +123,13 @@ class RecordingRunner:
             ("git", "symbolic-ref", "--quiet", "--short", "HEAD"): "main\n",
             ("git", "status", "--porcelain", "--untracked-files=all"): "",
             ("gh", "api", "repos/owner/repo", "--jq", ".permissions.push"): "true\n",
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                "refs/heads/main",
+            ): "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n",
         }
         if call[:3] == ("gh", "repo", "view"):
             output = '{"nameWithOwner":"owner/repo"}\n'
@@ -114,7 +174,7 @@ def test_host_stub_production_adapter_reports_complete_ready_snapshot(
 
     report = evaluate_readiness(configuration(), adapter.dependencies())
 
-    assert report.ready
+    assert report.outcome is ReadinessOutcome.READY
     assert [check.id for check in report.checks] == list(CHECK_IDS)
     assert {check.id: check.status for check in report.checks}[
         "agent_image"
@@ -123,7 +183,18 @@ def test_host_stub_production_adapter_reports_complete_ready_snapshot(
         "runtime_authentication"
     ] is Status.NOT_APPLICABLE
     assert report.eligible_items == (EligibleItem(2, "Two"), EligibleItem(9, "Nine"))
-    assert any(call[-1] == "--check-tools" for call in runner.calls)
+    assert report.frozen_inputs is not None
+    assert (
+        report.frozen_inputs.base_commit == "0123456789abcdef0123456789abcdef01234567"
+    )
+    frozen_setup = next(
+        file
+        for file in report.frozen_inputs.project_fixture.files
+        if file.relative_path == "setup"
+    )
+    (fixture / "setup").write_text("#!/bin/sh\nexit 9\n")
+    assert frozen_setup.content == b"#!/bin/sh\nexit 0\n"
+    assert not any(call[-1] == "--check-tools" for call in runner.calls)
     assert not (fixture / "__pycache__").exists()
     assert sys.dont_write_bytecode is False
 
@@ -139,6 +210,23 @@ def test_fixture_structure_rejects_symlinked_prompt(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="prompt"):
         adapter.check_fixture_structure(configuration())
+
+
+def test_fixture_structure_accepts_out_of_order_runtime_and_gate_nodes(
+    tmp_path: Path,
+) -> None:
+    fixture = _valid_fixture(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "run=build_run(item=execution_graph(start='work',nodes=["
+        "gate_node('verify'),runtime_node('work','item.md',on_success='verify')]))\n"
+    )
+
+    result = DefaultReadinessAdapter(fixture, tmp_path).check_fixture_structure(
+        configuration()
+    )
+
+    assert result.status is Status.PASS
 
 
 def test_github_repository_requires_matching_identity(tmp_path: Path) -> None:
@@ -171,44 +259,6 @@ def test_base_branch_fails_when_github_default_could_not_be_resolved(
     assert "default" in result.summary.lower()
 
 
-def test_doctor_and_run_share_readiness_arguments_and_defaults() -> None:
-    parser = cli.build_parser()
-    doctor = parser.parse_args(["doctor"])
-    run = parser.parse_args(["run"])
-    fields = (
-        "runtime",
-        "sandbox",
-        "image",
-        "assignee",
-        "include_unassigned",
-        "iterations",
-    )
-
-    assert {field: getattr(doctor, field) for field in fields} == {
-        field: getattr(run, field) for field in fields
-    }
-    assert not hasattr(doctor, "verbose")
-
-    arguments = [
-        "--runtime",
-        "stub",
-        "--sandbox",
-        "host",
-        "--image",
-        "fixture/image",
-        "--assignee",
-        "octocat",
-        "--include-unassigned",
-        "--iterations",
-        "3",
-    ]
-    doctor = parser.parse_args(["doctor", *arguments])
-    run = parser.parse_args(["run", *arguments])
-    assert {field: getattr(doctor, field) for field in fields} == {
-        field: getattr(run, field) for field in fields
-    }
-
-
 def test_doctor_human_and_json_outputs_are_complete_and_single_document(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -216,9 +266,9 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
         configuration(),
         ReadinessDependencies(
             probe=lambda check_id, _configuration: CheckResult(
-                Status.FAIL if check_id == "gate_toolchain" else Status.PASS,
-                "toolchain missing" if check_id == "gate_toolchain" else "ready",
-                remediation="install tools" if check_id == "gate_toolchain" else None,
+                Status.FAIL if check_id == "working_tree" else Status.PASS,
+                "checkout dirty" if check_id == "working_tree" else "ready",
+                remediation="clean checkout" if check_id == "working_tree" else None,
             ),
             eligible_items=lambda _configuration: [EligibleItem(4, "Unicode ✓")],
         ),
@@ -229,7 +279,7 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
     human = capsys.readouterr().out
     assert human == render_human(report) + "\n"
     assert all(check_id in human for check_id in CHECK_IDS)
-    assert "Fix: install tools" in human
+    assert "Fix: clean checkout" in human
     assert "#4 Unicode ✓" in human
 
     assert cli.main(["doctor", "--runtime", "stub", "--sandbox", "host", "--json"]) == 1
@@ -290,117 +340,6 @@ class DockerRecordingRunner:
         return subprocess.CompletedProcess(argv, returncode, "", "")
 
 
-def test_explicit_agent_image_is_probed_as_is_without_touching_dockerfile(
-    tmp_path: Path,
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    # A directory at the Dockerfile path makes any attempted recipe read fail.
-    (fixture / "Dockerfile").mkdir()
-    runner = DockerRecordingRunner()
-    config = docker_configuration(image="registry.example/agent:exact")
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        result = adapter.check_agent_image(config)
-
-    assert result.status is Status.PASS
-    assert not any(
-        call[:3] == ("docker", "image", "inspect") for call, _ in runner.calls
-    )
-    assert not any(call[:2] == ("docker", "build") for call, _ in runner.calls)
-    assert any(config.agent_image in call for call, _ in runner.calls)
-
-
-@pytest.mark.parametrize("runtime", ["claude", "codex"])
-def test_docker_probes_share_isolated_workspace_and_runtime_conventions(
-    tmp_path: Path, runtime: str
-) -> None:
-    fixture = _valid_fixture(tmp_path)
-    runner = DockerRecordingRunner()
-    config = docker_configuration(runtime)
-    repository = tmp_path.resolve()
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        image = adapter.check_agent_image(config)
-        gate = adapter.check_gate_toolchain(config)
-        disposable = adapter._docker_workspace
-        assert disposable is not None and disposable.exists()
-        assert (disposable / "gate").read_text() == (fixture / "gate").read_text()
-        assert stat.S_IMODE(disposable.stat().st_mode) == 0o777
-        assert stat.S_IMODE((disposable / "gate").stat().st_mode) == 0o755
-
-    assert image.status is Status.PASS
-    assert gate.status is Status.PASS
-    assert disposable is not None and not disposable.exists()
-    docker_runs = [call for call, _ in runner.calls if call[:2] == ("docker", "run")]
-    assert len(docker_runs) == 2
-    mount_sources = [
-        next(
-            value.split(":", 1)[0] for value in call if value.endswith(f":{disposable}")
-        )
-        for call in docker_runs
-    ]
-    assert mount_sources == [str(disposable), str(disposable)]
-    assert all(str(repository) not in call for call in docker_runs)
-    runtime_config = sandbox.RUNTIME_CONFIG[runtime]
-    assert all(config.agent_image in call for call in docker_runs)
-    assert all(sandbox.SANDBOX_USER in call for call in docker_runs)
-    assert all(
-        f"{sandbox.auth_volume(runtime)}:{runtime_config.config_dir}" in call
-        for call in docker_runs
-    )
-    assert all(
-        f"{runtime_config.config_env}={runtime_config.config_dir}" in call
-        for call in docker_runs
-    )
-    contract = " ".join(docker_runs[0])
-    assert 'test "$(id -un)" = node' in contract
-    assert 'test "$HOME" = /home/node' in contract
-    assert 'command -v "$runtime"' in contract
-    assert 'auth_file="$config_dir/$auth_name"' in contract
-    assert 'workspace_file="$PWD/$workspace_name"' in contract
-    assert docker_runs[1][-2:] == (str(disposable / "gate"), "--check-tools")
-    assert str((fixture / "gate").resolve()) not in docker_runs[1]
-
-
-def test_disposable_workspace_is_cleaned_when_docker_gate_fails(tmp_path: Path) -> None:
-    fixture = _valid_fixture(tmp_path)
-    runner = DockerRecordingRunner(fail_gate=True)
-    config = docker_configuration()
-
-    with DefaultReadinessAdapter(
-        fixture, tmp_path, runner=runner, image_flag=config.agent_image
-    ) as adapter:
-        assert adapter.check_agent_image(config).status is Status.PASS
-        assert adapter.check_gate_toolchain(config).status is Status.FAIL
-        disposable = adapter._docker_workspace
-
-    assert disposable is not None and not disposable.exists()
-
-
-def test_disposable_workspace_is_cleaned_when_probe_raises(tmp_path: Path) -> None:
-    fixture = _valid_fixture(tmp_path)
-    config = docker_configuration()
-
-    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["docker", "run"]:
-            raise subprocess.TimeoutExpired(argv, 15.0, output="secret")
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    with pytest.raises(subprocess.TimeoutExpired):
-        with DefaultReadinessAdapter(
-            fixture, tmp_path, runner=runner, image_flag=config.agent_image
-        ) as adapter:
-            disposable = adapter._readiness_workspace()
-            adapter.check_agent_image(config)
-
-    assert not disposable.exists()
-
-
 def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -419,44 +358,6 @@ def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
     assert diagnostics == ["Doctor cleanup could not complete."]
     assert str(disposable) not in diagnostics[0]
     assert adapter._docker_workspace is None
-
-
-@pytest.mark.parametrize(
-    ("stream_build", "expected_capture"), [(True, False), (False, True)]
-)
-def test_agent_image_build_capture_tracks_human_versus_json_mode(
-    tmp_path: Path, stream_build: bool, expected_capture: bool
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    dockerfile = fixture / "Dockerfile"
-    dockerfile.write_text("FROM node:22-slim\n")
-    image = sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-
-    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((tuple(argv), kwargs))
-        returncode = 1 if argv[:3] == ["docker", "image", "inspect"] else 0
-        return subprocess.CompletedProcess(argv, returncode, "secret", "secret")
-
-    with DefaultReadinessAdapter(
-        fixture,
-        tmp_path,
-        runner=runner,
-        stream_image_build=stream_build,
-    ) as adapter:
-        result = adapter.check_agent_image(docker_configuration(image=image))
-
-    assert result.status is Status.PASS
-    inspect = next(
-        entry for entry in calls if entry[0][:3] == ("docker", "image", "inspect")
-    )
-    build = next(entry for entry in calls if entry[0][:2] == ("docker", "build"))
-    assert inspect[1]["capture"] is True
-    assert inspect[1]["timeout"] == 15.0
-    assert build[1]["capture"] is expected_capture
-    assert build[1]["timeout"] == 900.0
-    assert "secret" not in repr(result)
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
@@ -491,21 +392,6 @@ def test_unknown_runtime_authentication_fails_without_running_command(
     assert result.status is Status.FAIL
     assert result.summary == "The selected Runtime has no authentication convention."
     assert runner.calls == []
-
-
-def test_missing_gate_runs_nothing_and_creates_no_disposable_workspace(
-    tmp_path: Path,
-) -> None:
-    fixture = tmp_path / ".pycastle"
-    fixture.mkdir()
-    runner = DockerRecordingRunner()
-    adapter = DefaultReadinessAdapter(fixture, tmp_path, runner=runner)
-
-    result = adapter.check_gate_toolchain(docker_configuration())
-
-    assert result.status is Status.NOT_APPLICABLE
-    assert runner.calls == []
-    assert adapter._docker_workspace is None
 
 
 class ScriptedRuntimeRunner:
@@ -754,13 +640,17 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
         ),
     )
 
-    assert calls == list(CHECK_IDS[:-1])
+    assert calls == [
+        check_id
+        for check_id in CHECK_IDS
+        if check_id not in {"eligible_items", "frozen_execution_inputs"}
+    ]
     assert [check.id for check in report.checks] == list(CHECK_IDS)
-    assert report.ready is True
+    assert report.outcome is ReadinessOutcome.READY
     document = json.loads(render_json(report))
     assert list(document) == [
         "schema_version",
-        "ready",
+        "outcome",
         "runner_version",
         "configuration",
         "checks",
@@ -796,10 +686,10 @@ def test_failed_prerequisite_blocks_dependents_and_independent_checks_continue()
     assert by_id["sandbox"].status is Status.BLOCKED
     assert by_id["github_authentication"].status is Status.PASS
     assert "github_authentication" in called
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
-def test_zero_items_is_a_failure_with_actionable_remediation() -> None:
+def test_zero_items_is_a_successful_no_work_outcome() -> None:
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
@@ -807,11 +697,10 @@ def test_zero_items_is_a_failure_with_actionable_remediation() -> None:
             eligible_items=lambda _configuration: [],
         ),
     )
-    check = report.checks[-1]
+    check = next(check for check in report.checks if check.id == "eligible_items")
     assert check.id == "eligible_items"
-    assert check.status is Status.FAIL
-    assert check.remediation
-    assert report.ready is False
+    assert check.status is Status.PASS
+    assert report.outcome is ReadinessOutcome.NO_WORK
 
 
 @pytest.mark.parametrize(
@@ -834,11 +723,11 @@ def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
         ),
     )
 
-    check = report.checks[-1]
+    check = next(check for check in report.checks if check.id == "eligible_items")
     assert check.id == "eligible_items"
     assert check.status is Status.FAIL
     assert report.eligible_items == ()
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 @pytest.mark.parametrize(
@@ -862,9 +751,12 @@ def test_invalid_item_values_make_doctor_unready(items: object) -> None:
         ),
     )
 
-    assert report.checks[-1].status is Status.FAIL
+    assert (
+        next(check for check in report.checks if check.id == "eligible_items").status
+        is Status.FAIL
+    )
     assert report.eligible_items == ()
-    assert report.ready is False
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 def test_invalid_probe_result_becomes_a_failed_check_and_evaluation_continues() -> None:
@@ -1125,7 +1017,7 @@ def test_external_item_resolution_failures_are_not_empty_batch_noops(
 
     assert eligible.status is Status.FAIL
     assert eligible.facts.get("count") is None
-    assert not cli._run_can_preserve_empty_batch_noop(report)
+    assert report.outcome is ReadinessOutcome.NOT_READY
 
 
 @pytest.mark.parametrize(
@@ -1211,6 +1103,14 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def snapshot(number: int) -> object:
+        def freeze(config: object, items: tuple[IssueRef, ...]) -> object:
+            frozen = MagicMock()
+            frozen.items = items
+            frozen.sandbox = config.sandbox
+            frozen.runtime = config.runtime
+            frozen.agent_image = config.agent_image
+            return frozen
+
         return evaluate_readiness(
             configuration(),
             ReadinessDependencies(
@@ -1218,14 +1118,13 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
                 eligible_items=lambda _configuration: [
                     IssueRef(number=number, title=f"Item {number}")
                 ],
+                freeze_inputs=freeze,
             ),
         )
 
     evaluations = MagicMock(side_effect=[snapshot(1), snapshot(2)])
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", evaluations)
     monkeypatch.setattr(cli, "_build_runtime", MagicMock())
-    monkeypatch.setattr(cli, "make_fixture_gate_check", MagicMock())
-    monkeypatch.setattr(cli, "make_fixture_setup", MagicMock())
     monkeypatch.setattr(cli, "GitHubIssueSource", MagicMock())
     monkeypatch.setattr(cli, "_make_run_id", lambda: "current")
     run_loop = MagicMock()

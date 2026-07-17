@@ -1,5 +1,5 @@
-# Integrated Run Review
+# Integrated Run review
 
-Review the integrated Run branch and its complete diff. Run focused checks and
-write actionable findings to `.pycastle/run-review.md`. Do not mutate GitHub.
-Write an explicit "No findings" when no repair is needed.
+Review the integrated Run diff for cross-Item defects. Fix and commit defects.
+Record findings and fixes in `.pycastle/run-review.md`, or write `No findings`.
+A fresh Gate node performs verification. Do not mutate GitHub.

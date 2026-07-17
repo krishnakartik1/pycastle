@@ -5,17 +5,9 @@ bounded batch. It cuts a per-run branch in its own worktree (the main checkout
 stays untouched), then works each issue in its own worktree off that run branch:
 run the graph, commit, and on a clean merge fold the issue branch back into the
 run branch. Successful issues are accumulated and a single pull request is opened
-for the whole run. Per-phase provider telemetry and a run log are written into
+for the whole run. Per-node provider telemetry and a run log are written into
 the Project fixture under ``.pycastle/runs/<run_id>/`` (an ignored path, so run
 output is never committed).
-
-A failed implement attempt (an agent crash, or a clean run whose gates come
-back red) is retried in place on the same worktree (#8): a handoff document is
-written summarising what was tried and what to fix, and the next attempt carries
-that context. For Codex the handoff resumes the thread that did the failed
-attempt; Claude has no thread resume, so its handoff is a fresh call carrying
-the prior-attempt context. An item that exhausts its retries is labelled
-``ready-for-human`` and the run continues to the next item.
 
 A merge that does not apply cleanly does not fail the run (#9): the conflicting
 issue is labelled ``ready-for-human`` and the run continues with the remaining
@@ -27,36 +19,77 @@ worktrees and no issue stuck in a claimed state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import signal
+import subprocess
+import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
 from .commands import run_cmd
+from .execution import (
+    ExecutionRecord,
+    execute_hook,
+    project_gate_evidence,
+    sensitive_environment_values,
+)
 from .graph import (
     HUMAN,
-    GraphExecutor,
-    Phase,
-    PhaseGraph,
-    PhaseResult,
-    RunDefinition,
-    WalkResult,
-    load_run,
+    ExecutionGraph,
+    GateNode,
+    NodeOutcome,
+    NodeVisit,
+    RuntimeNode,
+    Terminal,
+    walk_execution_graph,
 )
 from .issues import IssueSource
-from .models import IssueRef
-from .runtime import AgentCrashError, CodexRuntime, Runtime
+from .models import IssueRef, RuntimeResult
+from .readiness import FrozenReadinessInputs
+from .runtime import AgentCrashError, Runtime
 
 logger = logging.getLogger(__name__)
 
 Runner = Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class NodeResult:
+    node: str
+    result: RuntimeResult
+
+
+@dataclass
+class ExecutionResult:
+    results: list[NodeResult]
+    terminal: Terminal
+
+
+class PromptRenderer:
+    """Render a frozen Runtime-node prompt without executing graph policy."""
+
+    def __init__(self, *, prompts: Mapping[str, str], preamble: str = "") -> None:
+        self.prompts = prompts
+        self.preamble = preamble
+
+    def render_prompt(self, node: RuntimeNode, extra: str | None = None) -> str:
+        try:
+            prompt = self.prompts[node.prompt]
+        except KeyError:
+            raise ValueError(
+                f"Frozen Runtime prompt is missing: {node.prompt!r}"
+            ) from None
+        return "\n\n".join(value for value in (self.preamble, prompt, extra) if value)
 
 
 class WorktreeError(RuntimeError):
@@ -84,7 +117,7 @@ class PruneError(RuntimeError):
 
 
 class RunCheckpointError(RuntimeError):
-    """A successful Run phase could not be committed durably."""
+    """A successful Run node could not be committed durably."""
 
 
 def prune_run_branches(
@@ -193,213 +226,214 @@ def prune_run_branches(
     return deleted
 
 
-#: A gate check decides whether an implement attempt's quality gates passed.
-#: It takes the issue worktree and returns a :class:`GateOutcome` whose
-#: ``passed`` is the green/red verdict and whose ``output`` is the captured gate
-#: text. It is injectable so a "gates red" outcome can drive a retry without
-#: hardcoding a specific project gate command here; the default treats every
-#: attempt as passing (the real gate is the project's own and is wired by the
-#: caller).
-GateCheck = Callable[[Path], "GateOutcome"]
-Setup = Callable[[Path], None]
-
-#: Where a handoff document is written inside the issue worktree (ignored path).
-HANDOFF_DOC = ".pycastle/handoff.md"
-
-#: The phase name used for the handoff invocation's telemetry.
-HANDOFF_PHASE = "handoff"
-
-
 @dataclass
 class GateOutcome:
-    """What running an attempt's quality gate produced.
-
-    ``passed`` is the green/red verdict (the gate exited 0); ``output`` is the
-    captured stdout+stderr the orchestrator surfaces (logged on failure, and
-    persisted into the per-issue transcript so a run is auditable). Replaces the
-    bare bool the gate check used to return so the gate's reasoning is no longer
-    discarded (#28).
-    """
+    """The safe publication facts produced by the most recent Gate node."""
 
     passed: bool
     output: str
-    exit_code: int = 0
     duration_seconds: float = 0.0
     command: str = ".pycastle/gate"
+    termination: dict[str, object] | None = None
 
 
-def _gates_always_pass(_worktree: Path) -> GateOutcome:
-    """Default gate check: treat every attempt as passing, with no output.
-
-    The real gate is the project's own quality-gate command; it is injected by
-    the caller. With no gate wired, a single implement attempt is made and no
-    retry/handoff is triggered.
-    """
-    return GateOutcome(passed=True, output="")
-
-
-#: The optional project-owned quality gate, relative to the Project fixture.
-#: If this file exists it is run (as an executable) inside the issue worktree
-#: after the implement phase; exit 0 means the gates passed, any non-zero exit
-#: means they failed and the attempt is retried with a handoff. The file is
-#: project-owned (it lives in and travels with ``.pycastle/``), so each project
-#: decides its own gate without the runner hardcoding a command. ``pycastle
-#: init`` (#11) will scaffold a default ``gate`` file matching this convention.
+#: Mandatory project-owned executables relative to the Project fixture.
 FIXTURE_GATE = "gate"
 FIXTURE_SETUP = "setup"
 
 
+@dataclass(frozen=True)
+class SetupFailure:
+    """Allow-listed Setup facts safe to expose outside the local record."""
+
+    command: str
+    termination: dict[str, object]
+
+
 class SetupError(RuntimeError):
-    """The project-owned setup hook could not prepare an issue worktree."""
+    """The frozen Setup prerequisite was not durably established."""
+
+    def __init__(self, failure: SetupFailure, message: str = "Setup failed") -> None:
+        if not isinstance(failure, SetupFailure):
+            raise TypeError("failure must be a SetupFailure")
+        super().__init__(message)
+        self.failure = failure
 
 
-def make_fixture_setup(
-    fixture_dir: Path,
-    *,
-    runner: Runner = run_cmd,
-    sandbox: str = "host",
-    image: str | None = None,
-    runtime_name: str = "claude",
-    workspace: Path | None = None,
-) -> Setup:
-    """Build the optional project-owned setup hook for the selected sandbox.
+@dataclass(frozen=True)
+class FrozenRunExecution:
+    """Frozen Run hooks and deterministic per-graph visit record allocation."""
 
-    The canonical fixture executable runs with the issue worktree as its cwd,
-    immediately before that issue's phase graph is walked. Missing hooks are a
-    backward-compatible no-op. Launch errors and non-zero exits raise
-    :class:`SetupError`, because an unprepared sandbox is a run infrastructure
-    failure rather than a phase outcome that should follow a graph edge.
-    """
-    setup_path = fixture_dir / FIXTURE_SETUP
+    setup: Path
+    gate: Path
+    records: Path
+    setup_content: bytes = field(repr=False)
+    setup_mode: int
+    gate_content: bytes = field(repr=False)
+    gate_mode: int
+    prompts: Mapping[str, str] = field(repr=False)
+    sandbox: str = "host"
+    runtime_name: str = "claude"
+    workspace: Path | None = None
+    image: str | None = None
 
-    def _setup(worktree: Path) -> None:
-        if not setup_path.is_file():
-            return
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prompts", MappingProxyType(dict(self.prompts)))
+
+    def _hook_argv(
+        self, executable: Path, cwd: Path, scope: Literal["item", "run"]
+    ) -> list[str]:
+        if self.sandbox == "host":
+            return [str(executable)]
+        if self.workspace is None or self.image is None:
+            raise ValueError("Docker hook execution requires workspace and image")
+        return sandbox_mod.build_run_command(
+            self.runtime_name,
+            inner_argv=[str(executable)],
+            workspace=self.workspace,
+            workdir=cwd,
+            image=self.image,
+            environment={"PYCASTLE_SCOPE": scope},
+        )
+
+    @staticmethod
+    def _record_identity(value: str) -> str:
+        """Return a readable, collision-resistant filename component."""
+        readable = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-") or "node"
+        digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+        return f"{readable[:48]}-{digest}"
+
+    @classmethod
+    def freeze(cls, fixture_dir: Path, run_id: str) -> FrozenRunExecution:
+        fixture_dir = fixture_dir.resolve()
+        root = fixture_dir / "runs" / run_id
+        frozen = root / "frozen"
+        frozen.mkdir(parents=True, exist_ok=True)
+        setup = fixture_dir / FIXTURE_SETUP
+        gate = fixture_dir / FIXTURE_GATE
+        prompts = {
+            str(path.relative_to(fixture_dir / "prompts")): path.read_text()
+            for path in (fixture_dir / "prompts").rglob("*")
+            if path.is_file()
+        }
+        return cls(
+            frozen / FIXTURE_SETUP,
+            frozen / FIXTURE_GATE,
+            root / "executions",
+            setup.read_bytes(),
+            setup.stat().st_mode & 0o777,
+            gate.read_bytes(),
+            gate.stat().st_mode & 0o777,
+            prompts,
+        )
+
+    @staticmethod
+    def _stage_executable(path: Path, content: bytes, mode: int) -> None:
+        """Atomically stage one frozen hook immediately before invocation."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".hook-")
         try:
-            if sandbox == "docker":
-                argv = sandbox_mod.build_run_command(
-                    runtime_name,
-                    inner_argv=["bash", str(setup_path.resolve())],
-                    workspace=workspace or Path.cwd(),
-                    workdir=worktree,
-                    image=image or sandbox_mod.DEFAULT_IMAGE,
-                )
-                result = runner(argv, capture=True)
-            else:
-                result = runner([str(setup_path.resolve())], cwd=worktree, capture=True)
-        except OSError as exc:
-            raise SetupError(f"Project setup could not be launched: {exc}") from exc
-        if getattr(result, "returncode", 1) != 0:
-            output = (getattr(result, "stdout", "") or "") + (
-                getattr(result, "stderr", "") or ""
-            )
-            raise SetupError(f"Project setup failed:\n{output}".rstrip())
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
 
-    return _setup
-
-
-def _gate_outcome_from_result(result: Any) -> GateOutcome:
-    """Build a :class:`GateOutcome` from a runner's completed-process result.
-
-    Captures the gate's combined stdout+stderr (so the orchestrator can surface
-    the actual failing checks) and reads the verdict off the exit code: 0 is a
-    pass, anything else (including a missing/odd returncode) is a failure.
-    """
-    output = (getattr(result, "stdout", "") or "") + (
-        getattr(result, "stderr", "") or ""
-    )
-    exit_code = getattr(result, "returncode", 1)
-    return GateOutcome(passed=exit_code == 0, output=output, exit_code=exit_code)
-
-
-def make_fixture_gate_check(
-    fixture_dir: Path,
-    *,
-    runner: Runner = run_cmd,
-    sandbox: str = "host",
-    image: str | None = None,
-    runtime_name: str = "claude",
-    workspace: Path | None = None,
-) -> GateCheck:
-    """Build a :data:`GateCheck` from the Project fixture's gate file.
-
-    The gate definition is project-owned: if ``<fixture_dir>/gate`` exists it is
-    run (so it sees the attempt's code, not the fixture), and the returned check
-    passes only when that command exits 0, carrying the captured output back in
-    the :class:`GateOutcome`. With no gate file the fixture opts out of gating
-    and the check falls back to :func:`_gates_always_pass`, so a project without
-    a gate keeps the single-attempt, no-retry behaviour (back-compat).
-
-    The gate runs where the phases run, driven by the single ``--sandbox`` flag
-    (#28) so gate and runtime are always on the same side:
-
-    * ``sandbox="host"`` (the default) runs the gate as a host subprocess inside
-      the issue worktree, exactly as before — byte-for-byte unchanged behaviour
-      for existing callers.
-    * ``sandbox="docker"`` runs the gate INSIDE the same resolved agent image as
-      the phases, wrapped through :func:`pycastle.sandbox.build_run_command` (the
-      same wrapper the runtime uses, #50 workdir fix included). The repo root
-      (``workspace``) is bind-mounted at its own path and the issue ``worktree``
-      becomes the container ``-w``, so the gate sees the same cwd it does on the
-      host. The inner argv runs ``bash`` on the *canonical* repo-root gate
-      (``fixture_dir/gate``), NOT the worktree's copy, so an attempt cannot
-      weaken its own gate; the canonical absolute path is valid in the container
-      because the repo root is mounted at the same path. The runtime's auth mount
-      is inert for the gate, so ``build_run_command`` is reused as-is rather than
-      building a leaner gate-only wrapper.
-
-    The gate is resolved once here, but read freshly per call so a fixture that
-    grows or drops its gate between runs is honoured. ``runner`` is injectable so
-    the subprocess can be mocked in tests; production passes the real
-    :func:`~pycastle.commands.run_cmd`.
-
-    A gate that exists but cannot be launched — it lost its executable bit on
-    checkout (``PermissionError``), or has a bad interpreter line
-    (``FileNotFoundError``/``ENOEXEC``), or the ``docker run`` itself cannot be
-    spawned — is treated as a *failing* gate, not a crash: the :class:`OSError`
-    is logged and the check returns a failing :class:`GateOutcome` so the attempt
-    is retried and the issue ultimately handed to a human, rather than one bad
-    file mode sinking the whole run.
-    """
-    gate_path = fixture_dir / FIXTURE_GATE
-
-    def _check(worktree: Path) -> GateOutcome:
-        if not gate_path.is_file():
-            return GateOutcome(passed=True, output="")
-        started = time.monotonic()
+    def _execute_hook(
+        self,
+        executable: Path,
+        content: bytes,
+        mode: int,
+        *,
+        cwd: Path,
+        scope: Literal["item", "run"],
+        record_path: Path,
+        environment: dict[str, str] | None = None,
+    ) -> ExecutionRecord:
+        self._stage_executable(executable, content, mode)
         try:
-            if sandbox == "docker":
-                # Wrap the canonical gate through the same docker wrapper the
-                # runtime uses: repo root mounted at its own path, worktree as the
-                # container cwd (-w). ``docker run`` is launched from the host with
-                # no cwd dependence, so no ``cwd=`` is passed here.
-                argv = sandbox_mod.build_run_command(
-                    runtime_name,
-                    inner_argv=["bash", str(gate_path.resolve())],
-                    workspace=workspace or Path.cwd(),
-                    workdir=worktree,
-                    image=image or sandbox_mod.DEFAULT_IMAGE,
-                )
-                result = runner(argv, capture=True)
-            else:
-                result = runner([str(gate_path.resolve())], cwd=worktree, capture=True)
-        except OSError as exc:
-            # The gate file is there but cannot be executed (lost +x on checkout,
-            # bad shebang, docker not spawnable, ...). Count it as a gate failure
-            # so the run retries and hands the issue to a human instead of
-            # aborting the whole batch.
-            logger.exception("Could not run quality gate %s", gate_path)
-            return GateOutcome(
-                passed=False,
-                output=f"gate could not be launched: {exc}",
-                exit_code=126,
-                duration_seconds=time.monotonic() - started,
+            return execute_hook(
+                executable,
+                cwd=cwd,
+                scope=scope,
+                record_path=record_path,
+                environment=environment,
+                argv_builder=self._hook_argv if self.sandbox == "docker" else None,
             )
-        outcome = _gate_outcome_from_result(result)
-        outcome.duration_seconds = time.monotonic() - started
-        return outcome
+        finally:
+            executable.unlink(missing_ok=True)
 
-    return _check
+    def invoke_setup(
+        self,
+        worktree: Path,
+        *,
+        scope: Literal["item", "run"] = "item",
+        identity: str,
+        ordinal: int,
+    ) -> None:
+        record = self._execute_hook(
+            self.setup,
+            self.setup_content,
+            self.setup_mode,
+            cwd=worktree,
+            scope=scope,
+            record_path=self.records
+            / f"{self._record_identity(identity)}-setup-{ordinal}.json",
+        )
+        if not record.success:
+            raise SetupError(
+                SetupFailure(".pycastle/setup", dict(record.termination.__dict__))
+            )
+
+    def invoke_gate(
+        self,
+        worktree: Path,
+        *,
+        scope: Literal["item", "run"] = "item",
+        identity: str,
+        node: str,
+        ordinal: int,
+    ) -> tuple[NodeOutcome, GateOutcome]:
+        environment = dict(os.environ)
+        started_at = time.monotonic()
+        try:
+            record = self._execute_hook(
+                self.gate,
+                self.gate_content,
+                self.gate_mode,
+                cwd=worktree,
+                scope=scope,
+                record_path=self.records
+                / (
+                    f"{self._record_identity(identity)}-"
+                    f"{self._record_identity(node)}-gate-{ordinal}.json"
+                ),
+                environment=environment,
+            )
+        finally:
+            duration_seconds = time.monotonic() - started_at
+        evidence = project_gate_evidence(
+            record,
+            node=node,
+            sensitive_values=sensitive_environment_values(environment),
+        )
+        termination = evidence["termination"]
+        return NodeOutcome(
+            record.success,
+            evidence,
+        ), GateOutcome(
+            record.success,
+            "",
+            duration_seconds=duration_seconds,
+            termination=termination if isinstance(termination, dict) else None,
+        )
 
 
 @dataclass
@@ -418,11 +452,13 @@ class RunOutcome:
     run_id: str
     run_branch: str
     selected: list[int] = field(default_factory=list)
+    stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
     pr_opened: bool = False
     pr_ready: bool = False
     succeeded: bool = True
     stopping_point: str | None = None
+    setup_failure: SetupFailure | None = None
 
     @property
     def completed(self) -> list[int]:
@@ -477,9 +513,9 @@ def issue_branch_name(issue: IssueRef) -> str:
 
 
 def render_issue_context(issue: IssueRef) -> str:
-    """Format an issue as the preamble handed to the runtime each phase.
+    """Format an issue as the preamble handed to the runtime each node.
 
-    The phase prompts tell the runtime to read the issue's "What to build" and
+    The node prompts tell the runtime to read the issue's "What to build" and
     "Acceptance criteria", so it must actually be handed the issue. This renders
     a ``# Issue #<n>: <title>`` header followed by the body when non-empty, then
     every author-attributed issue comment in source order. The title keeps its
@@ -512,17 +548,17 @@ def _write_telemetry(
     fixture_dir: Path,
     run_id: str,
     issue: IssueRef,
-    phase_results: list[PhaseResult],
+    node_results: list[NodeResult],
 ) -> None:
-    """Write per-phase telemetry for one issue into the Project fixture.
+    """Write per-node telemetry for one issue into the Project fixture.
 
-    Telemetry comes from each :class:`~pycastle.graph.PhaseResult`'s
+    Telemetry comes from each :class:`~pycastle.graph.NodeResult`'s
     ``result.telemetry`` (a pydantic model dumped with ``model_dump``). Only the
     cost/duration/turns/token counts are recorded; the agent's prose output is
     not, so nothing credential-like is written.
     """
     run_dir = _telemetry_dir(fixture_dir, run_id)
-    records = [pr.result.telemetry.model_dump(mode="json") for pr in phase_results]
+    records = [pr.result.telemetry.model_dump(mode="json") for pr in node_results]
     path = run_dir / f"issue-{issue.number}-telemetry.json"
     path.write_text(json.dumps(records, indent=2) + "\n")
 
@@ -534,10 +570,10 @@ def _transcript_sink(
 
     The runtime surfaces both the agent's thinking and its output but does not
     know ``run_id`` or the issue number (its :meth:`run` only gets ``cwd`` and
-    ``phase``), so the orchestrator — which owns both — binds this sink onto the
+    ``node``), so the orchestrator — which owns both — binds this sink onto the
     runtime per issue (#48, #52). Each chunk is appended to
     ``.pycastle/runs/<run_id>/issue-<n>-transcript.log``, tagged with its stream
-    and prefixed with its phase, so OUTPUT and THINKING interleave in one file in
+    and prefixed with its node, so OUTPUT and THINKING interleave in one file in
     chronological order (matching the predecessor ralph runner's single-file
     model), beside the per-issue telemetry and the run log. Neither stream is
     credentials, so writing them to the (gitignored) run dir is fine; it makes a
@@ -546,9 +582,9 @@ def _transcript_sink(
     run_dir = _telemetry_dir(fixture_dir, run_id)
     path = run_dir / f"issue-{issue_number}-transcript.log"
 
-    def _sink(phase: str, tag: str, text: str) -> None:
+    def _sink(node: str, tag: str, text: str) -> None:
         with path.open("a") as handle:
-            handle.write(f"[{phase}] [{tag}] {text}\n")
+            handle.write(f"[{node}] [{tag}] {text}\n")
 
     return _sink
 
@@ -556,14 +592,14 @@ def _transcript_sink(
 def _run_transcript_sink(
     fixture_dir: Path, run_id: str, scope: str
 ) -> Callable[[str, str, str], None]:
-    """Build a sink for one before-Run or after-Run phase graph."""
-    path = _telemetry_dir(fixture_dir, run_id) / "run-phase-transcript.log"
+    """Build a sink for one before-Run or after-Run node graph."""
+    path = _telemetry_dir(fixture_dir, run_id) / "run-node-transcript.log"
 
-    def _sink(phase: str, tag: str, text: str) -> None:
+    def _sink(node: str, tag: str, text: str) -> None:
         with path.open("a") as handle:
             lines = text.splitlines() or [""]
             for line in lines:
-                handle.write(f"[{scope}] [{phase}] [{tag}] {line}\n")
+                handle.write(f"[{scope}] [{node}] [{tag}] {line}\n")
 
     return _sink
 
@@ -572,35 +608,20 @@ def _append_run_telemetry(
     fixture_dir: Path,
     run_id: str,
     scope: str,
-    phase_results: list[PhaseResult],
+    node_results: list[NodeResult],
 ) -> None:
-    """Append scoped Run-phase telemetry in lifecycle order."""
-    path = _telemetry_dir(fixture_dir, run_id) / "run-phase-telemetry.json"
+    """Append scoped Run-node telemetry in lifecycle order."""
+    path = _telemetry_dir(fixture_dir, run_id) / "run-node-telemetry.json"
     records = json.loads(path.read_text()) if path.exists() else []
     records.extend(
         {
             "scope": scope,
-            **phase_result.result.telemetry.model_dump(mode="json"),
-            "phase": phase_result.phase,
+            **node_result.result.telemetry.model_dump(mode="json"),
+            "node": node_result.node,
         }
-        for phase_result in phase_results
+        for node_result in node_results
     )
     path.write_text(json.dumps(records, indent=2) + "\n")
-
-
-def _surface_gate(sink: Callable[[str, str, str], None], outcome: GateOutcome) -> None:
-    """Persist the gate's captured output into the per-issue transcript.
-
-    Tagged ``GATE`` under phase ``gate`` so lines read ``[gate] [GATE] <text>``,
-    matching the runtime's transcript format. The caller decides *when* to call
-    this — always on failure, only under ``--verbose`` on success (#28). Output
-    is split per line so each line keeps the ``[gate] [GATE] `` prefix, and a
-    gate that produced no output writes nothing (no empty tagged line).
-    """
-    if not outcome.output:
-        return
-    for line in outcome.output.splitlines():
-        sink("gate", "GATE", line)
 
 
 def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
@@ -667,6 +688,15 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
         cwd=cwd,
     )
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
+
+
+def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
+    """Remove Git state that cannot represent a publishable Run checkpoint."""
+    result = runner(["git", "branch", "-D", branch], capture=True, cwd=cwd)
+    if getattr(result, "returncode", 1) != 0:
+        raise BranchError(
+            f"git branch deletion failed for {branch}{_git_failure_detail(result)}"
+        )
 
 
 @contextmanager
@@ -759,259 +789,125 @@ def _cleanup_cancelled(
         logger.exception("Could not persist cancellation recovery summary: %s", summary)
 
 
-_HANDOFF_PROMPT = (
-    "A previous implement attempt left the quality gates red. Write a handoff "
-    f"document at {HANDOFF_DOC} for the next attempt. Summarise, briefly: what "
-    "you attempted, the current state of the code, which files you touched, and "
-    "what to try next to fix the failing gates. Reference the issue and the diff "
-    "by path; do not duplicate their content.\n\n"
-    "## Failing gate output\n\n```\n{gate_output}\n```\n"
-)
-
-
-def generate_handoff(
-    runtime: Runtime,
+def _walk_execution_graph(
+    issue: IssueRef | None,
     *,
+    runtime: Runtime,
     worktree: Path,
-    thread_id: str | None,
-    gate_output: str,
-) -> bool:
-    """Have the runtime write a handoff document for the next attempt.
-
-    The handoff captures what the failed attempt tried and what to fix next. For
-    Codex (a runtime whose :meth:`run` accepts ``resume_thread_id``) the handoff
-    resumes the thread that produced the failed attempt, so it keeps the original
-    context; ``thread_id`` is the failed attempt's thread. Claude has no thread
-    resume, so its handoff is a fresh ``run`` carrying the prior-attempt context
-    in the prompt. Returns whether the document was created — a runtime that
-    fails to write it degrades to a fresh retry rather than aborting the issue.
-    """
-    prompt = _HANDOFF_PROMPT.format(gate_output=gate_output)
-    if _runtime_resumes_threads(runtime) and thread_id is not None:
-        # Codex: resume the failed attempt's thread to keep its context.
-        runtime.run(  # type: ignore[call-arg]
-            prompt,
-            cwd=worktree,
-            phase=HANDOFF_PHASE,
-            resume_thread_id=thread_id,
-        )
-    else:
-        # Claude (or any non-resuming runtime): a fresh call with the context.
-        runtime.run(prompt, cwd=worktree, phase=HANDOFF_PHASE)
-    return (worktree / HANDOFF_DOC).is_file()
-
-
-def _runtime_resumes_threads(runtime: Runtime) -> bool:
-    """Whether a runtime can resume the thread that did the failed attempt.
-
-    Thread resume (``run(..., resume_thread_id=...)``) is a Codex capability,
-    not part of the Runtime Protocol, so we narrow on the Codex runtime — by
-    concrete type, or by its ``name`` so a stand-in Codex runtime is recognised
-    too — rather than forcing ``resume_thread_id`` onto every runtime.
-    """
-    return isinstance(runtime, CodexRuntime) or runtime.name == CodexRuntime.name
-
-
-def _retry_context(attempt: int, gate_output: str, *, handoff_made: bool) -> str:
-    """Build the prior-attempt context threaded into the next implement prompt.
-
-    It points the next attempt at the handoff document and the failing gate
-    output rather than duplicating either inline. The handoff path is named even
-    when this attempt did not produce one (a crash skips the handoff) so the
-    next attempt reads it if present.
-    """
-    handoff_note = (
-        "the handoff document from the previous attempt"
-        if handoff_made
-        else "the handoff document, if the previous attempt left one"
+    graph: ExecutionGraph,
+    execution: FrozenRunExecution,
+    scope: Literal["item", "run"] = "item",
+    identity: str | None = None,
+    context: str | None = None,
+    checkpoint: Callable[[RuntimeNode], None] | None = None,
+) -> tuple[ExecutionResult, GateOutcome | None]:
+    """Walk one mixed Execution graph with Setup before every node visit."""
+    if issue is None and context is None:
+        raise ValueError("Run graph execution requires factual Run context")
+    executor = PromptRenderer(
+        prompts=execution.prompts,
+        preamble=context if context is not None else render_issue_context(issue),
     )
-    lines = [
-        "## Previous Attempt",
-        "",
-        f"Attempt {attempt} was made but a quality gate is still failing.",
-        "",
-        f"- Read {handoff_note}: `{HANDOFF_DOC}`",
-        "- The failing gate output was:",
-        "",
-        "```",
-        gate_output,
-        "```",
-        "",
-        "Fix the failing gates before finishing.",
-    ]
-    return "\n".join(lines)
+    results: list[NodeResult] = []
+    identity = identity or f"item-{issue.number}"
+    last_gate: GateOutcome | None = None
 
-
-def _run_implement_phase(
-    issue: IssueRef,
-    implement: Phase,
-    extra: str | None,
-    *,
-    executor: GraphExecutor,
-    runtime: Runtime,
-    fixture_dir: Path,
-    run_id: str,
-    issue_worktree: Path,
-    impl_retries: int,
-    gate_check: GateCheck,
-    gate_sink: Callable[[str, str, str], None],
-    verbose: bool,
-) -> tuple[bool, list[PhaseResult]]:
-    """Run the ``implement`` phase under #8's retry-with-handoff budget.
-
-    This is the per-phase runner the walker calls for the ``implement`` node, so
-    the branching graph drives the flow while the implement step keeps its
-    bounded retry. Up to ``1 + impl_retries`` attempts are made in place on the
-    same worktree. An attempt fails when the agent crashes
-    (:class:`AgentCrashError`) or when the run is clean but :paramref:`gate_check`
-    reports the gates red. On a failed attempt with retries left, a handoff
-    document is generated (resuming the failed Codex thread, or a fresh Claude
-    call) and the next attempt carries that context. ``extra`` is any
-    prior-context the walker threaded into the implement prompt for the first
-    attempt (none, today). Returns ``(passed, phase_results)`` — the walker maps
-    ``passed`` onto the implement node's ``on_success`` / ``on_failure`` edge.
-    """
-    phase_results: list[PhaseResult] = []
-    retry_context = extra or ""
-
-    for attempt in range(impl_retries + 1):
-        if attempt > 0:
-            _append_log(
-                fixture_dir,
-                run_id,
-                f"Retry {attempt}/{impl_retries} for #{issue.number}",
+    def visit(entry: NodeVisit) -> NodeOutcome:
+        node = entry.node
+        execution.invoke_setup(
+            worktree,
+            scope=scope,
+            identity=f"{identity}-{node.name}",
+            ordinal=entry.ordinal,
+        )
+        if isinstance(node, GateNode):
+            nonlocal last_gate
+            outcome, last_gate = execution.invoke_gate(
+                worktree,
+                scope=scope,
+                identity=identity,
+                node=node.name,
+                ordinal=entry.ordinal,
             )
-        prompt = executor.render_prompt(implement, retry_context or None)
+            return outcome
+        if not isinstance(node, RuntimeNode):
+            raise TypeError("Unknown Execution node")
+        extra = (
+            json.dumps(entry.predecessor, sort_keys=True)
+            if entry.predecessor is not None
+            else None
+        )
         try:
-            result = runtime.run(prompt, cwd=issue_worktree, phase=implement.name)
-        except AgentCrashError as crash:
-            phase_results = []
-            _append_log(
-                fixture_dir,
-                run_id,
-                f"Attempt {attempt + 1} for #{issue.number} crashed "
-                f"during {crash.phase} (exit {crash.exit_code}).",
+            result = runtime.run(
+                executor.render_prompt(node, extra),
+                cwd=worktree,
+                node=node.name,
             )
-            if attempt < impl_retries:
-                retry_context = _retry_context(
-                    attempt + 1,
-                    f"agent crashed during {crash.phase} (exit {crash.exit_code})",
-                    handoff_made=False,
-                )
-                continue
-            return False, phase_results
-
-        phase_results = [PhaseResult(phase=implement.name, result=result)]
-        outcome = gate_check(issue_worktree)
-        # The handoff/next-attempt context gets the gate's real captured output
-        # rather than a static string, so the agent sees the actual failing checks.
-        gate_output = outcome.output or "quality gates reported a failure"
-        if outcome.passed:
-            # Surface a passing gate only under --verbose: persist its output and
-            # note the pass in the run log.
-            if verbose:
-                _surface_gate(gate_sink, outcome)
-                _append_log(fixture_dir, run_id, f"Gate passed for #{issue.number}.")
-            return True, phase_results
-
-        # A failing gate is surfaced ALWAYS (regardless of verbose): persist its
-        # output into the transcript and warn-log it so a red run is auditable.
-        _surface_gate(gate_sink, outcome)
-        logger.warning("Gate failed for #%s:\n%s", issue.number, outcome.output)
-        _append_log(
-            fixture_dir,
-            run_id,
-            f"Gates red after attempt {attempt + 1} for #{issue.number}.",
-        )
-        if attempt >= impl_retries:
-            return False, phase_results
-
-        thread_id = _last_thread_id(phase_results)
-        handoff_made = generate_handoff(
-            runtime,
-            worktree=issue_worktree,
-            thread_id=thread_id,
-            gate_output=gate_output,
-        )
-        _append_log(
-            fixture_dir,
-            run_id,
-            f"Handoff {'generated' if handoff_made else 'skipped'} for "
-            f"#{issue.number} (thread {thread_id or 'n/a'}).",
-        )
-        retry_context = _retry_context(
-            attempt + 1, gate_output, handoff_made=handoff_made
-        )
-
-    return False, phase_results
-
-
-#: The phase name that runs through #8's retry-with-handoff budget. Every other
-#: phase runs once; a crash takes that phase's failure edge.
-IMPLEMENT_PHASE = "implement"
-
-
-def _walk_issue(
-    issue: IssueRef,
-    *,
-    runtime: Runtime,
-    fixture_dir: Path,
-    run_id: str,
-    issue_worktree: Path,
-    impl_retries: int,
-    gate_check: GateCheck,
-    gate_sink: Callable[[str, str, str], None],
-    verbose: bool,
-    graph: PhaseGraph,
-) -> WalkResult:
-    """Walk the issue's phase graph, with the implement node under #8's retry.
-
-    The graph is loaded from the Project fixture and walked from its ``start``
-    (see :class:`~pycastle.graph.GraphExecutor`). The ``implement`` node is run
-    through :func:`_run_implement_phase` (the retry-with-handoff budget plus the
-    project gate), so "succeeded within budget" follows its ``on_success`` edge
-    and "exhausted/failed" follows its ``on_failure`` edge. Every other phase
-    runs once; an agent crash takes that phase's failure edge. The walk stops at
-    a terminal — :data:`~pycastle.graph.DONE` (proceed to commit + merge) or
-    :data:`~pycastle.graph.HUMAN` (hand the issue to a person).
-    """
-    executor = GraphExecutor(
-        runtime, fixture_dir=fixture_dir, preamble=render_issue_context(issue)
-    )
-    default_runner = executor._default_runner(issue_worktree)
-
-    def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
-        if phase.name == IMPLEMENT_PHASE:
-            return _run_implement_phase(
-                issue,
-                phase,
-                extra,
-                executor=executor,
-                runtime=runtime,
-                fixture_dir=fixture_dir,
-                run_id=run_id,
-                issue_worktree=issue_worktree,
-                impl_retries=impl_retries,
-                gate_check=gate_check,
-                gate_sink=gate_sink,
-                verbose=verbose,
+        except AgentCrashError as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {"kind": "exited", "code": error.exit_code},
+                },
             )
-        return default_runner(phase, extra)
+        except OSError as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "launch_error",
+                        "error_kind": type(error).__name__,
+                        "errno": error.errno,
+                    },
+                },
+            )
+        except subprocess.TimeoutExpired as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "timeout",
+                        "timeout_seconds": error.timeout,
+                    },
+                },
+            )
+        except (TypeError, ValueError) as error:
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "malformed_result",
+                        "error_kind": type(error).__name__,
+                    },
+                },
+            )
+        if not isinstance(result, RuntimeResult):
+            return NodeOutcome(
+                False,
+                {
+                    "source": node.name,
+                    "success": False,
+                    "termination": {
+                        "kind": "malformed_result",
+                        "error_kind": type(result).__name__,
+                    },
+                },
+            )
+        results.append(NodeResult(node.name, result))
+        if checkpoint is not None:
+            checkpoint(node)
+        return NodeOutcome(True, {"source": node.name, "success": True})
 
-    return executor.execute(graph, cwd=issue_worktree, phase_runner=run_phase)
-
-
-def _last_thread_id(phase_results: list[PhaseResult]) -> str | None:
-    """Return the thread id of the last phase that exposed one, if any.
-
-    Codex records its resumable thread on each phase's telemetry; the handoff
-    resumes the implement attempt's thread. Claude records ``None`` here.
-    """
-    for phase_result in reversed(phase_results):
-        thread_id = phase_result.result.telemetry.thread_id
-        if thread_id:
-            return thread_id
-    return None
+    walked = walk_execution_graph(graph, visit)
+    return ExecutionResult(results, walked.terminal), last_gate
 
 
 def _work_issue(
@@ -1023,28 +919,24 @@ def _work_issue(
     worktree_root: Path,
     assignee: str,
     workspace: Path,
-    impl_retries: int,
-    gate_check: GateCheck,
-    setup: Setup,
-    item_graph: PhaseGraph,
+    item_graph: ExecutionGraph,
+    execution: FrozenRunExecution,
     cancellation: CancellationState | None = None,
     verbose: bool = False,
 ) -> IssueOutcome:
     """Work one issue in its own worktree and merge it into the run branch.
 
     The issue is claimed, branched off the run branch into its own worktree, and
-    driven by *walking* its phase graph (#10): from ``start`` each phase runs and
-    its success/failure outcome follows the phase's ``on_success`` /
-    ``on_failure`` edge until a terminal (see :func:`_walk_issue`). The
-    ``implement`` node keeps its bounded retry — a failed attempt (a crash, or
-    clean-but-gates-red) is retried in place with a handoff document and
-    prior-attempt context (see :func:`_run_implement_phase`). A walk that reaches
+    driven by walking its Execution graph: from ``start`` each node runs and
+    its success/failure outcome follows the node's ``on_success`` /
+    ``on_failure`` edge until a Terminal. A failed node follows only its declared
+    edge; no retry or automatic context is added.
+    A walk that reaches
     :data:`~pycastle.graph.DONE` is committed and, on a clean merge, folded into
     the run; the issue worktree and branch are then removed.
 
-    A walk that reaches :data:`~pycastle.graph.HUMAN` (an implement node that
-    exhausted its retries, a crash on a non-retried phase, or a runaway cycle
-    hitting the visit cap) labels the issue ``ready-for-human`` and skips it
+    A walk that reaches :data:`~pycastle.graph.HUMAN` (through a declared edge
+    or the visit bound) labels the issue ``ready-for-human`` and skips it
     (recorded as not merged) so the run continues to the next issue — one stuck
     item does not sink the batch. A merge that does not apply cleanly is likewise
     recorded as not merged and skipped, and the issue is labelled
@@ -1066,16 +958,11 @@ def _work_issue(
     issue_source.claim(issue.number, assignee=assignee)
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
-    # The gate sink is built unconditionally — a failing gate surfaces its output
-    # regardless of --verbose (#28), so unlike the runtime sink below (verbose-only
-    # live transcript persistence) the gate needs its persistence target always.
-    gate_sink = _transcript_sink(fixture_dir, run_id, issue.number)
-
     if verbose:
         # The runtime is shared across issues (built once so a Docker image builds
         # once), so its transcript sink is rebound per issue to point at this
-        # issue's transcript log. The runtime keeps surfacing [THINKING:<phase>]
-        # and [OUTPUT:<phase>] lines live regardless; the sink is only the run-dir
+        # issue's transcript log. The runtime keeps surfacing [THINKING:<node>]
+        # and [OUTPUT:<node>] lines live regardless; the sink is only the run-dir
         # persistence target. A deliberate mutation of the shared runtime: the
         # Claude/Codex runtimes read this attribute, a runtime that does not just
         # ignores it.
@@ -1092,26 +979,18 @@ def _work_issue(
     # directory that was never created (#64).
     add_worktree(issue_worktree, branch, runner=runner, cwd=workspace)
 
-    setup(issue_worktree)
-
-    walk: WalkResult = _walk_issue(
+    walk, _ = _walk_execution_graph(
         issue,
         runtime=runtime,
-        fixture_dir=fixture_dir,
-        run_id=run_id,
-        issue_worktree=issue_worktree,
-        impl_retries=impl_retries,
-        gate_check=gate_check,
-        gate_sink=gate_sink,
-        verbose=verbose,
+        worktree=issue_worktree,
         graph=item_graph,
+        execution=execution,
     )
     if walk.results:
         _write_telemetry(fixture_dir, run_id, issue, walk.results)
 
     if walk.terminal is HUMAN:
-        # The walk routed to a human (retries exhausted, a non-retried phase
-        # crashed, or a runaway cycle hit the visit cap): hand the issue over and
+        # The walk routed to a human or hit the visit bound: hand the issue over and
         # move on. Cleaning up the worktree and branch keeps the batch tidy.
         issue_source.mark_for_human(issue.number)
         _append_log(
@@ -1148,7 +1027,7 @@ def _work_issue(
     )
 
     if _branch_has_no_diff(branch, run=run):
-        # The walk reached DONE but the phase produced no change (e.g. a runtime
+        # The walk reached DONE but the node produced no change (e.g. a runtime
         # that silently no-ops): the issue branch equals the run branch, so a
         # merge would be a clean no-op and report a phantom success with no PR.
         # Hand the issue to a human instead of counting it completed (#35).
@@ -1203,7 +1082,7 @@ def _branch_has_no_diff(
 
     After the walk commits, ``git diff --quiet <run_branch> <branch>`` exits 0
     when the two trees are identical (no change) and non-zero when they differ.
-    An empty diff means the phase silently no-opped: merging it would be a clean
+    An empty diff means the node silently no-opped: merging it would be a clean
     no-op that reports a phantom success and opens no PR, so the caller routes the
     issue to a human instead (#35). The check runs in the run worktree, which can
     resolve both branch refs. It stays git-only and does not touch the Issue
@@ -1262,7 +1141,7 @@ RUN_REPORT_LIMIT = 65_536
 def render_run_context(
     run_id: str, selected: Sequence[IssueRef], outcomes: Sequence[IssueOutcome]
 ) -> str:
-    """Render the bounded factual envelope supplied to each Run phase."""
+    """Render the bounded factual envelope supplied to each Run node."""
     outcome_by_number = {o.issue.number: o for o in outcomes}
     rows = []
     for issue in selected:
@@ -1276,13 +1155,13 @@ def render_run_context(
     return f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
 
 
-def _checkpoint_run_phase(
-    phase: Phase,
+def _checkpoint_run_node(
+    node: RuntimeNode,
     *,
     run: RunContext,
     scope: str = "Run",
 ) -> None:
-    """Commit a successful Run phase when dirty and attempt a durability push."""
+    """Commit a successful Run node when dirty and attempt a durability push."""
     argv: Sequence[str]
     try:
         # Run review/report artifacts are part of the Project fixture's ignored
@@ -1297,7 +1176,7 @@ def _checkpoint_run_phase(
         )
         if getattr(staged, "returncode", 1) != 0:
             detail = _record_host_command_failure(
-                run, scope=scope, phase=phase.name, argv=add_argv, result=staged
+                run, scope=scope, node=node.name, argv=add_argv, result=staged
             )
             raise RunCheckpointError(detail)
 
@@ -1311,7 +1190,7 @@ def _checkpoint_run_phase(
         dirty_code = getattr(dirty, "returncode", 2)
         if dirty_code not in (0, 1):
             detail = _record_host_command_failure(
-                run, scope=scope, phase=phase.name, argv=diff_argv, result=dirty
+                run, scope=scope, node=node.name, argv=diff_argv, result=dirty
             )
             raise RunCheckpointError(detail)
         if dirty_code == 1:
@@ -1319,7 +1198,7 @@ def _checkpoint_run_phase(
                 "git",
                 "commit",
                 "-m",
-                f"chore: checkpoint Run phase {phase.name}",
+                f"chore: checkpoint Run node {node.name}",
             ]
             argv = commit_argv
             committed = run.runner(
@@ -1331,51 +1210,26 @@ def _checkpoint_run_phase(
                 detail = _record_host_command_failure(
                     run,
                     scope=scope,
-                    phase=phase.name,
+                    node=node.name,
                     argv=commit_argv,
                     result=committed,
                 )
                 raise RunCheckpointError(detail)
     except OSError as exc:
         detail = _record_host_command_exception(
-            run, scope=scope, phase=phase.name, argv=argv, exc=exc
+            run, scope=scope, node=node.name, argv=argv, exc=exc
         )
         raise RunCheckpointError(detail) from exc
 
-    _push_run_branch(run=run, final=False, scope=scope, phase=phase.name)
-
-
-def _walk_run_graph(
-    graph: PhaseGraph,
-    *,
-    runtime: Runtime,
-    run: RunContext,
-    context: str,
-    scope: str = "Run",
-) -> WalkResult:
-    """Walk one Run phase graph, checkpointing each successful visit."""
-    executor = GraphExecutor(runtime, fixture_dir=run.fixture_dir, preamble=context)
-    default = executor._default_runner(run.worktree)
-
-    def run_phase(phase: Phase, extra: str | None) -> tuple[bool, list[PhaseResult]]:
-        passed, results = default(phase, extra)
-        if results:
-            _append_run_telemetry(run.fixture_dir, run.run_id, scope, results)
-        if passed:
-            _checkpoint_run_phase(phase, run=run, scope=scope)
-        else:
-            _discard_run_commands(run, scope=scope, phase=phase.name)
-        return passed, results
-
-    return executor.execute(graph, cwd=run.worktree, phase_runner=run_phase)
+    _push_run_branch(run=run, final=False, scope=scope, node=node.name)
 
 
 def _discard_incomplete_run_scope(run: RunContext) -> None:
     """Restore the Run worktree to its last committed durable checkpoint."""
-    _discard_run_commands(run, scope="after-Run", phase="Setup")
+    _discard_run_commands(run, scope="after-Run", node="Setup")
 
 
-def _discard_run_commands(run: RunContext, *, scope: str, phase: str) -> None:
+def _discard_run_commands(run: RunContext, *, scope: str, node: str) -> None:
     """Discard incomplete Run work and retain diagnostics for failed commands."""
     commands = (
         ["git", "reset", "--hard", "HEAD"],
@@ -1386,7 +1240,7 @@ def _discard_run_commands(run: RunContext, *, scope: str, phase: str) -> None:
         result = run.runner(argv, capture=True, cwd=run.worktree)
         if getattr(result, "returncode", 1) != 0:
             detail = _record_host_command_failure(
-                run, scope=scope, phase=phase, argv=argv, result=result
+                run, scope=scope, node=node, argv=argv, result=result
             )
             raise RunCheckpointError(
                 f"could not discard incomplete Run scope\n{detail}"
@@ -1397,7 +1251,7 @@ def _record_host_command_failure(
     run: RunContext,
     *,
     scope: str,
-    phase: str,
+    node: str,
     argv: Sequence[str],
     result: Any,
 ) -> str:
@@ -1405,7 +1259,7 @@ def _record_host_command_failure(
     return _record_host_command_diagnostics(
         run,
         scope=scope,
-        phase=phase,
+        node=node,
         argv=argv,
         headline="Host command failed",
         exit_code=repr(getattr(result, "returncode", None)),
@@ -1418,7 +1272,7 @@ def _record_host_command_exception(
     run: RunContext,
     *,
     scope: str,
-    phase: str,
+    node: str,
     argv: Sequence[str],
     exc: OSError,
 ) -> str:
@@ -1426,7 +1280,7 @@ def _record_host_command_exception(
     return _record_host_command_diagnostics(
         run,
         scope=scope,
-        phase=phase,
+        node=node,
         argv=argv,
         headline="Host command could not be launched",
         exit_code="unavailable",
@@ -1439,7 +1293,7 @@ def _record_host_command_diagnostics(
     run: RunContext,
     *,
     scope: str,
-    phase: str,
+    node: str,
     argv: Sequence[str],
     headline: str,
     exit_code: str,
@@ -1459,7 +1313,7 @@ def _record_host_command_diagnostics(
     logger.error("%s", detail)
     sink = _run_transcript_sink(run.fixture_dir, run.run_id, scope)
     for line in detail.splitlines():
-        sink(phase, "HOST-COMMAND", line)
+        sink(node, "HOST-COMMAND", line)
     return detail
 
 
@@ -1500,14 +1354,12 @@ def run_batch(
     assignee: str,
     run_id: str,
     iterations: int = 1,
-    impl_retries: int = 2,
-    gate_check: GateCheck | None = None,
-    setup: Setup | None = None,
     workspace: Path | None = None,
     worktree_root: Path | None = None,
     include_unassigned: bool = False,
     runner: Runner = run_cmd,
     verbose: bool = False,
+    frozen_inputs: FrozenReadinessInputs,
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
@@ -1518,26 +1370,35 @@ def run_batch(
     merged. ``run_id`` is injected (not read from a clock) to keep runs
     deterministic for tests.
 
-    A failed implement attempt is retried up to ``impl_retries`` times
-    (``1 + impl_retries`` attempts total) with a handoff document and
-    prior-attempt context; ``gate_check`` decides whether an attempt's quality
-    gates passed (default: every attempt passes, so no retry fires). An issue
-    that exhausts its retries is labelled ``ready-for-human`` and the run
-    continues to the next issue.
-
-    ``setup`` prepares each newly-created issue worktree before its phase graph
-    is walked. It defaults to a no-op for callers and older Project fixtures.
+    Runtime-node and Gate-node outcomes follow only their declared Execution
+    graph edges. Every Runtime visit is fresh, and its successor receives only
+    the immediate predecessor's typed outcome. Frozen Setup runs once at Run
+    bootstrap and again immediately before every executable node; any Setup
+    failure stops the Run outside graph control flow.
 
     ``verbose`` (#48, #52) turns on transcript persistence: before each issue is
     worked the runtime's transcript sink is bound to that issue's transcript log
-    under ``.pycastle/runs/<run_id>/`` (live ``[THINKING:<phase>]`` and
-    ``[OUTPUT:<phase>]`` surfacing is already on in the runtime itself). Off by
+    under ``.pycastle/runs/<run_id>/`` (live ``[THINKING:<node>]`` and
+    ``[OUTPUT:<node>]`` surfacing is already on in the runtime itself). Off by
     default, so a normal run writes no transcript log and behaves exactly as
     before.
     """
+    fixture_dir = fixture_dir.resolve()
+    if not isinstance(frozen_inputs, FrozenReadinessInputs):
+        raise TypeError("Run requires FrozenReadinessInputs")
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
     selected = tuple(issue.model_copy(deep=True) for issue in selected)
+    frozen_items = frozen_inputs.items
+    if not isinstance(frozen_items, tuple) or not all(
+        isinstance(issue, IssueRef) for issue in frozen_items
+    ):
+        raise ValueError("Frozen readiness Item batch is invalid")
+    if selected != frozen_items:
+        raise ValueError("Selected Items differ from frozen readiness batch")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", frozen_inputs.base_commit):
+        raise ValueError("Frozen readiness base commit is invalid")
+    branch_start = frozen_inputs.base_commit
     run_branch = f"pycastle/run-{run_id}"
     outcome = RunOutcome(
         run_id=run_id,
@@ -1547,19 +1408,61 @@ def run_batch(
     if not selected:
         return outcome
 
-    gate_check = gate_check or _gates_always_pass
-    setup = setup or (lambda _worktree: None)
+    frozen_project = frozen_inputs.project_fixture
+    for frozen_file in frozen_project.files:
+        relative_path = Path(frozen_file.relative_path)
+        if (
+            not frozen_file.relative_path
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+        ):
+            raise ValueError("Frozen Project fixture path is invalid")
     workspace = workspace or Path.cwd()
     worktree_root = worktree_root or (fixture_dir / "worktrees")
     worktree_root.mkdir(parents=True, exist_ok=True)
 
-    # Import once: Runtime edits to the fixture are proposed changes and cannot
-    # rewrite the active Run definition or weaken its graphs.
-    run_definition: RunDefinition = load_run(fixture_dir)
+    files = {
+        frozen_file.relative_path: frozen_file for frozen_file in frozen_project.files
+    }
+    try:
+        setup_file = files[FIXTURE_SETUP]
+        gate_file = files[FIXTURE_GATE]
+    except KeyError as error:
+        raise ValueError(
+            f"Frozen Project fixture is missing mandatory executable: {error.args[0]}"
+        ) from None
+    prompts: dict[str, str] = {}
+    for relative_path, frozen_file in files.items():
+        path = Path(relative_path)
+        if not path.parts or path.parts[0] != "prompts":
+            continue
+        prompt_name = str(Path(*path.parts[1:]))
+        try:
+            prompts[prompt_name] = frozen_file.content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(
+                f"Frozen Runtime prompt is not valid UTF-8: {prompt_name}"
+            ) from None
+    run_definition = frozen_project.run_definition
+    frozen_dir = fixture_dir / "runs" / run_id / "frozen"
+    execution = FrozenRunExecution(
+        frozen_dir / FIXTURE_SETUP,
+        frozen_dir / FIXTURE_GATE,
+        fixture_dir / "runs" / run_id / "executions",
+        setup_file.content,
+        setup_file.mode,
+        gate_file.content,
+        gate_file.mode,
+        prompts,
+        sandbox=frozen_inputs.sandbox,
+        runtime_name=frozen_inputs.runtime,
+        workspace=workspace,
+        image=frozen_inputs.agent_image,
+    )
 
     # Per-run branch + worktree: the main checkout is left on its branch.
     run_worktree = worktree_root / f"run-{run_id}"
-    create_branch(run_branch, base_branch, runner=runner, cwd=workspace)
+    create_branch(run_branch, branch_start, runner=runner, cwd=workspace)
     # A failed run-worktree add is fatal: no issue can be worked without it, so
     # raise rather than silently drive the batch against a missing directory (#64).
     add_worktree(run_worktree, run_branch, runner=runner, cwd=workspace)
@@ -1573,24 +1476,32 @@ def run_batch(
     _append_log(
         fixture_dir,
         run_id,
-        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {base_branch})",
+        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {branch_start})",
     )
 
     cancellation = CancellationState()
     try:
         with _sigint_as_keyboard_interrupt():
-            setup(run_worktree)
+            execution.invoke_setup(
+                run_worktree, scope="run", identity="run-bootstrap", ordinal=1
+            )
             if run_definition.before is not None:
                 if verbose:
                     runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
                         fixture_dir, run_id, "before-Run"
                     )
-                before = _walk_run_graph(
-                    run_definition.before,
+                before, _ = _walk_execution_graph(
+                    None,
                     runtime=runtime,
-                    run=run,
+                    worktree=run_worktree,
+                    graph=run_definition.before,
+                    execution=execution,
                     context=render_run_context(run_id, selected, []),
-                    scope="before-Run",
+                    scope="run",
+                    identity="before-run",
+                    checkpoint=lambda node: _checkpoint_run_node(
+                        node, run=run, scope="before-Run"
+                    ),
                 )
             else:
                 before = None
@@ -1605,8 +1516,11 @@ def run_batch(
         raise
     except SetupError as exc:
         outcome.succeeded = False
-        outcome.stopping_point = f"before-Run Setup: {exc}"
+        outcome.stopping_point = "Run bootstrap Setup"
+        outcome.setup_failure = exc.failure
+        _append_log(fixture_dir, run_id, outcome.stopping_point)
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        delete_local_branch(run_branch, runner=runner, cwd=workspace)
         return outcome
     except RunCheckpointError as exc:
         outcome.succeeded = False
@@ -1627,6 +1541,32 @@ def run_batch(
         try:
             for issue in selected:
                 try:
+                    eligible = issue_source.is_still_eligible(
+                        issue,
+                        assignee=assignee,
+                        include_unassigned=include_unassigned,
+                    )
+                    if not isinstance(eligible, bool):
+                        raise TypeError("Item eligibility recheck did not return bool")
+                except Exception as exc:
+                    if not outcome.completed:
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        raise
+                    outcome.succeeded = False
+                    outcome.stopping_point = (
+                        f"Item #{issue.number} eligibility recheck failure: {exc}"
+                    )
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    break
+                if not eligible:
+                    outcome.stale.append(issue.number)
+                    _append_log(
+                        fixture_dir,
+                        run_id,
+                        f"Item #{issue.number} is stale; skipped without mutation",
+                    )
+                    continue
+                try:
                     item_outcome = _work_issue(
                         issue,
                         runtime=runtime,
@@ -1635,13 +1575,31 @@ def run_batch(
                         worktree_root=worktree_root,
                         assignee=assignee,
                         workspace=workspace,
-                        impl_retries=impl_retries,
-                        gate_check=gate_check,
-                        setup=setup,
                         item_graph=run_definition.item,
+                        execution=execution,
                         cancellation=cancellation,
                         verbose=verbose,
                     )
+                except SetupError as exc:
+                    cleanup_worktree(
+                        worktree_root / f"issue-{issue.number}",
+                        runner=runner,
+                        cwd=workspace,
+                    )
+                    issue_source.release(issue.number)
+                    cancellation.in_flight = None
+                    delete_local_branch(
+                        issue_branch_name(issue), runner=runner, cwd=workspace
+                    )
+                    outcome.succeeded = False
+                    outcome.stopping_point = f"Item #{issue.number} Setup"
+                    outcome.setup_failure = exc.failure
+                    _append_log(fixture_dir, run_id, outcome.stopping_point)
+                    if not outcome.completed:
+                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                        delete_local_branch(run_branch, runner=runner, cwd=workspace)
+                        return outcome
+                    break
                 except Exception as exc:  # handled infrastructure boundary
                     cleanup_worktree(
                         worktree_root / f"issue-{issue.number}",
@@ -1678,36 +1636,35 @@ def run_batch(
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
-                    setup(run_worktree)
                     if run_definition.after is not None:
                         if verbose:
                             runtime.transcript_sink = _run_transcript_sink(  # type: ignore[attr-defined]
                                 fixture_dir, run_id, "after-Run"
                             )
-                        after = _walk_run_graph(
-                            run_definition.after,
+                        after, run_gate = _walk_execution_graph(
+                            None,
                             runtime=runtime,
-                            run=run,
+                            worktree=run_worktree,
+                            graph=run_definition.after,
+                            execution=execution,
                             context=render_run_context(
                                 run_id, selected, outcome.issues
                             ),
-                            scope="after-Run",
+                            scope="run",
+                            identity="after-run",
+                            checkpoint=lambda node: _checkpoint_run_node(
+                                node, run=run, scope="after-Run"
+                            ),
                         )
                         if after.terminal is HUMAN:
                             outcome.succeeded = False
                             outcome.stopping_point = "after-Run HUMAN"
-                    run_gate = gate_check(run_worktree)
-                    (_telemetry_dir(fixture_dir, run_id) / "run-gate.log").write_text(
-                        run_gate.output
-                    )
-                    if not run_gate.passed:
-                        outcome.succeeded = False
-                        outcome.stopping_point = "Run Gate"
         except SetupError as exc:
             suppress_report_harvest = True
             if outcome.succeeded:
                 outcome.succeeded = False
                 outcome.stopping_point = "after-Run Setup"
+                outcome.setup_failure = exc.failure
             _append_log(fixture_dir, run_id, f"After-Run Setup failed: {exc}")
             try:
                 _discard_incomplete_run_scope(run)
@@ -1748,6 +1705,7 @@ def run_batch(
             publication_error=publication_error,
             successful=outcome.succeeded,
             stopping_point=outcome.stopping_point,
+            setup_failure=outcome.setup_failure,
         )
         outcome.pr_opened = publication.pr_opened
         outcome.pr_ready = publication.pr_ready
@@ -1783,6 +1741,7 @@ def _open_pull_request(
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
+    setup_failure: SetupFailure | None = None,
 ) -> PublicationOutcome:
     """Final-push, draft-create, report, then ready a successful Run PR."""
     if not _push_run_branch(run=run, final=True):
@@ -1917,9 +1876,19 @@ def _open_pull_request(
     state = "complete" if successful else "draft"
     gate_line = "not run"
     if gate is not None:
+        termination = gate.termination or {}
+        kind = termination.get("kind")
+        if kind == "signaled":
+            result = f"signal {termination.get('signal')}"
+        elif kind == "launch_error":
+            result = f"launch error {termination.get('error_kind', 'unknown')}"
+        else:
+            result = (
+                f"exit {termination['code']}" if "code" in termination else "unknown"
+            )
         gate_line = (
             f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
-            f"(exit {gate.exit_code}, {gate.duration_seconds:.2f}s)"
+            f"({result}, {gate.duration_seconds:.2f}s)"
         )
     selected_numbers = [issue.number for issue in selected]
     marker = f"<!-- pycastle-run-report:{run.run_id} -->"
@@ -1933,6 +1902,20 @@ def _open_pull_request(
     )
     if stopping_point:
         comment += f"- Stopping point: {stopping_point}\n"
+    if setup_failure is not None:
+        termination = setup_failure.termination
+        kind = termination.get("kind")
+        if kind == "exited":
+            setup_result = f"exit {termination.get('code')}"
+        elif kind == "signaled":
+            setup_result = f"signal {termination.get('signal')}"
+        elif kind == "launch_error":
+            setup_result = f"launch error {termination.get('error_kind', 'unknown')}"
+        elif kind == "record_persistence_error":
+            setup_result = "record persistence error"
+        else:
+            setup_result = "orchestration error"
+        comment += f"- Setup: `{setup_failure.command}` — {setup_result}\n"
     if publication_error:
         comment += f"\n> Run report validation error: {publication_error}\n"
     elif report is not None:
@@ -2053,11 +2036,11 @@ def _push_run_branch(
     run: RunContext,
     final: bool,
     scope: str = "Run",
-    phase: str | None = None,
+    node: str | None = None,
 ) -> bool:
     """Push the current Run checkpoint, logging failures without raising."""
     argv = ["git", "push", "-u", "origin", run.branch]
-    phase_name = phase or ("final-push" if final else "durability-push")
+    node_name = node or ("final-push" if final else "durability-push")
     try:
         result = run.runner(
             argv,
@@ -2069,7 +2052,7 @@ def _push_run_branch(
             _record_host_command_failure(
                 run,
                 scope=scope,
-                phase=phase_name,
+                node=node_name,
                 argv=argv,
                 result=result,
             )
@@ -2078,7 +2061,7 @@ def _push_run_branch(
         _record_host_command_exception(
             run,
             scope=scope,
-            phase=phase_name,
+            node=node_name,
             argv=argv,
             exc=exc,
         )

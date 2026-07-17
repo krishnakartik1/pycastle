@@ -17,8 +17,6 @@ from .compatibility import FixtureCompatibilityError
 from .issues import GitHubIssueSource
 from .orchestrator import (
     PruneError,
-    make_fixture_gate_check,
-    make_fixture_setup,
     prune_run_branches,
 )
 from .orchestrator import run_batch as run_loop
@@ -30,13 +28,13 @@ from .readiness import (
     AgentImagePreparationError,
     DefaultReadinessAdapter,
     ReadinessConfiguration,
+    ReadinessOutcome,
     ReadinessReport,
     Status,
     evaluate_readiness,
     prepare_agent_image,
     render_human,
     render_json,
-    resolve_agent_image_name,
 )
 from .runtime import ClaudeRuntime, CodexRuntime, Runtime, make_runtime
 from .scaffold import (
@@ -73,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("host", "docker"),
         default=None,
         help=(
-            "Default Sandbox recorded in the Project fixture. When omitted, "
-            "init prompts; an empty answer or unavailable stdin defaults to host."
+            "Sandbox recorded in the Project fixture. When omitted from an "
+            "attached terminal, init requires an explicit host or Docker choice."
         ),
     )
     sub.add_parser("upgrade", help="Migrate this repo's Project fixture")
@@ -87,26 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also delete Run branches with no associated pull request",
     )
 
-    sandbox = sub.add_parser("sandbox", help="Manage the Docker agent sandbox")
-    sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
-    setup = sandbox_sub.add_parser(
-        "setup", help="Log a runtime into its Docker auth volume (coming soon)"
-    )
-    setup.add_argument("--runtime", choices=RUNTIMES, default="claude")
-    setup.add_argument(
-        "--image",
-        default=None,
-        help=(
-            "Agent image to onboard auth against (bring-your-own-image). When "
-            "omitted, .pycastle/Dockerfile is built on demand into a "
-            "content-addressed tag -- the same image `run` uses. With neither a "
-            "Dockerfile nor --image present, setup errors (run `pycastle init`)."
-        ),
-    )
-    sandbox_sub.add_parser(
-        "build",
-        help="Build .pycastle/Dockerfile into its content-addressed agent image",
-    )
+    runtime_parser = sub.add_parser("runtime", help="Manage a Runtime")
+    runtime_sub = runtime_parser.add_subparsers(dest="runtime_command", required=True)
+    login = runtime_sub.add_parser("login", help="Explicitly authenticate a Runtime")
+    login.add_argument("--runtime", choices=RUNTIMES, default="claude")
+    login.add_argument("--sandbox", choices=("host", "docker"), default=None)
 
     doctor_parser = sub.add_parser(
         "doctor", help="Check one Run configuration without starting a Run"
@@ -116,7 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--assignee", type=_non_empty, default="@me")
     doctor_parser.add_argument("-u", "--include-unassigned", action="store_true")
     doctor_parser.add_argument("--sandbox", choices=("host", "docker"), default=None)
-    doctor_parser.add_argument("--image", type=_non_empty, default=None)
     doctor_parser.add_argument("--json", action="store_true")
 
     run_parser = sub.add_parser("run", help="Run the autonomous loop")
@@ -150,8 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help=(
-            "Capture and surface the agent's thinking/reasoning trace, live as "
-            "[THINKING:<phase>] lines and persisted under "
+            "Capture and surface the Runtime reasoning trace, live as "
+            "[THINKING:<node>] lines and persisted under "
             ".pycastle/runs/<run_id>/. High-volume; off by default."
         ),
     )
@@ -160,19 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("host", "docker"),
         default=None,
         help=(
-            "Where the runtime runs: on the host or inside the Docker agent "
-            "sandbox. Defaults to the choice recorded in .pycastle/sandbox at "
-            "init time, or host when that marker is absent."
-        ),
-    )
-    run_parser.add_argument(
-        "--image",
-        type=_non_empty,
-        default=None,
-        help=(
-            "Agent image to run in the Docker sandbox (bring-your-own-image). "
-            "When omitted, .pycastle/Dockerfile is built on demand into a "
-            "content-addressed tag, else the default tag is used."
+            "Sandbox for Runtime nodes. When omitted, use the explicit choice "
+            "recorded in .pycastle/sandbox; a missing or invalid marker fails "
+            "Run readiness."
         ),
     )
     return parser
@@ -205,66 +177,13 @@ def _resolve_assignee(login: str) -> str:
 
 
 def _resolve_sandbox(flag: str | None) -> str:
-    """Resolve the effective sandbox for a run: flag, then marker, then host.
-
-    An explicit ``--sandbox`` flag wins. With no flag, the choice
-    ``pycastle init`` recorded in ``.pycastle/sandbox`` is used. A missing,
-    empty, or unrecognised marker falls back to ``host`` so a run never crashes
-    on a garbled marker -- only ``host`` and ``docker`` are honoured.
-    """
+    """Resolve an explicit flag or exact fixture marker, without a default."""
     if flag is not None:
         return flag
     recorded = read_sandbox(FIXTURE_DIR)
     if recorded in ("host", "docker"):
         return recorded
-    return "host"
-
-
-def _build_image_for_dockerfile(dockerfile_text: str, fixture_dir: Path) -> str:
-    """Build ``fixture_dir``'s Dockerfile into its content-addressed tag if absent.
-
-    Derives the tag from the recipe text (ADR-0005), then builds only when the
-    tag is not already present. A successful ``docker image inspect <tag>``
-    (exit 0) means the cached image exists and the build is skipped; any
-    non-zero exit is treated as "absent → build", and that one ``docker build``
-    is the only build invoked. Returns the resolved tag.
-    """
-    # Preserve this established API while delegating to the one readiness/Run
-    # preparation path. The text argument is retained for compatibility and is
-    # validated against the canonical fixture recipe.
-    if sandbox.image_tag_for_dockerfile(dockerfile_text) != resolve_agent_image_name(
-        None, fixture_dir
-    ):
-        raise PreflightError("Dockerfile content changed during image resolution.")
-    try:
-        return prepare_agent_image(None, fixture_dir, runner=run_cmd)
-    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
-        raise PreflightError(
-            "Failed to build the Agent image; fix the Dockerfile and retry."
-        ) from error
-
-
-def _resolve_agent_image(image_flag: str | None, fixture_dir: Path) -> str:
-    """Resolve the agent image for a Docker run by ADR-0005's precedence.
-
-    1. ``image_flag`` given → return it verbatim. The Dockerfile is never read
-       and ``docker`` is never invoked (pure bring-your-own-image). An empty or
-       whitespace-only flag raises :class:`PreflightError`: it would otherwise
-       slot into the ``docker run`` argv as the image name, shifting the real
-       inner argv and failing opaquely deep in ``docker run``.
-    2. No flag, ``fixture_dir/Dockerfile`` exists → build it on demand into its
-       content-addressed tag (skipping the build when the tag already exists)
-       and return that tag.
-    3. No flag, no Dockerfile → fall back to :data:`sandbox.DEFAULT_IMAGE`.
-
-    Only ever called for a Docker run; a host run never resolves an image.
-    """
-    try:
-        return prepare_agent_image(image_flag, fixture_dir, runner=run_cmd)
-    except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as error:
-        raise PreflightError(
-            "Failed to prepare the Agent image; fix the Dockerfile or --image."
-        ) from error
+    return ""
 
 
 def _build_runtime(
@@ -272,15 +191,15 @@ def _build_runtime(
     sandbox_kind: str,
     workspace: Path,
     *,
-    image: str = sandbox.DEFAULT_IMAGE,
+    image: str | None = None,
     verbose: bool = False,
 ) -> Runtime:
     """Build the Runtime for a run, sandboxed in Docker when asked.
 
-    ``--sandbox docker`` wraps each phase's inner agent argv into a
+    ``--sandbox docker`` wraps each node's inner Runtime argv into a
     ``docker run`` argv, so both the Runtime and the commands it invokes run
-    inside the agent container. ``image`` is the already-resolved agent image
-    (see :func:`_resolve_agent_image`) and is threaded into the docker wrapper.
+    inside the Agent image. ``image`` is the immutable identity pinned by Run
+    readiness and is threaded into the Docker wrapper.
     Both Claude and Codex support this; every other combination runs the runtime
     on the host as before. The docker-vs-host choice is orthogonal to which
     runtime runs.
@@ -290,11 +209,13 @@ def _build_runtime(
     the ``Runtime.run`` signature stays unchanged. The per-issue transcript sink
     is bound later by the orchestrator (which owns ``run_id`` and the issue
     number); here the runtime is built only with ``verbose`` so live
-    ``[THINKING:<phase>]`` and ``[OUTPUT:<phase>]`` surfacing turns on. With
+    ``[THINKING:<node>]`` and ``[OUTPUT:<node>]`` surfacing turns on. With
     ``verbose`` off the host path stays the bare :func:`make_runtime` runtime, so
     nothing changes.
     """
     if sandbox_kind == "docker":
+        if image is None:
+            raise ValueError("Docker Runtime requires a pinned Agent image")
         if runtime_name == "claude":
             return ClaudeRuntime.in_docker(
                 workspace=workspace, image=image, verbose=verbose
@@ -337,14 +258,6 @@ def _non_empty(value: str) -> str:
 def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration:
     """Resolve Doctor/Run inputs once using the shared CLI defaults."""
     sandbox_kind = _resolve_sandbox(args.sandbox)
-    image: str | None = None
-    if sandbox_kind == "docker":
-        if args.image is not None:
-            if not args.image.strip():
-                raise PreflightError("The --image value is empty.")
-            image = args.image
-        else:
-            image = resolve_agent_image_name(None, FIXTURE_DIR)
 
     def resolve(argv: list[str]) -> str:
         try:
@@ -381,7 +294,7 @@ def _readiness_configuration(args: argparse.Namespace) -> ReadinessConfiguration
         github_default_branch=default_branch or None,
         runtime=args.runtime,
         sandbox=sandbox_kind,
-        agent_image=image,
+        agent_image=None,
         assignee=assignee,
         include_unassigned=args.include_unassigned,
         item_limit=args.iterations,
@@ -393,7 +306,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     report = _evaluate_cli_readiness(args)
     output = render_json(report) if args.json else render_human(report)
     print(output)
-    return 0 if report.ready else 1
+    return 0 if report.outcome is not ReadinessOutcome.NOT_READY else 1
 
 
 def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
@@ -407,7 +320,6 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
     with DefaultReadinessAdapter(
         FIXTURE_DIR,
         Path.cwd(),
-        image_flag=args.image,
         include_item_content=args.command == "run",
         # Human Doctor may show a first build's progress. Run and JSON keep
         # child output captured so stdout remains a single report document.
@@ -431,22 +343,18 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
         )
 
 
-def _run_can_preserve_empty_batch_noop(report: ReadinessReport) -> bool:
-    """Return whether the sole readiness failure is Run's intentional empty no-op."""
-    failures = [
-        check
-        for check in report.checks
-        if check.status in {Status.FAIL, Status.BLOCKED}
-    ]
-    return (
-        len(failures) == 1
-        and failures[0].id == "eligible_items"
-        and failures[0].facts.get("count") == 0
-    )
-
-
 def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
     """Return whether every eligible Item has matching Run-only content."""
+    frozen = report.frozen_inputs
+    if frozen is None or frozen.items != report.selected_items:
+        return False
+    configuration = report.configuration
+    if (
+        frozen.sandbox != configuration.sandbox
+        or frozen.runtime != configuration.runtime
+        or frozen.agent_image != configuration.agent_image
+    ):
+        return False
     if len(report.selected_items) != len(report.eligible_items):
         return False
     return all(
@@ -459,31 +367,24 @@ def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle run``: work up to ``--iterations`` issues into one PR."""
-    workspace = Path.cwd()
     # Readiness is deliberately the first Run operation. It may prepare a
-    # content-addressed Agent image, but creates no Run ID, record, branch,
-    # worktree, claim, phase, Setup invocation, or ordinary Gate invocation.
+    # canonical Agent image, but creates no Run ID, record, branch,
+    # worktree, claim, node, Setup invocation, or ordinary Gate invocation.
     report = _evaluate_cli_readiness(args)
-    if _run_can_preserve_empty_batch_noop(report):
+    if report.outcome is ReadinessOutcome.NO_WORK:
         logger.info("Nothing to do.")
         return 0
-    if not report.ready:
+    if report.outcome is ReadinessOutcome.NOT_READY:
         for check in report.checks:
             if check.status in {Status.FAIL, Status.BLOCKED}:
                 logger.error("Readiness %s: %s", check.id, check.summary)
         return 1
     if not _run_has_complete_frozen_batch(report):
-        logger.error("Readiness did not return a complete frozen Item batch.")
+        logger.error("Readiness did not return a complete matching frozen snapshot.")
         return 1
 
     configuration = report.configuration
-    # Resolve the agent image once, before the run loop, so a missing image is
-    # built exactly once rather than per iteration. Resolution is docker-only.
-    # The single --sandbox flag drives BOTH the runtime and the gate onto the
-    # same side (#28): under docker the gate runs inside the SAME resolved agent
-    # image as the phases, wrapped through the same sandbox wrapper; under host it
-    # runs as a host subprocess (unchanged). Building the gate-check here, in the
-    # branch that already resolves the image, keeps them in lockstep.
+    workspace = Path.cwd()
     if configuration.sandbox == "docker":
         image = configuration.agent_image
         if image is None:  # Defensive: a ready Docker report always has an image.
@@ -495,20 +396,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             image=image,
             verbose=args.verbose,
         )
-        gate_check = make_fixture_gate_check(
-            FIXTURE_DIR,
-            sandbox="docker",
-            image=image,
-            runtime_name=configuration.runtime,
-            workspace=workspace,
-        )
-        setup = make_fixture_setup(
-            FIXTURE_DIR,
-            sandbox="docker",
-            image=image,
-            runtime_name=configuration.runtime,
-            workspace=workspace,
-        )
     else:
         runtime = _build_runtime(
             configuration.runtime,
@@ -516,8 +403,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             workspace,
             verbose=args.verbose,
         )
-        gate_check = make_fixture_gate_check(FIXTURE_DIR)
-        setup = make_fixture_setup(FIXTURE_DIR)
     repo = configuration.repository
     base_branch = configuration.base_branch
     assignee = configuration.assignee
@@ -534,9 +419,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=_make_run_id(),
         iterations=configuration.item_limit,
         include_unassigned=configuration.include_unassigned,
-        gate_check=gate_check,
-        setup=setup,
         verbose=args.verbose,
+        frozen_inputs=report.frozen_inputs,
     )
     if not outcome.selected:
         logger.info("Nothing to do.")
@@ -565,149 +449,79 @@ def _cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_sandbox_setup(args: argparse.Namespace) -> int:
-    """Dispatch ``pycastle sandbox setup``: onboard a runtime's Docker auth.
-
-    Both Claude and Codex log into their per-Runtime auth volume. Credential
-    contents are never read or printed.
-
-    Claude runs the interactive browser login and then confirms auth from a
-    *fresh* container by having the agent answer a one-word prompt; the login
-    needs a TTY and the headless token fallback is documented in
-    :mod:`pycastle.sandbox`.
-
-    Codex runs the device-authorization login (``codex login --device-auth``),
-    which prints a code and a verification URL and polls in the background — no
-    localhost callback and no TTY. The flow's own zero exit is the success
-    signal, so no fresh-container status check is run.
-
-    The auth image is resolved through the *same* :func:`_resolve_agent_image`
-    path ``run`` uses, so setup onboards auth against the exact image a run will
-    drive (ADR-0006). With no ``--image`` and no ``.pycastle/Dockerfile`` there
-    is no buildable image, so setup errors with guidance (``pycastle init``)
-    rather than onboarding auth against the unbuildable default tag -- the one
-    place setup diverges from ``run``'s precedence, which there falls back to the
-    default image.
-    """
-    if args.image is None and not (FIXTURE_DIR / DOCKERFILE_NAME).is_file():
-        logger.error(
-            "No %s found and no --image given; run `pycastle init` to scaffold "
-            "a Project fixture with an agent Dockerfile first, or pass --image.",
-            FIXTURE_DIR / DOCKERFILE_NAME,
-        )
+def _cmd_runtime_login(args: argparse.Namespace) -> int:
+    """Run the selected Runtime's explicit native authentication flow."""
+    if args.runtime == "stub":
+        logger.error("The Stub Runtime does not support login.")
+        return 2
+    sandbox_kind = _resolve_sandbox(args.sandbox)
+    if sandbox_kind not in {"host", "docker"}:
+        logger.error("Select host or docker, or record it in .pycastle/sandbox.")
+        return 2
+    convention = sandbox.RUNTIME_CONFIG[args.runtime]
+    if sandbox_kind == "host":
+        result = run_cmd(list(convention.login_args))
+    else:
+        try:
+            image = prepare_agent_image(
+                FIXTURE_DIR, runner=run_cmd, cwd=Path.cwd(), capture_build=False
+            )
+        except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as exc:
+            raise PreflightError(
+                "Failed to build and pin the canonical Agent image."
+            ) from exc
+        result = run_cmd(sandbox.build_login_command(args.runtime, image=image))
+    if getattr(result, "returncode", 1) != 0:
+        logger.error("Runtime login failed.")
         return 1
-    image = _resolve_agent_image(args.image, FIXTURE_DIR)
-    if args.runtime == "codex":
-        return _setup_codex(image)
-    if args.runtime == "claude":
-        return _setup_claude(image)
-    logger.error(
-        "`pycastle sandbox setup --runtime %s` is not supported.", args.runtime
-    )
-    return 2
-
-
-def _cmd_sandbox_build(_args: argparse.Namespace) -> int:
-    """Dispatch ``pycastle sandbox build``: build the Dockerfile's agent image.
-
-    Builds ``.pycastle/Dockerfile`` into its content-addressed tag via the same
-    build path a Docker run takes implicitly (see
-    :func:`_build_image_for_dockerfile`), so there is one build path, not two.
-    Errors with guidance and a non-zero exit when no Dockerfile is present,
-    rather than silently falling back to the default image.
-    """
-    dockerfile = FIXTURE_DIR / DOCKERFILE_NAME
-    if not dockerfile.is_file():
-        logger.error(
-            "No %s found; run `pycastle init` to scaffold a Project fixture "
-            "with an agent Dockerfile first.",
-            dockerfile,
-        )
-        return 1
-    tag = _build_image_for_dockerfile(dockerfile.read_text(), FIXTURE_DIR)
-    logger.info("The agent image %s is built and ready.", tag)
+    logger.info("The %s Runtime login completed.", args.runtime)
     return 0
 
 
-def _setup_claude(image: str) -> int:
-    """Run the Claude browser login, then confirm auth from a fresh container.
-
-    ``image`` is the already-resolved agent image (the same one ``run`` uses;
-    see :func:`_resolve_agent_image`); both the login and the fresh-container
-    status check run against it. The per-Runtime auth *volume* is independent of
-    the image and shared across projects (ADR-0002), so credentials onboarded
-    here are reused by every run, whatever image it resolves.
-    """
-    logger.info(
-        "Logging the claude runtime into volume %s", sandbox.auth_volume("claude")
-    )
-    login = run_cmd(sandbox.build_login_command("claude", image=image))
-    if getattr(login, "returncode", 1) != 0:
-        logger.error("Login failed; the auth volume was not onboarded.")
-        return 1
-
-    logger.info("Confirming auth from a fresh container...")
-    status = run_cmd(sandbox.build_status_command("claude", image=image))
-    if getattr(status, "returncode", 1) != 0:
-        logger.error("Fresh-container auth check failed; credentials are not usable.")
-        return 1
-
-    logger.info("The claude runtime is authenticated and ready.")
-    return 0
-
-
-def _setup_codex(image: str) -> int:
-    """Run the Codex device-authorization login into its auth volume.
-
-    ``image`` is the already-resolved agent image (the same one ``run`` uses;
-    see :func:`_resolve_agent_image`); the login runs against it. The per-Runtime
-    auth *volume* is independent of the image and shared across projects
-    (ADR-0002), so the onboarded credentials are reused by every run.
-    """
-    logger.info(
-        "Logging the codex runtime into volume %s via the device-authorization "
-        "flow; follow the printed code and URL to finish.",
-        sandbox.auth_volume("codex"),
-    )
-    login = run_cmd(sandbox.build_login_command("codex", image=image))
-    if getattr(login, "returncode", 1) != 0:
-        logger.error("Device-authorization login failed; the volume was not onboarded.")
-        return 1
-
-    logger.info("The codex runtime is authenticated and ready.")
-    return 0
+class SandboxSelectionError(Exception):
+    """Raised when initialization cannot obtain an explicit Sandbox choice."""
 
 
 def _prompt_sandbox() -> SandboxChoice:
-    """Ask whether execution is host-first or Docker-first; default to host.
-
-    The default is host-first because it needs no Docker image build to run the
-    scaffolded fixture. An empty answer (Enter) takes the default; ``docker``
-    (or ``d``) picks Docker-first. End-of-file is treated like an empty answer
-    so non-interactive callers retain the host default.
-    """
-    try:
-        answer = (
-            input("Execution: [H]ost-first or [d]ocker-first? [H] ").strip().lower()
-        )
-    except EOFError:
-        answer = ""
-    return "docker" if answer in {"docker", "d"} else "host"
+    """Prompt until an attached maintainer explicitly chooses host or Docker."""
+    while True:
+        try:
+            answer = input("Sandbox: [h]ost or [d]ocker? ").strip().lower()
+        except EOFError as exc:
+            raise SandboxSelectionError from exc
+        if answer in {"host", "h"}:
+            return "host"
+        if answer in {"docker", "d"}:
+            return "docker"
+        logger.error("Choose 'host' or 'docker'.")
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
     """Dispatch ``pycastle init``: scaffold the Project fixture into the cwd.
 
-    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts for
-    host-first vs Docker-first when omitted. Refuses to clobber an existing
+    Uses an explicit ``--sandbox`` choice without reading stdin, or prompts an
+    attached maintainer for host or Docker when omitted. Refuses to clobber an existing
     ``.pycastle/`` so a project's prompts, gate, and graph shape are never
     silently replaced.
     """
-    choice = (
-        cast(SandboxChoice, args.sandbox)
-        if args.sandbox is not None
-        else _prompt_sandbox()
-    )
+    if args.sandbox is not None:
+        choice = cast(SandboxChoice, args.sandbox)
+    else:
+        if not sys.stdin.isatty():
+            logger.error(
+                "A Sandbox choice is required for non-interactive initialization. "
+                "Run `pycastle init --sandbox host` or "
+                "`pycastle init --sandbox docker`."
+            )
+            return 2
+        try:
+            choice = _prompt_sandbox()
+        except SandboxSelectionError:
+            logger.error(
+                "No Sandbox was selected. Run `pycastle init --sandbox host` or "
+                "`pycastle init --sandbox docker`."
+            )
+            return 2
     try:
         written = scaffold_fixture(Path.cwd(), sandbox=choice)
     except FixtureExistsError as exc:
@@ -715,14 +529,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     logger.info(
-        "Scaffolded the PyCastle Project fixture (%s-first) into .pycastle/:",
+        "Scaffolded the PyCastle Project fixture (Sandbox: %s) into .pycastle/:",
         choice,
     )
     for path in written:
         logger.info("  %s", path.relative_to(Path.cwd()))
     logger.info(
-        "Edit .pycastle/prompts/, .pycastle/gate, and .pycastle/main.py to "
-        "customize the loop, then run `pycastle run`."
+        "Next: configure .pycastle/setup when durable preparation is needed; "
+        "replace the fail-closed .pycastle/gate with the project's verification "
+        "policy; for Docker use, extend .pycastle/Dockerfile at the project "
+        "toolchain section; then review and commit the complete .pycastle/ "
+        "Project fixture."
     )
     return 0
 
@@ -754,9 +571,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     required = ["git", "gh"]
     if args.command in {"run", "doctor"}:
-        # Resolve the effective sandbox (flag -> .pycastle/sandbox marker ->
-        # host) before preflight so the required-command set matches where the
-        # run will actually execute. The resolved value is written back onto
+        # Resolve the effective sandbox (flag -> .pycastle/sandbox marker)
+        # before readiness so the command inventory matches where the
+        # Run will execute. Invalid or missing selection remains empty and is
+        # reported by the shared evaluator. The value is written back onto
         # args so _cmd_run reads the same decision.
         args.sandbox = _resolve_sandbox(args.sandbox)
         if args.sandbox == "docker":
@@ -765,8 +583,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             required.append("docker")
         elif args.runtime in {"claude", "codex"}:
             required.append(args.runtime)
-    if args.command == "sandbox":
-        required.append("docker")
+    if args.command == "runtime" and args.runtime_command == "login":
+        selected = _resolve_sandbox(args.sandbox)
+        if args.runtime != "stub" and selected in {"host", "docker"}:
+            required.append("docker" if selected == "docker" else args.runtime)
     try:
         if args.command not in {"doctor", "run"}:
             check_required_commands(required)
@@ -780,10 +600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_upgrade()
         if args.command == "prune":
             return _cmd_prune(args)
-        if args.command == "sandbox":
-            if args.sandbox_command == "build":
-                return _cmd_sandbox_build(args)
-            return _cmd_sandbox_setup(args)
+        if args.command == "runtime":
+            return _cmd_runtime_login(args)
     except (
         FixtureCompatibilityError,
         FixtureUpgradeError,

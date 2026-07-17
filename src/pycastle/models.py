@@ -24,17 +24,17 @@ class TokenUsage(BaseModel):
 
 
 class Telemetry(BaseModel):
-    """A per-phase record of what a Runtime invocation cost and did.
+    """A per-node record of what a Runtime invocation cost and did.
 
     ``duration_ms`` is the runtime-reported wall time when it supplies one
     (Claude does); ``elapsed_ms`` is PyCastle's own measured wall time, used by
-    runtimes that do not report duration (Codex). ``thread_id`` is the resumable
-    conversation handle a runtime exposes for handoffs (Codex's thread id);
-    ``None`` when the runtime has no resume concept.
+    runtimes that do not report duration (Codex). ``thread_id`` is an opaque
+    provider identifier retained only for audit telemetry; PyCastle never uses
+    it to resume a later Runtime-node visit.
     """
 
     runtime: str
-    phase: str
+    node: str
     cost_usd: float | None = None
     duration_ms: int | None = None
     elapsed_ms: int | None = None

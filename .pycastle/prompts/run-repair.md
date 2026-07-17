@@ -1,5 +1,5 @@
-# Integrated Run Repair
+# Integrated Run repair
 
-Read `.pycastle/run-review.md`. Repair every actionable finding and add tests
-for integration defects. When there are no findings, make no changes. Do not
-mutate GitHub.
+The immediately preceding Run-scope Gate failed. Use its typed termination and
+bounded evidence, `.pycastle/run-review.md`, and the worktree to repair the Run.
+Commit changes. The graph will regenerate the report, then apply Gate again.

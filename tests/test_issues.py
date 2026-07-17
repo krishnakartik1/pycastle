@@ -233,6 +233,88 @@ def test_github_source_rejects_failed_list_commands(method: str) -> None:
         getattr(source, method)()
 
 
+@pytest.mark.parametrize(
+    ("state", "labels", "assignees", "include_unassigned", "expected"),
+    [
+        ("OPEN", ["ready-for-agent"], ["krishna"], False, True),
+        ("CLOSED", ["ready-for-agent"], ["krishna"], False, False),
+        ("OPEN", ["other"], ["krishna"], False, False),
+        ("OPEN", ["ready-for-agent"], ["other"], False, False),
+        ("OPEN", ["ready-for-agent"], [], False, False),
+        ("OPEN", ["ready-for-agent"], [], True, True),
+    ],
+)
+def test_github_source_rechecks_only_frozen_item_eligibility(
+    state: str,
+    labels: list[str],
+    assignees: list[str],
+    include_unassigned: bool,
+    expected: bool,
+) -> None:
+    payload = json.dumps(
+        {
+            "number": 42,
+            "state": state,
+            "labels": [{"name": label} for label in labels],
+            "assignees": [{"login": login} for login in assignees],
+        }
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    result = source.is_still_eligible(
+        IssueRef(number=42, title="frozen title", body="frozen body"),
+        assignee="krishna",
+        include_unassigned=include_unassigned,
+    )
+
+    assert result is expected
+    runner.assert_called_once_with(
+        [
+            "gh",
+            "issue",
+            "view",
+            "42",
+            "-R",
+            "owner/repo",
+            "--json",
+            "number,state,labels,assignees",
+        ],
+        capture=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        subprocess.CompletedProcess(args=[], returncode=1, stdout=""),
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="not-json"),
+        subprocess.CompletedProcess(args=[], returncode=0, stdout='{"number": 99}'),
+        subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"number": 42, "state": "OPEN", "labels": [null], "assignees": []}',
+        ),
+        subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"number": 42, "state": "OPEN", "labels": [], "assignees": [{}]}',
+        ),
+    ],
+)
+def test_github_source_recheck_failure_is_not_stale(result: object) -> None:
+    source = GitHubIssueSource("owner/repo", runner=MagicMock(return_value=result))
+
+    with pytest.raises(OSError, match="eligibility recheck failed"):
+        source.is_still_eligible(
+            IssueRef(number=42, title="Frozen"),
+            assignee="krishna",
+            include_unassigned=False,
+        )
+
+
 def test_github_source_claim_assigns_and_drops_label() -> None:
     runner = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0))
     source = GitHubIssueSource("owner/repo", runner=runner)

@@ -21,8 +21,8 @@ def _project(tmp_path: Path, marker: str = "1.0\n") -> tuple[Path, Path]:
     fixture = project / ".pycastle"
     (fixture / "prompts").mkdir(parents=True)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build, build_run, phase\n"
-        "run = build_run(item=build(start='work', phases=[phase('work', 'work.md')]))\n"
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "run = build_run(item=execution_graph(start='work', nodes=[runtime_node('work', 'work.md')]))\n"
     )
     (fixture / "prompts" / "work.md").write_text("work\n")
     (fixture / "gate").write_text("#!/bin/sh\nexit 0\n")
@@ -279,8 +279,8 @@ def test_fixture_validator_rejects_prompt_outside_prompts_directory(
     _, fixture = _project(tmp_path)
     (fixture / "outside.md").write_text("outside\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build, build_run, phase\n"
-        "run = build_run(item=build(start='work', phases=[phase('work', '../outside.md')]))\n"
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "run = build_run(item=execution_graph(start='work', nodes=[runtime_node('work', '../outside.md')]))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="outside prompts"):

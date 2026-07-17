@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +21,14 @@ from typing import Any
 from . import __version__, sandbox
 from .commands import command_exists, run_cmd
 from .compatibility import check_fixture_compatibility
-from .graph import PhaseGraph, RunDefinition, Terminal, load_run
+from .graph import (
+    ExecutionGraph,
+    GateNode,
+    RunDefinition,
+    RuntimeNode,
+    Terminal,
+    load_run,
+)
 from .issues import GitHubIssueSource, select_batch
 from .models import IssueRef
 
@@ -33,15 +43,15 @@ CHECK_IDS = (
     "fixture_compatibility",
     "fixture_structure",
     "sandbox",
-    "agent_image",
-    "runtime",
-    "runtime_authentication",
-    "gate_toolchain",
     "github_authentication",
     "github_repository",
     "github_permissions",
     "workflow_labels",
     "eligible_items",
+    "agent_image",
+    "frozen_execution_inputs",
+    "runtime",
+    "runtime_authentication",
 )
 
 
@@ -49,20 +59,7 @@ class AgentImagePreparationError(RuntimeError):
     """The resolved Agent image could not be prepared safely."""
 
 
-def resolve_agent_image_name(image_flag: str | None, fixture_dir: Path) -> str:
-    """Resolve ADR-0005 precedence without invoking Docker."""
-    if image_flag is not None:
-        if not image_flag.strip():
-            raise AgentImagePreparationError("The --image value is empty.")
-        return image_flag
-    dockerfile = fixture_dir / "Dockerfile"
-    if dockerfile.is_file():
-        return sandbox.image_tag_for_dockerfile(dockerfile.read_text())
-    return sandbox.DEFAULT_IMAGE
-
-
 def prepare_agent_image(
-    image_flag: str | None,
     fixture_dir: Path,
     *,
     runner: Callable[..., Any] = run_cmd,
@@ -71,32 +68,50 @@ def prepare_agent_image(
     inspect_timeout: float | None = None,
     build_timeout: float | None = None,
 ) -> str:
-    """Resolve and, when selected by Dockerfile, prepare Run's exact image."""
-    image = resolve_agent_image_name(image_flag, fixture_dir)
-    if image_flag is not None or not (fixture_dir / "Dockerfile").is_file():
-        return image
+    """Build the canonical Dockerfile and return its immutable image ID."""
+    dockerfile = fixture_dir / "Dockerfile"
+    if dockerfile.is_symlink() or not dockerfile.is_file():
+        raise AgentImagePreparationError(
+            "The canonical Dockerfile is missing or unsafe."
+        )
+    repository_root = Path(cwd or fixture_dir.parent).resolve()
+    image = f"pycastle-readiness:{uuid.uuid4().hex}"
     run_options: dict[str, Any] = {}
-    if cwd is not None:
-        run_options["cwd"] = cwd
-    inspect_options = dict(run_options)
-    if inspect_timeout is not None:
-        inspect_options["timeout"] = inspect_timeout
-    inspect = runner(
-        ["docker", "image", "inspect", image], capture=True, **inspect_options
-    )
-    if getattr(inspect, "returncode", 1) == 0:
-        return image
+    run_options["cwd"] = repository_root
     build_options = dict(run_options)
     if build_timeout is not None:
         build_options["timeout"] = build_timeout
     build = runner(
-        ["docker", "build", "-t", image, str(fixture_dir)],
+        [
+            "docker",
+            "build",
+            "--file",
+            str(dockerfile.resolve()),
+            "--tag",
+            image,
+            str(repository_root),
+        ],
         capture=capture_build,
         **build_options,
     )
     if getattr(build, "returncode", 1) != 0:
         raise AgentImagePreparationError("Agent image build failed.")
-    return image
+    inspect_options = dict(run_options)
+    if inspect_timeout is not None:
+        inspect_options["timeout"] = inspect_timeout
+    inspect = runner(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        capture=True,
+        **inspect_options,
+    )
+    identity = (getattr(inspect, "stdout", "") or "").strip()
+    if getattr(inspect, "returncode", 1) != 0 or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", identity
+    ):
+        raise AgentImagePreparationError(
+            "Docker did not resolve an immutable image ID."
+        )
+    return identity
 
 
 class Status(StrEnum):
@@ -104,6 +119,12 @@ class Status(StrEnum):
     FAIL = "fail"
     BLOCKED = "blocked"
     NOT_APPLICABLE = "not_applicable"
+
+
+class ReadinessOutcome(StrEnum):
+    READY = "ready"
+    NO_WORK = "no_work"
+    NOT_READY = "not_ready"
 
 
 @dataclass(frozen=True)
@@ -123,6 +144,30 @@ class ReadinessConfiguration:
 class EligibleItem:
     number: int
     title: str
+
+
+@dataclass(frozen=True)
+class FrozenFixtureFile:
+    relative_path: str
+    content: bytes = field(repr=False)
+    mode: int
+
+
+@dataclass(frozen=True)
+class FrozenProjectFixture:
+    identity: str
+    run_definition: RunDefinition = field(repr=False, compare=False)
+    files: tuple[FrozenFixtureFile, ...] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class FrozenReadinessInputs:
+    base_commit: str
+    project_fixture: FrozenProjectFixture
+    items: tuple[IssueRef, ...] = field(repr=False)
+    sandbox: str
+    runtime: str
+    agent_image: str | None
 
 
 @dataclass(frozen=True)
@@ -148,7 +193,7 @@ class ReadinessCheck:
 @dataclass(frozen=True)
 class ReadinessReport:
     schema_version: int
-    ready: bool
+    outcome: ReadinessOutcome
     runner_version: str
     configuration: ReadinessConfiguration
     checks: tuple[ReadinessCheck, ...]
@@ -157,10 +202,16 @@ class ReadinessReport:
     selected_items: tuple[IssueRef, ...] = field(
         default_factory=tuple, repr=False, compare=False
     )
+    frozen_inputs: FrozenReadinessInputs | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
 ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem | IssueRef]]
+InputFreezer = Callable[
+    [ReadinessConfiguration, tuple[IssueRef, ...]], FrozenReadinessInputs
+]
 Progress = Callable[[str, str, Status | None], None]
 
 
@@ -168,6 +219,7 @@ Progress = Callable[[str, str, Status | None], None]
 class ReadinessDependencies:
     probe: Probe
     eligible_items: ItemLoader
+    freeze_inputs: InputFreezer | None = None
 
 
 _PREREQUISITES: dict[str, tuple[str, ...]] = {
@@ -175,14 +227,25 @@ _PREREQUISITES: dict[str, tuple[str, ...]] = {
     "base_branch": ("git_repository",),
     "fixture_structure": ("fixture_compatibility",),
     "sandbox": ("fixture_compatibility",),
-    "agent_image": ("fixture_compatibility", "sandbox"),
-    "runtime": ("sandbox", "agent_image"),
-    "runtime_authentication": ("runtime",),
-    "gate_toolchain": ("fixture_structure", "sandbox", "agent_image"),
     "github_repository": ("github_authentication", "git_repository"),
     "github_permissions": ("github_authentication", "github_repository"),
     "workflow_labels": ("github_authentication", "github_repository"),
     "eligible_items": ("github_authentication", "github_repository"),
+    "agent_image": (
+        "fixture_compatibility",
+        "fixture_structure",
+        "sandbox",
+        "eligible_items",
+    ),
+    "frozen_execution_inputs": (
+        "base_branch",
+        "fixture_structure",
+        "sandbox",
+        "eligible_items",
+        "agent_image",
+    ),
+    "runtime": ("sandbox", "agent_image", "frozen_execution_inputs", "eligible_items"),
+    "runtime_authentication": ("runtime", "eligible_items"),
 }
 
 
@@ -197,6 +260,8 @@ def evaluate_readiness(
     outcomes: dict[str, Status] = {}
     items: list[EligibleItem] = []
     selected_items: tuple[IssueRef, ...] = ()
+    frozen_inputs: FrozenReadinessInputs | None = None
+    no_work = False
     for check_id in CHECK_IDS:
         if progress is not None:
             progress("start", check_id, None)
@@ -210,13 +275,45 @@ def evaluate_readiness(
                 and configuration.sandbox == "docker"
             )
         ]
-        if failed:
+        if no_work and check_id in {
+            "frozen_execution_inputs",
+            "agent_image",
+            "runtime",
+            "runtime_authentication",
+        }:
+            result = CheckResult(
+                Status.NOT_APPLICABLE,
+                "No eligible Items require execution coordination.",
+            )
+        elif failed:
             result = CheckResult(
                 Status.BLOCKED,
                 "Blocked by failed prerequisite(s): " + ", ".join(failed),
                 {"prerequisites": failed},
                 "Resolve the prerequisite checks, then run Doctor again.",
             )
+        elif check_id == "frozen_execution_inputs":
+            if dependencies.freeze_inputs is None:
+                result = CheckResult(Status.PASS, "Execution inputs are frozen.")
+            else:
+                try:
+                    frozen_inputs = dependencies.freeze_inputs(
+                        configuration, selected_items
+                    )
+                    result = CheckResult(
+                        Status.PASS,
+                        "Exact base, Project fixture, Item batch, and host configuration are frozen.",
+                        {
+                            "base_commit": frozen_inputs.base_commit,
+                            "fixture_identity": frozen_inputs.project_fixture.identity,
+                        },
+                    )
+                except (OSError, TypeError, ValueError):
+                    result = CheckResult(
+                        Status.FAIL,
+                        "Execution inputs could not be frozen safely.",
+                        remediation="Resolve the failed identity checks and retry Doctor.",
+                    )
         elif check_id == "eligible_items":
             try:
                 loaded_items = dependencies.eligible_items(configuration)
@@ -234,20 +331,12 @@ def evaluate_readiness(
                 items = [safe_items[index] for index in order]
                 if len(full_items) == len(loaded_items):
                     selected_items = tuple(full_items[index] for index in order)
-                result = (
-                    CheckResult(
-                        Status.PASS,
-                        f"{len(items)} eligible Item(s) selected.",
-                        {"count": len(items)},
-                    )
-                    if items
-                    else CheckResult(
-                        Status.FAIL,
-                        "No eligible Items match the resolved Run configuration.",
-                        {"count": 0},
-                        "Assign or label an Item ready-for-agent, or adjust the assignee policy.",
-                    )
+                result = CheckResult(
+                    Status.PASS,
+                    f"{len(items)} eligible Item(s) selected.",
+                    {"count": len(items)},
                 )
+                no_work = not items
             except (
                 AttributeError,
                 KeyError,
@@ -290,15 +379,22 @@ def evaluate_readiness(
         outcomes[check_id] = result.status
         if progress is not None:
             progress("complete", check_id, result.status)
-    ready = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
+    successful = all(c.status in {Status.PASS, Status.NOT_APPLICABLE} for c in checks)
+    if successful and no_work:
+        outcome = ReadinessOutcome.NO_WORK
+    elif successful:
+        outcome = ReadinessOutcome.READY
+    else:
+        outcome = ReadinessOutcome.NOT_READY
     return ReadinessReport(
         SCHEMA_VERSION,
-        ready,
+        outcome,
         __version__,
         configuration,
         tuple(checks),
         tuple(items),
         selected_items,
+        frozen_inputs,
     )
 
 
@@ -314,6 +410,10 @@ _FACT_KEYS: dict[str, dict[str, str]] = {
     "runtime": {"version": "text"},
     "workflow_labels": {"missing": "list"},
     "eligible_items": {"count": "integer"},
+    "frozen_execution_inputs": {
+        "base_commit": "text",
+        "fixture_identity": "text",
+    },
 }
 
 
@@ -391,7 +491,7 @@ def report_document(report: ReadinessReport) -> dict[str, Any]:
     }
     return {
         "schema_version": report.schema_version,
-        "ready": report.ready,
+        "outcome": report.outcome.value,
         "runner_version": report.runner_version,
         "configuration": configuration,
         "checks": [
@@ -446,7 +546,7 @@ def render_human(report: ReadinessReport) -> str:
         else ""
     )
     lines = [
-        f"PyCastle Doctor: {'ready' if report.ready else 'not ready'}",
+        f"PyCastle Doctor: {report.outcome.value.replace('_', ' ')}",
         f"Repository: {repository}",
         f"Base branch: {base_branch} "
         f"(GitHub default: {github_default or 'unknown'})",
@@ -471,7 +571,6 @@ class DefaultReadinessAdapter:
         *,
         runner: Callable[..., Any] = run_cmd,
         exists: Callable[[str], bool] = command_exists,
-        image_flag: str | None = None,
         include_item_content: bool = False,
         stream_image_build: bool = False,
         cleanup_reporter: Callable[[str], None] | None = None,
@@ -480,11 +579,12 @@ class DefaultReadinessAdapter:
         self.workspace = workspace
         self.runner = runner
         self.exists = exists
-        self.image_flag = image_flag
         self.include_item_content = include_item_content
         self.stream_image_build = stream_image_build
         self.cleanup_reporter = cleanup_reporter
         self._docker_workspace: Path | None = None
+        self._base_commit: str | None = None
+        self._project_fixture: FrozenProjectFixture | None = None
 
     def __enter__(self) -> DefaultReadinessAdapter:
         return self
@@ -508,10 +608,10 @@ class DefaultReadinessAdapter:
             self._docker_workspace = Path(
                 tempfile.mkdtemp(prefix="pycastle-doctor-")
             ).resolve()
-            # Docker always runs as the canonical ``node`` user, whose uid may
-            # differ from the host caller that owns this directory. This path
-            # holds no repository or credential data, so allow that user to
-            # traverse and write the disposable bind mount.
+            # The image-declared user may have a uid different from the host
+            # caller that owns this directory. This path holds no repository or
+            # credential data, so allow that user to traverse and write the
+            # disposable bind mount.
             self._docker_workspace.chmod(0o777)
         return self._docker_workspace
 
@@ -527,11 +627,13 @@ class DefaultReadinessAdapter:
     ) -> list[str]:
         if config.sandbox == "host":
             return inner_argv
+        if not config.agent_image:
+            raise AgentImagePreparationError("Agent image has not been pinned")
         return sandbox.build_run_command(
             config.runtime,
             inner_argv=inner_argv,
             workspace=self._readiness_workspace(),
-            image=config.agent_image or sandbox.DEFAULT_IMAGE,
+            image=config.agent_image,
         )
 
     @staticmethod
@@ -626,12 +728,26 @@ class DefaultReadinessAdapter:
                 f"refs/heads/{config.base_branch}",
             ]
         )
+        lines = (getattr(result, "stdout", "") or "").splitlines()
+        expected_ref = f"refs/heads/{config.base_branch}"
+        parsed = [line.split() for line in lines]
+        exact = [
+            parts for parts in parsed if len(parts) == 2 and parts[1] == expected_ref
+        ]
+        commit = exact[0][0] if len(exact) == 1 else ""
+        valid_commit = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", commit))
+        if self._ok(result) and valid_commit:
+            self._base_commit = commit.lower()
         return (
-            CheckResult(Status.PASS, "Selected base branch exists on origin.", facts)
-            if self._ok(result)
+            CheckResult(
+                Status.PASS,
+                "Selected remote base resolved to one exact commit.",
+                {**facts, "commit": self._base_commit},
+            )
+            if self._base_commit
             else CheckResult(
                 Status.FAIL,
-                "Selected base branch is not reachable on origin.",
+                "Selected base branch did not resolve to one exact remote commit.",
                 facts,
                 "Push the selected base branch or choose an existing remote branch.",
             )
@@ -664,6 +780,9 @@ class DefaultReadinessAdapter:
             sys.dont_write_bytecode = True
             definition = load_run(self.fixture_dir)
             _validate_run_definition(definition, self.fixture_dir)
+            self._project_fixture = _freeze_project_fixture(
+                self.fixture_dir, definition
+            )
         finally:
             sys.dont_write_bytecode = old
         return CheckResult(
@@ -686,17 +805,8 @@ class DefaultReadinessAdapter:
             return CheckResult(
                 Status.NOT_APPLICABLE, "Host Sandbox uses no Agent image."
             )
-        if not config.agent_image:
-            return CheckResult(
-                Status.FAIL,
-                "No Agent image was resolved.",
-                remediation="Provide --image or add .pycastle/Dockerfile.",
-            )
-        # Explicit-image provenance is authoritative: never even stat/read the
-        # Project Dockerfile in bring-your-own-image mode.
         try:
             prepared = prepare_agent_image(
-                self.image_flag,
                 self.fixture_dir,
                 runner=self.runner,
                 cwd=self.workspace,
@@ -704,14 +814,12 @@ class DefaultReadinessAdapter:
                 inspect_timeout=SHORT_TIMEOUT,
                 build_timeout=IMAGE_BUILD_TIMEOUT,
             )
-            if prepared != config.agent_image:
-                raise AgentImagePreparationError("resolved image changed")
+            object.__setattr__(config, "agent_image", prepared)
         except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired):
             return CheckResult(
                 Status.FAIL,
                 "Agent image could not be prepared.",
-                {"image": config.agent_image},
-                "Fix .pycastle/Dockerfile or provide a valid --image, then retry.",
+                remediation="Fix .pycastle/Dockerfile and retry.",
             )
         runtime_config = sandbox.RUNTIME_CONFIG.get(config.runtime)
         if runtime_config is None:
@@ -726,8 +834,9 @@ class DefaultReadinessAdapter:
         script = r"""set -eu
 cleanup() { rm -f "${auth_file:-}" "${workspace_file:-}"; }
 trap cleanup EXIT HUP INT TERM
-test "$(id -un)" = node
-test "$HOME" = /home/node
+test "$(id -u)" != 0
+test -n "${HOME:-}"
+test -w "$HOME"
 command -v "$runtime" >/dev/null
 eval "config_value=\${$config_env-}"
 test "$config_value" = "$config_dir"
@@ -756,20 +865,20 @@ test -w "$workspace_file"
             config.runtime,
             inner_argv=inner,
             workspace=self._readiness_workspace(),
-            image=config.agent_image,
+            image=prepared,
         )
         result = self._run(argv)
         return (
             CheckResult(
                 Status.PASS,
                 "Agent image satisfies the runtime contract.",
-                {"image": config.agent_image},
+                {"image": prepared},
             )
             if self._ok(result)
             else CheckResult(
                 Status.FAIL,
                 "Agent image does not satisfy the runtime contract.",
-                {"image": config.agent_image},
+                {"image": prepared},
                 "Fix the image user, home, Runtime PATH, Auth volume, or workspace permissions.",
             )
         )
@@ -818,8 +927,10 @@ test -w "$workspace_file"
             )
         argv = list(runtime_config.status_args)
         if config.sandbox == "docker":
+            if not config.agent_image:
+                return CheckResult(Status.BLOCKED, "Agent image is unavailable.")
             argv = sandbox.build_status_command(
-                config.runtime, image=config.agent_image or sandbox.DEFAULT_IMAGE
+                config.runtime, image=config.agent_image
             )
         try:
             result = self._run(argv)
@@ -836,35 +947,6 @@ test -w "$workspace_file"
                 Status.FAIL,
                 "Runtime is not authenticated.",
                 remediation=f"Authenticate {config.runtime} in the selected Sandbox.",
-            )
-        )
-
-    def check_gate_toolchain(self, config: ReadinessConfiguration) -> CheckResult:
-        gate = self.fixture_dir / "gate"
-        if not gate.is_file():
-            return CheckResult(Status.NOT_APPLICABLE, "The optional Gate is absent.")
-        argv = [str(gate.resolve()), "--check-tools"]
-        if config.sandbox == "docker":
-            workspace = self._readiness_workspace()
-            disposable_gate = workspace / "gate"
-            shutil.copy2(gate, disposable_gate)
-            # The canonical container user may not share the host owner's uid.
-            disposable_gate.chmod(0o755)
-            argv = [str(disposable_gate), "--check-tools"]
-            argv = sandbox.build_run_command(
-                config.runtime,
-                inner_argv=argv,
-                workspace=workspace,
-                image=config.agent_image or sandbox.DEFAULT_IMAGE,
-            )
-        result = self._run(argv)
-        return (
-            CheckResult(Status.PASS, "Gate toolchain check passed.")
-            if self._ok(result)
-            else CheckResult(
-                Status.FAIL,
-                "Gate toolchain check failed.",
-                remediation="Install the project toolchain in the selected Sandbox.",
             )
         )
 
@@ -966,23 +1048,67 @@ test -w "$workspace_file"
         if not config.assignee:
             raise ValueError("GitHub assignee could not be resolved")
         source = GitHubIssueSource(config.repository, runner=self.runner)
-        issues = (
-            source.list_ready(timeout=SHORT_TIMEOUT)
-            if self.include_item_content
-            else source.list_ready_metadata(timeout=SHORT_TIMEOUT)
-        )
+        # Doctor and Run freeze the same complete authoritative Item snapshot;
+        # renderers project only number/title from these private copies.
+        issues = source.list_ready(timeout=SHORT_TIMEOUT)
         selected = select_batch(
             issues,
             assignee=config.assignee,
             include_unassigned=config.include_unassigned,
             limit=config.item_limit,
         )
-        if self.include_item_content:
-            return selected
-        return [EligibleItem(issue.number, issue.title) for issue in selected]
+        return selected
 
     def dependencies(self) -> ReadinessDependencies:
-        return ReadinessDependencies(self.probe, self.eligible_items)
+        return ReadinessDependencies(
+            self.probe, self.eligible_items, self.frozen_inputs
+        )
+
+    def frozen_inputs(
+        self, config: ReadinessConfiguration, items: tuple[IssueRef, ...]
+    ) -> FrozenReadinessInputs:
+        if self._base_commit is None or self._project_fixture is None:
+            raise ValueError("Readiness identities are incomplete")
+        return FrozenReadinessInputs(
+            self._base_commit,
+            self._project_fixture,
+            tuple(item.model_copy(deep=True) for item in items),
+            config.sandbox,
+            config.runtime,
+            config.agent_image,
+        )
+
+
+def _freeze_project_fixture(
+    fixture_dir: Path, definition: RunDefinition
+) -> FrozenProjectFixture:
+    paths = {fixture_dir / "main.py", fixture_dir / "setup", fixture_dir / "gate"}
+    for marker in ("version", "sandbox", "Dockerfile"):
+        candidate = fixture_dir / marker
+        if candidate.is_file() and not candidate.is_symlink():
+            paths.add(candidate)
+    for graph in (definition.before, definition.item, definition.after):
+        if graph is not None:
+            paths.update(
+                fixture_dir / "prompts" / node.prompt
+                for node in graph.nodes.values()
+                if isinstance(node, RuntimeNode)
+            )
+    frozen: list[FrozenFixtureFile] = []
+    digest = hashlib.sha256()
+    for path in sorted(
+        paths, key=lambda value: value.relative_to(fixture_dir).as_posix()
+    ):
+        relative = path.relative_to(fixture_dir).as_posix()
+        content = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+        digest.update(relative.encode())
+        digest.update(mode.to_bytes(2, "big"))
+        digest.update(content)
+        frozen.append(FrozenFixtureFile(relative, content, mode))
+    return FrozenProjectFixture(
+        digest.hexdigest(), copy.deepcopy(definition), tuple(frozen)
+    )
 
 
 def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> None:
@@ -997,13 +1123,17 @@ def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> No
     ):
         if graph is None:
             continue
-        if not isinstance(graph, PhaseGraph) or graph.start not in graph.phases:
+        if not isinstance(graph, ExecutionGraph) or graph.start not in graph.nodes:
             raise ValueError(f"Invalid {scope} graph")
-        for phase in graph.phases.values():
-            for target in (phase.on_success, phase.on_failure):
-                if not isinstance(target, Terminal) and target not in graph.phases:
+        for node in graph.nodes.values():
+            if not isinstance(node, RuntimeNode | GateNode):
+                raise ValueError(f"Invalid node in {scope} graph")
+            for target in (node.on_success, node.on_failure):
+                if not isinstance(target, Terminal) and target not in graph.nodes:
                     raise ValueError(f"Invalid edge in {scope} graph")
-            candidate = prompts / phase.prompt
+            if isinstance(node, GateNode):
+                continue
+            candidate = prompts / node.prompt
             path = candidate.resolve()
             relative_parts = candidate.relative_to(prompts).parts
             has_symlink = any(
@@ -1014,7 +1144,17 @@ def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> No
                 raise ValueError(f"Invalid prompt path in {scope} graph")
     for name in ("setup", "gate"):
         path = fixture_dir / name
-        if path.exists() and (
-            not path.is_file() or path.is_symlink() or not path.stat().st_mode & 0o111
+        if (
+            not path.exists()
+            or not path.is_file()
+            or path.is_symlink()
+            or not path.stat().st_mode & 0o111
         ):
             raise ValueError(f"Invalid {name} executable")
+        try:
+            first_line = path.read_bytes().splitlines()[0].decode("utf-8")
+            words = shlex.split(first_line[2:]) if first_line.startswith("#!") else []
+        except (IndexError, OSError, UnicodeDecodeError, ValueError):
+            words = []
+        if not words or not words[0].startswith("/") or len(words) > 2:
+            raise ValueError(f"Invalid {name} shebang")

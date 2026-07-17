@@ -1,20 +1,16 @@
-"""The real Codex adapter parses the JSONL event stream and resumes threads."""
+"""The real Codex adapter parses JSONL and starts each node in a fresh thread."""
 
 from __future__ import annotations
 
 import io
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from pycastle import orchestrator
-from pycastle.models import IssueRef
 from pycastle.runtime import (
     CODEX_DOCKER_BYPASS,
-    CODEX_REASONING_SUMMARY_CONFIG,
     AgentCrashError,
     CodexRuntime,
     Runtime,
@@ -128,17 +124,13 @@ def test_build_command_minimal_omits_model_and_bypass(tmp_path: Path) -> None:
     ]
 
 
-def test_build_command_verbose_enables_reasoning_summary(tmp_path: Path) -> None:
-    # Codex exec --json emits no reasoning item unless asked, so a verbose run
-    # turns on the summary via -c model_reasoning_summary=detailed, placed before
-    # exec (a global codex flag) so the reasoning item appears for capture (#48).
-    cmd = CodexRuntime(verbose=True).build_command("hi", cwd=tmp_path)
-    assert cmd[cmd.index("-c") + 1] == CODEX_REASONING_SUMMARY_CONFIG
-    assert cmd.index("-c") < cmd.index("exec")
+def test_verbosity_does_not_change_provider_invocation(tmp_path: Path) -> None:
+    verbose = CodexRuntime(verbose=True).build_command("hi", cwd=tmp_path)
+    quiet = CodexRuntime(verbose=False).build_command("hi", cwd=tmp_path)
+    assert verbose == quiet
 
 
-def test_build_command_non_verbose_omits_reasoning_summary(tmp_path: Path) -> None:
-    # The summary costs extra tokens, so a non-verbose run never requests it.
+def test_build_command_omits_reasoning_summary_override(tmp_path: Path) -> None:
     assert "-c" not in CodexRuntime(verbose=False).build_command("hi", cwd=tmp_path)
 
 
@@ -173,32 +165,6 @@ def test_build_command_bypass_flag_when_sandboxed(tmp_path: Path) -> None:
     assert "workspace-write" not in cmd
 
 
-def test_build_command_resume_places_thread_id(tmp_path: Path) -> None:
-    runtime = CodexRuntime()
-    cmd = runtime.build_command(
-        "write handoff", cwd=tmp_path, resume_thread_id="thread-456"
-    )
-    assert cmd[-5:] == [
-        "exec",
-        "resume",
-        "--json",
-        "thread-456",
-        "write handoff",
-    ]
-
-
-def test_build_command_host_resume_carries_workspace_write(tmp_path: Path) -> None:
-    # The handoff path resumes a prior thread, and it must still scope writes to
-    # the worktree: a host resume carries -s workspace-write before exec, just
-    # like a fresh host run, or the retry attempt would silently no-op too (#35).
-    cmd = CodexRuntime().build_command(
-        "write handoff", cwd=tmp_path, resume_thread_id="thread-456"
-    )
-    assert cmd[cmd.index("-s") + 1] == "workspace-write"
-    assert cmd.index("-s") < cmd.index("exec")
-    assert CODEX_DOCKER_BYPASS not in cmd
-
-
 def test_build_command_resolves_relative_cwd_to_absolute_dash_c() -> None:
     # The orchestrator hands the runtime a relative worktree path derived from a
     # relative FIXTURE_DIR. Codex resolves a relative -C against its own process
@@ -223,7 +189,7 @@ def test_run_relative_cwd_does_not_double_dash_c_path(
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     relative = Path(".pycastle/worktrees/issue-3")
-    CodexRuntime().run("p", cwd=relative, phase="implement")
+    CodexRuntime().run("p", cwd=relative, node="implement")
 
     argv = mock_popen.call_args.args[0]
     dash_c_value = argv[argv.index("-C") + 1]
@@ -243,7 +209,7 @@ def test_run_absolute_cwd_is_idempotent(mock_popen: MagicMock, tmp_path: Path) -
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
     absolute = tmp_path.resolve()
 
-    CodexRuntime().run("p", cwd=absolute, phase="implement")
+    CodexRuntime().run("p", cwd=absolute, node="implement")
 
     argv = mock_popen.call_args.args[0]
     dash_c_value = argv[argv.index("-C") + 1]
@@ -257,17 +223,16 @@ def test_docker_relative_cwd_yields_absolute_inner_dash_c(
     # Under Docker the inner -C must also be absolute so it matches the
     # bind-mount path that build_run_command already resolves; a relative inner
     # -C would double under -w.
-    from pycastle import sandbox
 
     monkeypatch.chdir(tmp_path)
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     relative = Path(".pycastle/worktrees/issue-3")
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
-    runtime.run("p", cwd=relative, phase="implement")
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    runtime.run("p", cwd=relative, node="implement")
 
     argv = mock_popen.call_args.args[0]
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    image_idx = argv.index("sha256:" + ("a" * 64))
     inner = argv[image_idx + 1 :]
     inner_dash_c_value = inner[inner.index("-C") + 1]
     assert Path(inner_dash_c_value).is_absolute()
@@ -280,19 +245,18 @@ def test_docker_workdir_matches_inner_dash_c(
     # The symmetric half of the #50 fix: under docker the container -w and the
     # inner codex -C must agree (both the resolved worktree), and the bind-mount
     # source must stay the workspace root, not the worktree.
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
     root = tmp_path / "root"
     worktree = root / ".pycastle" / "worktrees" / "issue-3"
     worktree.mkdir(parents=True)
 
-    runtime = CodexRuntime.in_docker(workspace=root)
-    runtime.run("p", cwd=worktree, phase="implement")
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=root)
+    runtime.run("p", cwd=worktree, node="implement")
 
     argv = mock_popen.call_args.args[0]
     workdir = argv[argv.index("-w") + 1]
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    image_idx = argv.index("sha256:" + ("a" * 64))
     inner = argv[image_idx + 1 :]
     inner_dash_c = inner[inner.index("-C") + 1]
     assert workdir == inner_dash_c == str(worktree.resolve())
@@ -312,7 +276,7 @@ def test_parses_jsonl_into_output_and_telemetry(
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     result = CodexRuntime(model="gpt-test").run(
-        "do work", cwd=tmp_path, phase="implement"
+        "do work", cwd=tmp_path, node="implement"
     )
 
     # Only the agent_message prose becomes output; command/file-change items drop.
@@ -320,7 +284,7 @@ def test_parses_jsonl_into_output_and_telemetry(
 
     telemetry = result.telemetry
     assert telemetry.runtime == "codex"
-    assert telemetry.phase == "implement"
+    assert telemetry.node == "implement"
     assert telemetry.thread_id == "thread-123"
     # Codex reports no cost or duration; PyCastle measures elapsed wall time.
     assert telemetry.cost_usd is None
@@ -339,7 +303,7 @@ def test_parses_jsonl_into_output_and_telemetry(
 def test_run_invokes_host_codex_argv(mock_popen: MagicMock, tmp_path: Path) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    CodexRuntime(model="gpt-test").run("do work", cwd=tmp_path, phase="implement")
+    CodexRuntime(model="gpt-test").run("do work", cwd=tmp_path, node="implement")
 
     assert mock_popen.call_args.args[0] == [
         "codex",
@@ -354,39 +318,6 @@ def test_run_invokes_host_codex_argv(mock_popen: MagicMock, tmp_path: Path) -> N
         "do work",
     ]
     assert mock_popen.call_args.kwargs["cwd"] == tmp_path
-
-
-def test_resume_path_runs_resume_argv_and_keeps_thread_id(
-    mock_popen: MagicMock, tmp_path: Path
-) -> None:
-    # Resuming continues the same thread: the resume argv carries the thread id,
-    # and a fresh thread.started in the resumed stream is surfaced again.
-    events = [
-        {"type": "thread.started", "thread_id": "thread-456"},
-        {
-            "type": "item.completed",
-            "item": {"type": "agent_message", "text": "handoff written"},
-        },
-        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}},
-    ]
-    mock_popen.return_value = _fake_proc(events)
-
-    result = CodexRuntime().run(
-        "write handoff",
-        cwd=tmp_path,
-        phase="handoff",
-        resume_thread_id="thread-456",
-    )
-
-    assert mock_popen.call_args.args[0][-5:] == [
-        "exec",
-        "resume",
-        "--json",
-        "thread-456",
-        "write handoff",
-    ]
-    assert result.output == "handoff written"
-    assert result.telemetry.thread_id == "thread-456"
 
 
 def test_ignores_unparseable_lines(mock_popen: MagicMock, tmp_path: Path) -> None:
@@ -405,7 +336,7 @@ def test_ignores_unparseable_lines(mock_popen: MagicMock, tmp_path: Path) -> Non
     proc.wait.return_value = 0
     mock_popen.return_value = proc
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "implemented"
     assert result.telemetry.thread_id == "thread-123"
@@ -418,9 +349,9 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
     mock_popen.return_value = proc
 
     with pytest.raises(AgentCrashError) as exc_info:
-        CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+        CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
-    assert exc_info.value.phase == "implement"
+    assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 1
 
 
@@ -433,7 +364,7 @@ def test_nonzero_exit_reads_stderr_for_logging(
 
     with caplog.at_level("ERROR", logger="pycastle.runtime"):
         with pytest.raises(AgentCrashError):
-            CodexRuntime().run("p", cwd=tmp_path, phase="review")
+            CodexRuntime().run("p", cwd=tmp_path, node="review")
 
     assert "permission denied" in caplog.text
     proc.wait.assert_called_once()
@@ -446,11 +377,11 @@ def test_empty_stream_with_clean_exit_degrades_gracefully(
     # thread id, and no crash.
     mock_popen.return_value = _fake_proc([], returncode=0)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="plan")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="plan")
 
     assert result.output == ""
     assert result.telemetry.runtime == "codex"
-    assert result.telemetry.phase == "plan"
+    assert result.telemetry.node == "plan"
     assert result.telemetry.thread_id is None
     assert result.telemetry.usage is None
     assert result.telemetry.num_turns == 0
@@ -466,7 +397,7 @@ def test_non_dict_usage_does_not_throw(mock_popen: MagicMock, tmp_path: Path) ->
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.telemetry.usage is None
     assert result.telemetry.num_turns == 1
@@ -486,7 +417,7 @@ def test_non_dict_item_does_not_throw(mock_popen: MagicMock, tmp_path: Path) -> 
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "kept"
     assert result.telemetry.thread_id == "t"
@@ -503,7 +434,7 @@ def test_multiple_agent_messages_concatenate_in_order(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "first second"
 
@@ -523,7 +454,7 @@ def test_stream_without_turn_completed_degrades_no_crash(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "partial answer"
     assert result.telemetry.thread_id == "thread-789"
@@ -556,7 +487,7 @@ def test_multiple_turns_count_each_and_keep_last_usage(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.telemetry.num_turns == 2
     assert result.telemetry.usage is not None
@@ -574,7 +505,7 @@ def test_codex_telemetry_leaves_claude_cache_fields_none(
     # collide in one TokenUsage record.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     usage = result.telemetry.usage
     assert usage is not None
@@ -602,7 +533,7 @@ def test_empty_agent_message_text_contributes_nothing(
     ]
     mock_popen.return_value = _fake_proc(events)
 
-    result = CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    result = CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "real"
 
@@ -611,7 +542,7 @@ def test_verbose_surfaces_codex_reasoning_when_emitted(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # If codex exec --json emits a reasoning item, --verbose captures it the same
-    # way claude thinking is captured: a [THINKING:<phase>] line plus the sink.
+    # way claude thinking is captured: a [THINKING:<node>] line plus the sink.
     events = [
         {"type": "thread.started", "thread_id": "t"},
         {
@@ -627,10 +558,8 @@ def test_verbose_surfaces_codex_reasoning_when_emitted(
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(
             verbose=True,
-            transcript_sink=lambda phase, tag, text: captured.append(
-                (phase, tag, text)
-            ),
-        ).run("p", cwd=tmp_path, phase="implement")
+            transcript_sink=lambda node, tag, text: captured.append((node, tag, text)),
+        ).run("p", cwd=tmp_path, node="implement")
 
     assert "[THINKING:implement] weighing the approach" in caplog.text
     assert ("implement", "THINKING", "weighing the approach") in captured
@@ -643,7 +572,7 @@ def test_verbose_surfaces_codex_agent_message_output(
 ) -> None:
     # The headline thinking-less case: a codex run with only an agent_message (no
     # reasoning item) is still legible under --verbose because the prose narration
-    # is surfaced as an [OUTPUT:<phase>] line and persisted to the sink.
+    # is surfaced as an [OUTPUT:<node>] line and persisted to the sink.
     events = [
         {"type": "thread.started", "thread_id": "t"},
         {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
@@ -655,10 +584,8 @@ def test_verbose_surfaces_codex_agent_message_output(
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(
             verbose=True,
-            transcript_sink=lambda phase, tag, text: captured.append(
-                (phase, tag, text)
-            ),
-        ).run("p", cwd=tmp_path, phase="implement")
+            transcript_sink=lambda node, tag, text: captured.append((node, tag, text)),
+        ).run("p", cwd=tmp_path, node="implement")
 
     assert "[OUTPUT:implement] done" in caplog.text
     assert ("implement", "OUTPUT", "done") in captured
@@ -669,12 +596,12 @@ def test_verbose_logs_unavailable_when_no_codex_reasoning(
     mock_popen: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # When codex emits no reasoning item, --verbose logs once that reasoning text
-    # is unavailable; the agent_message still produces an [OUTPUT:<phase>] line so
+    # is unavailable; the agent_message still produces an [OUTPUT:<node>] line so
     # the run stays legible, and output and telemetry are unchanged.
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, node="implement")
 
     assert "codex reasoning text is unavailable" in caplog.text
     assert "[OUTPUT:implement] implemented" in caplog.text
@@ -701,8 +628,8 @@ def test_non_verbose_drops_codex_reasoning(
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         result = CodexRuntime(
-            transcript_sink=lambda phase, tag, text: captured.append((phase, tag, text))
-        ).run("p", cwd=tmp_path, phase="implement")
+            transcript_sink=lambda node, tag, text: captured.append((node, tag, text))
+        ).run("p", cwd=tmp_path, node="implement")
 
     assert "[THINKING:" not in caplog.text
     assert "[OUTPUT:" not in caplog.text
@@ -715,7 +642,10 @@ def test_in_docker_threads_verbose_and_sink(tmp_path: Path) -> None:
     # in_docker forwards verbose and the sink onto the constructed codex runtime.
     sink = MagicMock()
     runtime = CodexRuntime.in_docker(
-        workspace=tmp_path, verbose=True, transcript_sink=sink
+        image="sha256:" + ("a" * 64),
+        workspace=tmp_path,
+        verbose=True,
+        transcript_sink=sink,
     )
     assert runtime.verbose is True
     assert runtime.transcript_sink is sink
@@ -748,10 +678,8 @@ def test_verbose_flattens_codex_reasoning_content_list(
     with caplog.at_level("INFO", logger="pycastle.runtime"):
         CodexRuntime(
             verbose=True,
-            transcript_sink=lambda phase, tag, text: captured.append(
-                (phase, tag, text)
-            ),
-        ).run("p", cwd=tmp_path, phase="implement")
+            transcript_sink=lambda node, tag, text: captured.append((node, tag, text)),
+        ).run("p", cwd=tmp_path, node="implement")
 
     assert "[THINKING:implement] first part second part" in caplog.text
     assert ("implement", "THINKING", "first part second part") in captured
@@ -772,7 +700,7 @@ def test_verbose_does_not_crash_on_malformed_reasoning_type(
     mock_popen.return_value = _fake_proc(events)
 
     with caplog.at_level("INFO", logger="pycastle.runtime"):
-        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, phase="implement")
+        result = CodexRuntime(verbose=True).run("p", cwd=tmp_path, node="implement")
 
     assert result.output == "done"
     assert "codex reasoning text is unavailable" in caplog.text
@@ -786,17 +714,16 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     The Docker argv carries CODEX_HOME, the codex auth volume, and the bypass
     flag on the inner codex argv. The same JSONL parsing applies to stdout.
     """
-    from pycastle import sandbox
 
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
-    result = runtime.run("a prompt", cwd=tmp_path, phase="implement")
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    result = runtime.run("a prompt", cwd=tmp_path, node="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[:3] == ["docker", "run", "--rm"]
-    assert sandbox.DEFAULT_IMAGE in argv
-    image_idx = argv.index(sandbox.DEFAULT_IMAGE)
+    assert "sha256:" + ("a" * 64) in argv
+    image_idx = argv.index("sha256:" + ("a" * 64))
     # The inner argv starts the codex command and carries the bypass flag.
     inner = argv[image_idx + 1 :]
     assert inner[0] == "codex"
@@ -806,9 +733,9 @@ def test_docker_runtime_wraps_inner_argv_into_docker_run(
     assert "workspace-write" not in inner
     assert "-s" not in inner
     # CODEX_HOME and the codex auth volume are pinned, not Claude's.
-    assert "pycastle-codex-auth:/home/node/.codex" in argv
-    assert "CODEX_HOME=/home/node/.codex" in argv
-    assert "CLAUDE_CONFIG_DIR=/home/node/.claude" not in argv
+    assert "pycastle-codex-auth:/pycastle/auth" in argv
+    assert "CODEX_HOME=/pycastle/auth" in argv
+    assert "CLAUDE_CONFIG_DIR=/pycastle/auth" not in argv
     # Same JSONL parsing as the host path.
     assert result.output == "implemented"
     assert result.telemetry.thread_id == "thread-123"
@@ -819,8 +746,8 @@ def test_docker_runtime_runs_both_runtime_and_commands_in_container(
 ) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    runtime = CodexRuntime.in_docker(workspace=tmp_path)
-    runtime.run("p", cwd=tmp_path, phase="implement")
+    runtime = CodexRuntime.in_docker(image="sha256:" + ("a" * 64), workspace=tmp_path)
+    runtime.run("p", cwd=tmp_path, node="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[0] == "docker"
@@ -830,7 +757,7 @@ def test_docker_runtime_runs_both_runtime_and_commands_in_container(
 def test_host_runtime_invokes_bare_codex(mock_popen: MagicMock, tmp_path: Path) -> None:
     mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
 
-    CodexRuntime().run("p", cwd=tmp_path, phase="implement")
+    CodexRuntime().run("p", cwd=tmp_path, node="implement")
 
     argv = mock_popen.call_args.args[0]
     assert argv[0] == "codex"
@@ -838,95 +765,3 @@ def test_host_runtime_invokes_bare_codex(mock_popen: MagicMock, tmp_path: Path) 
     assert CODEX_DOCKER_BYPASS not in argv
     # It carries the scoped host sandbox so codex may write the worktree (#35).
     assert argv[argv.index("-s") + 1] == "workspace-write"
-
-
-def test_run_works_one_issue_end_to_end_via_codex(
-    mock_popen: MagicMock, fixture_dir: Path, tmp_path: Path
-) -> None:
-    """The orchestrator completes an issue using the real Codex adapter.
-
-    The agent is mocked at the subprocess boundary; every git/gh call is mocked
-    through the orchestrator's runner — no real agent runs.
-    """
-    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
-
-    def _ok(
-        argv: list[str], *_args: object, **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        # A non-empty diff (exit 1) for the post-commit no-change check, so the
-        # mocked agent's work is treated as a real change rather than a no-op.
-        if argv[:3] == ["git", "diff", "--quiet"]:
-            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
-        if argv[:3] == ["gh", "pr", "list"]:
-            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
-
-    issue = IssueRef(number=9, title="Wire codex", assignees=["krishna"])
-    source = MagicMock()
-    source.list_ready.return_value = [issue]
-    runner = MagicMock(side_effect=_ok)
-
-    outcome = orchestrator.run_batch(
-        runtime=make_runtime("codex"),
-        issue_source=source,
-        selected=source.list_ready(),
-        fixture_dir=fixture_dir,
-        repo="owner/repo",
-        base_branch="main",
-        assignee="krishna",
-        run_id="20260613-090000",
-        iterations=1,
-        workspace=tmp_path,
-        worktree_root=tmp_path / "wt",
-        runner=runner,
-    )
-
-    assert outcome.completed == [9]
-    assert outcome.pr_opened is True
-    # The real adapter ran through the graph: the codex CLI was invoked.
-    assert mock_popen.call_args.args[0][0] == "codex"
-
-
-def test_run_works_one_issue_end_to_end_via_codex_in_docker(
-    mock_popen: MagicMock, fixture_dir: Path, tmp_path: Path
-) -> None:
-    """The orchestrator completes an issue using Codex inside the Docker sandbox."""
-    mock_popen.return_value = _fake_proc(_SUCCESS_EVENTS)
-
-    def _ok(
-        argv: list[str], *_args: object, **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        # A non-empty diff (exit 1) for the post-commit no-change check, so the
-        # mocked agent's work is treated as a real change rather than a no-op.
-        if argv[:3] == ["git", "diff", "--quiet"]:
-            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="")
-        if argv[:3] == ["gh", "pr", "list"]:
-            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="[]")
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
-
-    issue = IssueRef(number=10, title="Codex in docker", assignees=["krishna"])
-    source = MagicMock()
-    source.list_ready.return_value = [issue]
-    runner = MagicMock(side_effect=_ok)
-
-    outcome = orchestrator.run_batch(
-        runtime=CodexRuntime.in_docker(workspace=tmp_path),
-        issue_source=source,
-        selected=source.list_ready(),
-        fixture_dir=fixture_dir,
-        repo="owner/repo",
-        base_branch="main",
-        assignee="krishna",
-        run_id="20260613-090000",
-        iterations=1,
-        workspace=tmp_path,
-        worktree_root=tmp_path / "wt",
-        runner=runner,
-    )
-
-    assert outcome.completed == [10]
-    assert outcome.pr_opened is True
-    # The agent ran in Docker, and the inner codex argv carried the bypass flag.
-    argv = mock_popen.call_args.args[0]
-    assert argv[0] == "docker"
-    assert CODEX_DOCKER_BYPASS in argv
