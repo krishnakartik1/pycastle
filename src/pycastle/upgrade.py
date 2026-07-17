@@ -6,7 +6,6 @@ import os
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable
@@ -15,12 +14,15 @@ from pathlib import Path
 
 from . import __version__
 from .compatibility import FixtureCompatibilityStatus, check_fixture_compatibility
-from .graph import load_run
+from .fixture_validation import (
+    ProjectFixtureValidationError,
+    validate_project_fixture_structure,
+)
 from .migrations import MIGRATIONS, FixtureMigration
 from .upgrade_errors import FixtureUpgradeError
 
 FixtureWriter = Callable[[Path, Path], None]
-REQUIRED_FILES = ("main.py", "gate", "sandbox", "Dockerfile", "version")
+REQUIRED_FILES = ("sandbox", "Dockerfile", "version")
 
 
 @dataclass(frozen=True)
@@ -50,58 +52,16 @@ def validate_fixture(fixture_dir: Path) -> None:
                 f"Required fixture file {path} is missing or unsafe."
             )
 
-    for hook_name in ("gate", "setup"):
-        hook = fixture_dir / hook_name
-        # ``Path.exists`` is false for a broken symlink.  Such a path is still
-        # a present, unsafe customized Setup hook rather than an absent optional
-        # hook, so only skip it when no directory entry exists at all.
-        if hook_name == "setup" and not hook.exists() and not hook.is_symlink():
-            continue
-        if not _regular_file(hook) or not os.access(hook, os.X_OK):
-            raise FixtureUpgradeError(
-                f"Fixture hook {hook} must be an executable file."
-            )
-
     sandbox = (fixture_dir / "sandbox").read_text().splitlines()
     if len(sandbox) != 1 or sandbox[0].strip() not in {"host", "docker"}:
         raise FixtureUpgradeError(
             "Fixture sandbox marker must be exactly host or docker."
         )
 
-    previous_bytecode = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
     try:
-        definition = load_run(fixture_dir)
-    except Exception as exc:
-        raise FixtureUpgradeError(
-            f"Could not load the fixture Run definition: {exc}"
-        ) from exc
-    finally:
-        sys.dont_write_bytecode = previous_bytecode
-    scoped_graphs = [("Item node", definition.item)]
-    scoped_graphs.extend(
-        (scope, graph)
-        for scope, graph in (
-            ("before-Run node", definition.before),
-            ("after-Run node", definition.after),
-        )
-        if graph is not None
-    )
-    for scope, graph in scoped_graphs:
-        for node in graph.nodes.values():
-            prompts_dir = (fixture_dir / "prompts").resolve()
-            prompt = (prompts_dir / node.prompt).resolve()
-            try:
-                prompt.relative_to(prompts_dir)
-            except ValueError as exc:
-                raise FixtureUpgradeError(
-                    f"{scope} {node.name!r} references prompt outside prompts/: "
-                    f"{node.prompt}"
-                ) from exc
-            if not _regular_file(prompt):
-                raise FixtureUpgradeError(
-                    f"{scope} {node.name!r} references missing prompt {node.prompt}."
-                )
+        validate_project_fixture_structure(fixture_dir)
+    except ProjectFixtureValidationError as exc:
+        raise FixtureUpgradeError(str(exc)) from exc
 
 
 def _ensure_clean(project_dir: Path) -> None:

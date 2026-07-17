@@ -96,7 +96,8 @@ _Avoid_: PR comment, final review, test report.
 The `.pycastle/` directory a project owns and PyCastle reads: prompts, **Setup**,
 the Gate, the **Run definition**, the agent Dockerfile, the sandbox marker, and
 the release marker used to verify fixture compatibility before a Run.
-Scaffolded by `pycastle init`.
+Scaffolded by `pycastle init`. A target-release Project fixture has one complete
+structural validity contract whether Doctor, Run, or Upgrade examines it.
 _Avoid_: config, template, project config.
 
 **Issue source**:
