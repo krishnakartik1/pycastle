@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from pycastle.graph import GateNode, RuntimeNode, load_run
 from pycastle.migrations import MIGRATIONS, dockerfile_declares_host_identity
+from pycastle.scaffold import scaffold_fixture
 from pycastle.upgrade import (
     FixtureMigration,
     FixtureUpgradeError,
@@ -19,19 +21,8 @@ from pycastle.upgrade import (
 
 def _project(tmp_path: Path, marker: str = "1.0\n") -> tuple[Path, Path]:
     project = tmp_path / "project"
+    scaffold_fixture(project, sandbox="host")
     fixture = project / ".pycastle"
-    (fixture / "prompts").mkdir(parents=True)
-    (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
-        "run = build_run(item=execution_graph(start='work', nodes=[runtime_node('work', 'work.md')]))\n"
-    )
-    (fixture / "prompts" / "work.md").write_text("work\n")
-    (fixture / "gate").write_text("#!/bin/sh\nexit 0\n")
-    (fixture / "setup").write_text("#!/bin/sh\nexit 0\n")
-    (fixture / "gate").chmod(0o755)
-    (fixture / "setup").chmod(0o755)
-    (fixture / "sandbox").write_text("host\n")
-    (fixture / "Dockerfile").write_text("FROM scratch\n")
     (fixture / "version").write_text(marker)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     subprocess.run(["git", "add", "."], cwd=project, check=True)
@@ -227,7 +218,7 @@ def test_migration_specific_validation_failure_changes_nothing(tmp_path: Path) -
         (lambda f: (f / "gate").chmod(0o644), "executable"),
         (lambda f: (f / "setup").chmod(0o644), "executable"),
         (lambda f: (f / "sandbox").write_text("cloud\n"), "sandbox"),
-        (lambda f: (f / "prompts" / "work.md").unlink(), "work.md"),
+        (lambda f: (f / "prompts" / "plan.md").unlink(), "prompt"),
         (lambda f: (f / "main.py").write_text("raise ValueError('broken')\n"), "load"),
     ],
 )
@@ -298,6 +289,55 @@ def test_fixture_validator_does_not_execute_gate(tmp_path: Path) -> None:
     assert not side_effect.exists()
 
 
+def test_fixture_validator_requires_an_item_execution_graph(tmp_path: Path) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import RunDefinition\n" "run = RunDefinition(item=None)\n"
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="Item execution graph"):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_rejects_an_unknown_terminal(tmp_path: Path) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode, Terminal\n"
+        "run = RunDefinition(item=ExecutionGraph(start='work', nodes={\n"
+        "    'work': RuntimeNode('work', 'plan.md', on_success=Terminal('UNKNOWN'))\n"
+        "}))\n"
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="Unknown Terminal"):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_rejects_a_node_key_name_mismatch(tmp_path: Path) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode\n"
+        "run = RunDefinition(item=ExecutionGraph(start='alias', nodes={\n"
+        "    'alias': RuntimeNode('work', 'plan.md')\n"
+        "}))\n"
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="node key"):
+        validate_fixture(fixture)
+
+
+def test_fixture_validator_rejects_empty_direct_graph_fields(tmp_path: Path) -> None:
+    _, fixture = _project(tmp_path)
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode\n"
+        "run = RunDefinition(item=ExecutionGraph(start='', nodes={\n"
+        "    '': RuntimeNode('', 'plan.md')\n"
+        "}))\n"
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="Item execution graph"):
+        validate_fixture(fixture)
+
+
 @pytest.mark.parametrize(
     "dockerfile",
     [
@@ -348,4 +388,18 @@ def test_012_manual_migration_accepts_owner_authored_args_and_only_advances_mark
     assert dockerfile_declares_host_identity(fixture)
     assert (fixture / "Dockerfile").read_text() == dockerfile
     assert (fixture / "version").read_text() == "0.1.2\n"
+    assert result.applied_versions == ()
+
+
+def test_013_runner_patch_upgrades_actual_project_fixture_via_012_docker_identity_migration(
+    tmp_path: Path,
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.1\n")
+
+    result = upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+
+    definition = load_run(fixture)
+    assert isinstance(definition.item.nodes["plan"], RuntimeNode)
+    assert isinstance(definition.item.nodes["verify"], GateNode)
+    assert (fixture / "version").read_text() == "0.1.3\n"
     assert result.applied_versions == ()

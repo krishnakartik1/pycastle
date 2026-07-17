@@ -7,10 +7,8 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
@@ -22,14 +20,8 @@ from typing import Any
 from . import __version__, sandbox
 from .commands import command_exists, run_cmd
 from .compatibility import check_fixture_compatibility
-from .graph import (
-    ExecutionGraph,
-    GateNode,
-    RunDefinition,
-    RuntimeNode,
-    Terminal,
-    load_run,
-)
+from .fixture_validation import validate_project_fixture_structure
+from .graph import RunDefinition, RuntimeNode
 from .issues import GitHubIssueSource, select_batch
 from .models import IssueRef
 
@@ -819,16 +811,8 @@ class DefaultReadinessAdapter:
         )
 
     def check_fixture_structure(self, _config: ReadinessConfiguration) -> CheckResult:
-        old = sys.dont_write_bytecode
-        try:
-            sys.dont_write_bytecode = True
-            definition = load_run(self.fixture_dir)
-            _validate_run_definition(definition, self.fixture_dir)
-            self._project_fixture = _freeze_project_fixture(
-                self.fixture_dir, definition
-            )
-        finally:
-            sys.dont_write_bytecode = old
+        definition = validate_project_fixture_structure(self.fixture_dir)
+        self._project_fixture = _freeze_project_fixture(self.fixture_dir, definition)
         return CheckResult(
             Status.PASS, "Complete Run definition and fixture executables are valid."
         )
@@ -1168,52 +1152,3 @@ def _freeze_project_fixture(
     return FrozenProjectFixture(
         digest.hexdigest(), copy.deepcopy(definition), tuple(frozen)
     )
-
-
-def _validate_run_definition(definition: RunDefinition, fixture_dir: Path) -> None:
-    prompt_root = fixture_dir / "prompts"
-    if prompt_root.is_symlink() or not prompt_root.is_dir():
-        raise ValueError("Invalid prompts directory")
-    prompts = prompt_root.resolve()
-    for scope, graph in (
-        ("before", definition.before),
-        ("item", definition.item),
-        ("after", definition.after),
-    ):
-        if graph is None:
-            continue
-        if not isinstance(graph, ExecutionGraph) or graph.start not in graph.nodes:
-            raise ValueError(f"Invalid {scope} graph")
-        for node in graph.nodes.values():
-            if not isinstance(node, RuntimeNode | GateNode):
-                raise ValueError(f"Invalid node in {scope} graph")
-            for target in (node.on_success, node.on_failure):
-                if not isinstance(target, Terminal) and target not in graph.nodes:
-                    raise ValueError(f"Invalid edge in {scope} graph")
-            if isinstance(node, GateNode):
-                continue
-            candidate = prompts / node.prompt
-            path = candidate.resolve()
-            relative_parts = candidate.relative_to(prompts).parts
-            has_symlink = any(
-                (prompts.joinpath(*relative_parts[:index])).is_symlink()
-                for index in range(1, len(relative_parts) + 1)
-            )
-            if prompts not in path.parents or not path.is_file() or has_symlink:
-                raise ValueError(f"Invalid prompt path in {scope} graph")
-    for name in ("setup", "gate"):
-        path = fixture_dir / name
-        if (
-            not path.exists()
-            or not path.is_file()
-            or path.is_symlink()
-            or not path.stat().st_mode & 0o111
-        ):
-            raise ValueError(f"Invalid {name} executable")
-        try:
-            first_line = path.read_bytes().splitlines()[0].decode("utf-8")
-            words = shlex.split(first_line[2:]) if first_line.startswith("#!") else []
-        except (IndexError, OSError, UnicodeDecodeError, ValueError):
-            words = []
-        if not words or not words[0].startswith("/") or len(words) > 2:
-            raise ValueError(f"Invalid {name} shebang")
