@@ -10,14 +10,11 @@ ARG GIT_USER_EMAIL=krishnakartik1@gmail.com
 ARG PYCASTLE_HOST_UID=1000
 ARG PYCASTLE_HOST_GID=1000
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /usr/local/bin/
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         procps \
-        python3 \
     && rm -rf /var/lib/apt/lists/* \
     && git config --system user.name "${GIT_USER_NAME}" \
     && git config --system user.email "${GIT_USER_EMAIL}" \
@@ -38,6 +35,12 @@ RUN groupmod --gid "${PYCASTLE_HOST_GID}" node \
 # this project's Setup, Runtime nodes, and Gate require. PyCastle never fills
 # this section by inspecting repository manifests.
 # ---------------------------------------------------------------------------
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /usr/local/bin/
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 USER node
 ENV HOME=/home/node
