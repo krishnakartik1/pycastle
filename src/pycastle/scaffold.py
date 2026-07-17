@@ -93,6 +93,8 @@ _DOCKERFILE = """# Project-owned PyCastle Agent image.
 # image for one Run. Once initialized, this entire file belongs to the project.
 FROM node:22-bookworm-slim
 
+ARG PYCASTLE_HOST_UID
+ARG PYCASTLE_HOST_GID
 ARG CLAUDE_CODE_VERSION=2.1.210
 ARG CODEX_VERSION=0.144.5
 
@@ -104,8 +106,20 @@ RUN apt-get update \\
         "@openai/codex@${CODEX_VERSION}" \\
     && npm cache clean --force
 
-RUN useradd --create-home --shell /bin/sh pycastle \\
-    && install -d -o pycastle -g pycastle /pycastle/auth
+RUN set -eu; \\
+    existing_group="$(getent group "${PYCASTLE_HOST_GID}" | cut -d: -f1 || true)"; \\
+    if [ -z "${existing_group}" ]; then \\
+        groupadd --gid "${PYCASTLE_HOST_GID}" pycastle; \\
+    fi; \\
+    existing_user="$(getent passwd "${PYCASTLE_HOST_UID}" | cut -d: -f1 || true)"; \\
+    if [ -n "${existing_user}" ]; then \\
+        usermod --login pycastle --home /home/pycastle --move-home \\
+            --gid "${PYCASTLE_HOST_GID}" --shell /bin/sh "${existing_user}"; \\
+    else \\
+        useradd --uid "${PYCASTLE_HOST_UID}" --gid "${PYCASTLE_HOST_GID}" \\
+            --create-home --shell /bin/sh pycastle; \\
+    fi; \\
+    install -d -o "${PYCASTLE_HOST_UID}" -g "${PYCASTLE_HOST_GID}" /pycastle/auth
 
 # --- PROJECT TOOLCHAIN -----------------------------------------------------
 # Install the interpreters, compilers, package managers, and OS libraries that

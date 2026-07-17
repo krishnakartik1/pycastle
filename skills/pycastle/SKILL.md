@@ -5,10 +5,10 @@ description: Onboard a project, check readiness, operate a PyCastle Run, and coo
 
 # PyCastle lifecycle
 
-PyCastle release: `0.1.1`
+PyCastle release: `0.1.2`
 
 Use this vendor-neutral workflow to operate PyCastle for the current repository.
-Treat `v0.1.1` as the only compatible runner and skill Git tag.
+Treat `v0.1.2` as the only compatible runner and skill Git tag.
 
 ## Select the Runtime
 
@@ -25,18 +25,18 @@ Call that choice `<runtime>` in the commands below.
 
 Before `init`, Doctor, or Run, execute `pycastle --version`. Parse the command's
 documented `pycastle <version>` output and require the normalized version to equal
-`0.1.1` exactly. A malformed output, prerelease, local version, or any other value
+`0.1.2` exactly. A malformed output, prerelease, local version, or any other value
 is a version mismatch.
 
 On a version mismatch, stop. Reinstall both the runner and this canonical skill
-from `v0.1.1`; do not continue with a merely compatible-looking version:
+from `v0.1.2`; do not continue with a merely compatible-looking version:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
-git clone --depth 1 --branch v0.1.1 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.1
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.2
+git clone --depth 1 --branch v0.1.2 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.2
 ```
 
-Then install or link `/tmp/pycastle-v0.1.1/skills/pycastle/` into the invoking
+Then install or link `/tmp/pycastle-v0.1.2/skills/pycastle/` into the invoking
 host's skill discovery directory and restart/reload that host. Re-run
 `pycastle --version`; do not proceed until it exactly matches this embedded release.
 
@@ -96,6 +96,16 @@ and remediation. Do not reproduce readiness probes, infer fixture compatibility,
 or substitute local inspection for Doctor's result. Doctor may build and pin the
 canonical Agent image, but it is only a current snapshot: Run re-evaluates readiness
 before side effects and freezes its own Run-readiness inputs.
+
+When Doctor reports fixture migration required, treat remediation as
+runner-owned. From a clean checkout, run `pycastle upgrade`. For the 0.1.2
+manual boundary it makes no writes and instructs the owner to add the reserved
+`PYCASTLE_HOST_UID` and `PYCASTLE_HOST_GID` declarations and reconcile the
+image-declared non-root user. The owner edits, reviews, and commits the
+project-owned Dockerfile. Run `pycastle upgrade` again from that clean checkout,
+then review and commit its marker change and rerun Doctor. Do not inspect or
+interpret the release marker, reinitialize the fixture, or rewrite the
+Dockerfile automatically.
 
 Use only the already-eligible `ready-for-agent` Items in Doctor's resolved batch.
 Zero eligible Items is a successful no-op. If fewer than five are eligible, accept

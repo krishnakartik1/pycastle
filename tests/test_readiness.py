@@ -80,7 +80,7 @@ def _valid_fixture(path: Path) -> Path:
     fixture = path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
-    (fixture / "version").write_text("0.1.0\n")
+    (fixture / "version").write_text("0.1.2\n")
     (fixture / "main.py").write_text(
         "from pycastle.graph import build_run, execution_graph, runtime_node\n"
         "run = build_run(\n"
@@ -358,6 +358,20 @@ def test_cleanup_failure_is_safe_and_does_not_expose_the_path(
     assert diagnostics == ["Doctor cleanup could not complete."]
     assert str(disposable) not in diagnostics[0]
     assert adapter._docker_workspace is None
+
+
+def test_docker_readiness_workspace_represents_host_owned_git_permissions(
+    tmp_path: Path,
+) -> None:
+    adapter = DefaultReadinessAdapter(tmp_path, tmp_path)
+
+    workspace = adapter._readiness_workspace()
+
+    assert workspace.stat().st_mode & 0o777 == 0o755
+    existing = workspace / ".pycastle-existing"
+    assert existing.read_text() == "host-owned\n"
+    assert existing.stat().st_mode & 0o777 == 0o644
+    adapter.close()
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])

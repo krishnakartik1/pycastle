@@ -18,11 +18,11 @@ Claude Code and Codex are supported as runtimes, on the host or in Docker.
 
 ## Install
 
-Release `v0.1.1` is the first release containing the lifecycle skill. Once that
+Release `v0.1.2` contains the current lifecycle skill. Once that
 tag is published, install it directly from GitHub:
 
 ```bash
-uv pip install git+https://github.com/krishnakartik1/pycastle@v0.1.1
+uv pip install git+https://github.com/krishnakartik1/pycastle@v0.1.2
 ```
 
 Run that inside an active virtual environment, or pass `--system` to `uv pip`
@@ -43,7 +43,7 @@ Claude Code. Obtain its canonical source from the same Git tag as the installed
 runner:
 
 ```bash
-git clone --depth 1 --branch v0.1.1 https://github.com/krishnakartik1/pycastle ~/.local/share/pycastle-v0.1.1
+git clone --depth 1 --branch v0.1.2 https://github.com/krishnakartik1/pycastle ~/.local/share/pycastle-v0.1.2
 ```
 
 Link that one `skills/pycastle/` directory into the discovery location for the
@@ -52,11 +52,11 @@ host you use:
 ```bash
 # Codex
 mkdir -p ~/.codex/skills
-ln -s ~/.local/share/pycastle-v0.1.1/skills/pycastle ~/.codex/skills/pycastle
+ln -s ~/.local/share/pycastle-v0.1.2/skills/pycastle ~/.codex/skills/pycastle
 
 # Claude Code
 mkdir -p ~/.claude/skills
-ln -s ~/.local/share/pycastle-v0.1.1/skills/pycastle ~/.claude/skills/pycastle
+ln -s ~/.local/share/pycastle-v0.1.2/skills/pycastle ~/.claude/skills/pycastle
 ```
 
 The wheel/tool and skill must always come from the same Git tag. The skill embeds
@@ -88,7 +88,8 @@ all of the project-owned behavior:
 - `.pycastle/gate` — the fail-closed project verification policy invoked by
   every Gate node; it must be configured before verification can pass.
 - `.pycastle/Dockerfile` — the language-neutral Agent image recipe with shipped
-  Runtime CLIs and a visible extension point for the project toolchain.
+  Runtime CLIs, the reserved host UID/GID interface, and a visible extension
+  point for the project toolchain.
 - `.pycastle/sandbox` — the selected `host` or `docker` Sandbox.
 - `.pycastle/version` — the installed PyCastle release that initialized or last
   migrated the fixture; `run` checks it before starting any Run side effects.
@@ -193,10 +194,10 @@ such as `git`, `gh`, worktree management, and image building stays on the host.
 ## Upgrade a Project fixture
 
 Choose a PyCastle release tag, reinstall that exact runner, and then explicitly
-migrate each initialized repository. For example, for `v0.1.1`:
+migrate each initialized repository. For example, for `v0.1.2`:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.2
 cd /path/to/initialized/repository
 pycastle upgrade
 ```
@@ -204,7 +205,7 @@ pycastle upgrade
 The equivalent `pipx` workflow is:
 
 ```bash
-pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.1
+pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.2
 cd /path/to/initialized/repository
 pycastle upgrade
 ```
@@ -216,9 +217,23 @@ dirty worktree and leaves a successful migration as an unstaged diff for you to
 inspect. PyCastle performs no self-update or update discovery, and it does not
 create a commit, branch, pull request, or merge authorization.
 
+The 0.1.2 Docker identity migration is deliberately owner-authored and uses two
+Upgrade passes:
+
+1. Doctor reports that fixture migration is required.
+2. Run `pycastle upgrade` from a clean checkout. It reports the required
+   `PYCASTLE_HOST_UID` and `PYCASTLE_HOST_GID` Dockerfile interface and writes
+   nothing.
+3. Edit, review, and commit `.pycastle/Dockerfile` so its declared non-root user
+   consumes both arguments and has their numeric UID/GID.
+4. Run `pycastle upgrade` again from the clean checkout. It validates the
+   declarations and advances the fixture marker.
+5. Review and commit the marker change, then rerun Doctor.
+
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
 Agent image. Doctor and Run build it with the clean repository root as context
-and pin the resulting immutable image identity for that one readiness snapshot.
+and the host process's effective UID/GID as non-secret reserved build arguments,
+then pin the resulting immutable image identity for that one readiness snapshot.
 PyCastle probes only its language-neutral launch, workspace, authentication, and
 Runtime boundary; project interpreters and toolchains remain behind Setup.
 

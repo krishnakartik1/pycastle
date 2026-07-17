@@ -58,8 +58,16 @@ depend on container-local changes, shell activation, exported variables, or a
 long-lived container surviving into the following node.
 
 Each Docker process runs in a fresh disposable container as the image's declared
-default user; PyCastle does not force a username, UID, or home path. PyCastle
-bind-mounts the repository workspace read-write at the same absolute path and
+default user; PyCastle does not force a username or home path and does not pass
+a runtime `--user` override. On POSIX hosts, every canonical image build supplies
+the non-secret decimal effective host identity as `PYCASTLE_HOST_UID` and
+`PYCASTLE_HOST_GID` build arguments. The project-owned Dockerfile must consume
+that interface and give its declared non-root user compatible numeric IDs,
+including when the base image already occupies either ID. A UID-0 host process
+is rejected because mapping the declared user to root would violate the Image
+contract. Hosts without meaningful effective Unix IDs fail image preparation
+with remediation rather than claiming readiness. PyCastle bind-mounts the
+repository workspace read-write at the same absolute path and
 sets the target Item or Run worktree as the process working directory. The only
 other persistent mount is the selected Runtime's Auth volume at
 `/pycastle/auth`; Codex and Claude use distinct volumes mounted at that same
@@ -86,6 +94,15 @@ Docker login builds the canonical Agent image and uses the Runtime-specific Auth
 volume. Authentication remains explicit and never occurs automatically during
 readiness or a Run. The old `pycastle sandbox setup` name has no compatibility
 alias.
+
+Release 0.1.2 introduces this Dockerfile interface as a manual compatibility
+boundary for every Project fixture. PyCastle validates semantic `ARG`
+declarations for both reserved names, but never rewrites the project-owned
+Dockerfile. An older fixture remains migration-required; its first Upgrade makes
+no writes and directs the owner to edit, review, and commit the Dockerfile. A
+second Upgrade from the corrected clean checkout validates adoption and advances
+the fixture marker. Doctor, not Upgrade, behaviorally proves that the resulting
+image user can create and modify host-owned worktree state.
 
 ## Rationale
 

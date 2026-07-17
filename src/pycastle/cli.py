@@ -466,7 +466,9 @@ def _cmd_runtime_login(args: argparse.Namespace) -> int:
             image = prepare_agent_image(
                 FIXTURE_DIR, runner=run_cmd, cwd=Path.cwd(), capture_build=False
             )
-        except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired) as exc:
+        except AgentImagePreparationError as exc:
+            raise PreflightError(str(exc)) from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
             raise PreflightError(
                 "Failed to build and pin the canonical Agent image."
             ) from exc

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from pycastle.migrations import MIGRATIONS, dockerfile_declares_host_identity
 from pycastle.upgrade import (
     FixtureMigration,
     FixtureUpgradeError,
@@ -295,3 +296,56 @@ def test_fixture_validator_does_not_execute_gate(tmp_path: Path) -> None:
     validate_fixture(fixture)
 
     assert not side_effect.exists()
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM scratch\n# ARG PYCASTLE_HOST_UID\n# ARG PYCASTLE_HOST_GID\n",
+        "FROM scratch\nRUN echo PYCASTLE_HOST_UID PYCASTLE_HOST_GID\n",
+        "FROM scratch\nARG PYCASTLE_HOST_UID\n",
+    ],
+)
+def test_012_manual_migration_rejects_nonsemantic_or_partial_args(
+    tmp_path: Path, dockerfile: str
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.1\n")
+    (fixture / "Dockerfile").write_text(dockerfile)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit", "-q"], cwd=project, check=True
+    )
+    before = {
+        p.relative_to(fixture): p.read_bytes()
+        for p in fixture.rglob("*")
+        if p.is_file()
+    }
+
+    with pytest.raises(FixtureUpgradeError, match="owner-authored.*PYCASTLE_HOST_UID"):
+        upgrade_fixture(project, runner_version="0.1.2", migrations=MIGRATIONS)
+
+    after = {
+        p.relative_to(fixture): p.read_bytes()
+        for p in fixture.rglob("*")
+        if p.is_file()
+    }
+    assert after == before
+
+
+def test_012_manual_migration_accepts_owner_authored_args_and_only_advances_marker(
+    tmp_path: Path,
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.1\n")
+    dockerfile = "FROM scratch\narg PYCASTLE_HOST_UID=1000\nARG PYCASTLE_HOST_GID\n"
+    (fixture / "Dockerfile").write_text(dockerfile)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit", "-q"], cwd=project, check=True
+    )
+
+    result = upgrade_fixture(project, runner_version="0.1.2", migrations=MIGRATIONS)
+
+    assert dockerfile_declares_host_identity(fixture)
+    assert (fixture / "Dockerfile").read_text() == dockerfile
+    assert (fixture / "version").read_text() == "0.1.2\n"
+    assert result.applied_versions == ()

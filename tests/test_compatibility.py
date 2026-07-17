@@ -44,7 +44,9 @@ def test_newer_fixture_is_an_unsupported_downgrade(tmp_path: Path) -> None:
 
 def test_same_or_older_fixture_is_compatible_without_migrations(tmp_path: Path) -> None:
     for marker in ("1.2.0\n", "1.0\n", "0\n"):
-        result = check_fixture_compatibility(_fixture(tmp_path, marker), "1.2.0")
+        result = check_fixture_compatibility(
+            _fixture(tmp_path, marker), "1.2.0", migration_versions=()
+        )
         assert result.status is FixtureCompatibilityStatus.COMPATIBLE
 
 
