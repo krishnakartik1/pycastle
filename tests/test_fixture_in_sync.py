@@ -128,8 +128,10 @@ def test_committed_fixture_matches_scaffolder(tmp_path: Path) -> None:
     )
 
     for relative in scaffolded_tree:
-        if relative == "gate":
-            # The repository customizes its project-owned Gate after init.
+        if relative in {"Dockerfile", "gate", "setup"} or relative.startswith(
+            "prompts/"
+        ):
+            # These files are deliberately project-owned after initialization.
             continue
         assert (committed / relative).read_bytes() == (
             scaffolded / relative

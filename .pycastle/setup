@@ -6,7 +6,6 @@
 # external-system effects survive; shell activation and exported variables do
 # not. Keep this safe to run repeatedly.
 #
-# Add commands when this project needs preparation. PyCastle does not inspect
-# dependency manifests or choose a language toolchain.
 set -eu
-:
+
+uv sync --locked --extra dev
