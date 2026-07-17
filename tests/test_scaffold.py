@@ -144,6 +144,10 @@ def test_dockerfile_is_neutral_and_has_project_extension(tmp_path: Path) -> None
     assert "git" in text
     assert "procps" in text
     assert "HOME=/home/pycastle" in text
+    assert "ARG PYCASTLE_HOST_UID" in text
+    assert "ARG PYCASTLE_HOST_GID" in text
+    assert 'getent passwd "${PYCASTLE_HOST_UID}"' in text
+    assert 'getent group "${PYCASTLE_HOST_GID}"' in text
     assert "python3" not in text and "ruff" not in text and "pytest" not in text
 
 

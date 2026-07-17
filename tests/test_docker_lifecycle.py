@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -7,6 +8,7 @@ import pytest
 
 from pycastle import cli, readiness
 from pycastle.readiness import AgentImagePreparationError, prepare_agent_image
+from pycastle.scaffold import scaffold_fixture
 
 IMAGE = "sha256:" + "b" * 64
 
@@ -66,6 +68,41 @@ def test_host_identity_resolver_rejects_root_with_actionable_guidance(
 
     with pytest.raises(AgentImagePreparationError, match="non-root host user"):
         readiness._resolve_posix_host_identity()
+
+
+@pytest.mark.skipif(
+    os.environ.get("PYCASTLE_DOCKER_TESTS") != "1",
+    reason="set PYCASTLE_DOCKER_TESTS=1 to run Docker-backed regressions",
+)
+def test_scaffold_image_writes_host_owned_0755_bind_mount(tmp_path: Path) -> None:
+    scaffold_fixture(tmp_path, sandbox="docker")
+    workspace = tmp_path / "worktree"
+    workspace.mkdir(mode=0o755)
+    existing = workspace / "existing"
+    existing.write_text("before\n")
+    existing.chmod(0o644)
+
+    image = prepare_agent_image(tmp_path / ".pycastle", cwd=tmp_path)
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--mount",
+        f"type=bind,src={workspace},dst=/worktree",
+        "--workdir",
+        "/worktree",
+        image,
+        "sh",
+        "-c",
+        "mkdir created-dir && : > created-file && printf after >> existing",
+    ]
+
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert (workspace / "created-dir").is_dir()
+    assert (workspace / "created-file").is_file()
+    assert existing.read_text().endswith("after")
 
 
 @pytest.mark.parametrize("missing", ["geteuid", "getegid"])

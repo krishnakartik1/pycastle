@@ -17,13 +17,10 @@ from . import __version__
 from .compatibility import FixtureCompatibilityStatus, check_fixture_compatibility
 from .graph import load_run
 from .migrations import MIGRATIONS, FixtureMigration
+from .upgrade_errors import FixtureUpgradeError
 
 FixtureWriter = Callable[[Path, Path], None]
 REQUIRED_FILES = ("main.py", "gate", "sandbox", "Dockerfile", "version")
-
-
-class FixtureUpgradeError(Exception):
-    """Raised when an upgrade cannot be completed without risking the fixture."""
 
 
 @dataclass(frozen=True)

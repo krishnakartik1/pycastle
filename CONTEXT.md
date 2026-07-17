@@ -140,8 +140,11 @@ _Avoid_: container, box, sandbox image.
 The language-agnostic boundary any **Agent image** must satisfy so PyCastle can
 execute the selected **Runtime**, **Setup**, and **Gate** in a writable Docker
 **Sandbox**. The image declares its own non-root user and writable home and must
-allow that user to write the worktree and PyCastle's neutral auth mount; PyCastle
-does not prescribe an identity or supply the project's language toolchain.
+allow that user to write the worktree and PyCastle's neutral auth mount. On
+POSIX hosts, canonical builds pass `PYCASTLE_HOST_UID` and
+`PYCASTLE_HOST_GID`; the project-owned Dockerfile must reconcile its declared
+user with those numeric IDs. PyCastle does not override the runtime user or
+supply the project's language toolchain.
 _Avoid_: requirements, spec.
 
 **Auth volume**:

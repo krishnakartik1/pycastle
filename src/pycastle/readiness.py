@@ -651,11 +651,12 @@ class DefaultReadinessAdapter:
             self._docker_workspace = Path(
                 tempfile.mkdtemp(prefix="pycastle-doctor-")
             ).resolve()
-            # The image-declared user may have a uid different from the host
-            # caller that owns this directory. This path holds no repository or
-            # credential data, so allow that user to traverse and write the
-            # disposable bind mount.
-            self._docker_workspace.chmod(0o777)
+            # Match a Git-created worktree: host-owned and traversable, but
+            # writable only by the host caller's numeric identity.
+            self._docker_workspace.chmod(0o755)
+            existing = self._docker_workspace / ".pycastle-existing"
+            existing.write_text("host-owned\n")
+            existing.chmod(0o644)
         return self._docker_workspace
 
     def _run(self, argv: list[str], *, timeout: float = SHORT_TIMEOUT) -> Any:
@@ -858,7 +859,13 @@ class DefaultReadinessAdapter:
                 build_timeout=IMAGE_BUILD_TIMEOUT,
             )
             object.__setattr__(config, "agent_image", prepared)
-        except (AgentImagePreparationError, OSError, subprocess.TimeoutExpired):
+        except AgentImagePreparationError as exc:
+            return CheckResult(
+                Status.FAIL,
+                "Agent image could not be prepared.",
+                remediation=str(exc),
+            )
+        except (OSError, subprocess.TimeoutExpired):
             return CheckResult(
                 Status.FAIL,
                 "Agent image could not be prepared.",
@@ -874,6 +881,7 @@ class DefaultReadinessAdapter:
             )
         auth_sentinel = f".pycastle-doctor-{uuid.uuid4().hex}"
         workspace_sentinel = f".pycastle-doctor-{uuid.uuid4().hex}"
+        directory_sentinel = f".pycastle-doctor-dir-{uuid.uuid4().hex}"
         script = r"""set -eu
 cleanup() { rm -f "${auth_file:-}" "${workspace_file:-}"; }
 trap cleanup EXIT HUP INT TERM
@@ -885,10 +893,15 @@ eval "config_value=\${$config_env-}"
 test "$config_value" = "$config_dir"
 auth_file="$config_dir/$auth_name"
 workspace_file="$PWD/$workspace_name"
+workspace_dir="$PWD/$directory_name"
 : >"$auth_file"
 : >"$workspace_file"
+mkdir "$workspace_dir"
+printf '%s\n' modified >>"$PWD/.pycastle-existing"
 test -w "$auth_file"
 test -w "$workspace_file"
+test -d "$workspace_dir"
+test "$(tail -n 1 "$PWD/.pycastle-existing")" = modified
 """
         inner = [
             "sh",
@@ -902,6 +915,7 @@ test -w "$workspace_file"
             f"runtime={config.runtime!s}; config_env={runtime_config.config_env!s}; "
             f"config_dir={runtime_config.config_dir!s}; auth_name={auth_sentinel!s}; "
             f"workspace_name={workspace_sentinel!s}; "
+            f"directory_name={directory_sentinel!s}; "
         )
         inner[2] = assignments + inner[2]
         argv = sandbox.build_run_command(
@@ -922,7 +936,9 @@ test -w "$workspace_file"
                 Status.FAIL,
                 "Agent image does not satisfy the runtime contract.",
                 {"image": prepared},
-                "Fix the image user, home, Runtime PATH, Auth volume, or workspace permissions.",
+                "Ensure .pycastle/Dockerfile consumes PYCASTLE_HOST_UID and "
+                "PYCASTLE_HOST_GID so its declared non-root user can write "
+                "host-owned worktrees; also verify home, Runtime PATH, and Auth volume permissions.",
             )
         )
 
