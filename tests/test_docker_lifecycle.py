@@ -181,3 +181,22 @@ def test_docker_runtime_login_builds_then_uses_pinned_identity(
     assert calls[2][:3] == ["docker", "run", "--rm"]
     assert IMAGE in calls[2]
     assert "pycastle-claude-auth:/pycastle/auth" in calls[2]
+
+
+def test_docker_runtime_login_preserves_image_preparation_remediation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = (
+        "Docker Agent-image preparation cannot reconcile host UID 0 without "
+        "violating the non-root Image contract. Run PyCastle as a non-root host user."
+    )
+    monkeypatch.setattr(
+        cli,
+        "prepare_agent_image",
+        MagicMock(side_effect=AgentImagePreparationError(message)),
+    )
+
+    with pytest.raises(cli.PreflightError, match="cannot reconcile host UID 0") as exc:
+        cli._cmd_runtime_login(argparse.Namespace(runtime="codex", sandbox="docker"))
+
+    assert str(exc.value) == message
