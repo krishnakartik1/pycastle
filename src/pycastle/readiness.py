@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -59,6 +60,43 @@ class AgentImagePreparationError(RuntimeError):
     """The resolved Agent image could not be prepared safely."""
 
 
+def _resolve_posix_host_identity() -> tuple[str, str]:
+    """Return the effective host UID/GID used for Docker bind mounts."""
+    if os.name != "posix" or not hasattr(os, "geteuid") or not hasattr(os, "getegid"):
+        raise AgentImagePreparationError(
+            "Docker Agent-image preparation requires a POSIX host with effective "
+            "Unix UID/GID values that describe bind-mount ownership. Run PyCastle "
+            "from a supported POSIX host."
+        )
+    try:
+        uid = os.geteuid()
+        gid = os.getegid()
+    except (OSError, RuntimeError) as exc:
+        raise AgentImagePreparationError(
+            "Docker Agent-image preparation could not determine the effective host "
+            "UID/GID. Run PyCastle from a supported POSIX host."
+        ) from exc
+    if (
+        isinstance(uid, bool)
+        or isinstance(gid, bool)
+        or not isinstance(uid, int)
+        or not isinstance(gid, int)
+        or uid < 0
+        or gid < 0
+    ):
+        raise AgentImagePreparationError(
+            "Docker Agent-image preparation received unusable effective host "
+            "UID/GID values. Run PyCastle from a supported POSIX host."
+        )
+    if uid == 0:
+        raise AgentImagePreparationError(
+            "Docker Agent-image preparation cannot reconcile host UID 0 without "
+            "violating the non-root Image contract. Run PyCastle as a non-root "
+            "host user."
+        )
+    return str(uid), str(gid)
+
+
 def prepare_agent_image(
     fixture_dir: Path,
     *,
@@ -75,6 +113,7 @@ def prepare_agent_image(
             "The canonical Dockerfile is missing or unsafe."
         )
     repository_root = Path(cwd or fixture_dir.parent).resolve()
+    host_uid, host_gid = _resolve_posix_host_identity()
     image = f"pycastle-readiness:{uuid.uuid4().hex}"
     run_options: dict[str, Any] = {}
     run_options["cwd"] = repository_root
@@ -85,6 +124,10 @@ def prepare_agent_image(
         [
             "docker",
             "build",
+            "--build-arg",
+            f"PYCASTLE_HOST_UID={host_uid}",
+            "--build-arg",
+            f"PYCASTLE_HOST_GID={host_gid}",
             "--file",
             str(dockerfile.resolve()),
             "--tag",

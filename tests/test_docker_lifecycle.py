@@ -5,15 +5,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pycastle import cli
+from pycastle import cli, readiness
 from pycastle.readiness import AgentImagePreparationError, prepare_agent_image
 
 IMAGE = "sha256:" + "b" * 64
 
 
 def test_canonical_build_uses_repository_context_and_pins_image_id(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(
+        readiness, "_resolve_posix_host_identity", lambda: ("1234", "5678")
+    )
     fixture = tmp_path / ".pycastle"
     fixture.mkdir()
     dockerfile = fixture / "Dockerfile"
@@ -27,7 +30,14 @@ def test_canonical_build_uses_repository_context_and_pins_image_id(
 
     assert prepare_agent_image(fixture, runner=runner, cwd=tmp_path) == IMAGE
     build = calls[0][0]
-    assert build[:2] == ["docker", "build"]
+    assert build[:6] == [
+        "docker",
+        "build",
+        "--build-arg",
+        "PYCASTLE_HOST_UID=1234",
+        "--build-arg",
+        "PYCASTLE_HOST_GID=5678",
+    ]
     assert build[build.index("--file") + 1] == str(dockerfile.resolve())
     assert build[-1] == str(tmp_path.resolve())
     assert calls[1][0][:5] == [
@@ -37,6 +47,35 @@ def test_canonical_build_uses_repository_context_and_pins_image_id(
         "--format",
         "{{.Id}}",
     ]
+
+
+def test_host_identity_resolver_returns_decimal_effective_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(readiness.os, "geteuid", lambda: 1234)
+    monkeypatch.setattr(readiness.os, "getegid", lambda: 5678)
+
+    assert readiness._resolve_posix_host_identity() == ("1234", "5678")
+
+
+def test_host_identity_resolver_rejects_root_with_actionable_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(readiness.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(readiness.os, "getegid", lambda: 0)
+
+    with pytest.raises(AgentImagePreparationError, match="non-root host user"):
+        readiness._resolve_posix_host_identity()
+
+
+@pytest.mark.parametrize("missing", ["geteuid", "getegid"])
+def test_host_identity_resolver_fails_cleanly_without_effective_unix_ids(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    monkeypatch.delattr(readiness.os, missing)
+
+    with pytest.raises(AgentImagePreparationError, match="supported POSIX host"):
+        readiness._resolve_posix_host_identity()
 
 
 @pytest.mark.parametrize("unsafe", ["missing", "symlink"])
