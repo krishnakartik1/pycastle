@@ -34,7 +34,20 @@ def test_readme_onboards_a_user_without_source_diving() -> None:
         assert fixture_entry in readme
 
     assert "ready-for-agent" in readme
+    assert "ready-for-human" in readme
     assert "gh issue edit" in readme
+    assert "npx skills@latest add mattpocock/skills" in readme
+    assert "Select both `setup-matt-pocock-skills` and `triage`" in readme
+    assert "/setup-matt-pocock-skills" in readme
+    assert "Review and commit the generated guidance" in readme
+    assert "gh label create ready-for-agent" in readme
+    assert "gh label create ready-for-human" in readme
+    assert "it does not create labels in GitHub" in " ".join(readme.split())
+    quick_start = readme.index("## Quick start")
+    setup = readme.index("/setup-matt-pocock-skills", quick_start)
+    initialize = readme.index("pycastle init", quick_start)
+    run = readme.index("pycastle run --runtime claude", quick_start)
+    assert setup < initialize < run
     assert "pycastle init --sandbox host" in readme
     assert "pycastle init --sandbox docker" in readme
     assert "non-interactive use" in readme.lower()
