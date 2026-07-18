@@ -1,13 +1,29 @@
 # PyCastle
 
-A reusable, installable autonomous development loop for any repository.
+PyCastle runs autonomous development graphs that turn ready GitHub issues into
+tested pull requests. Projects own their Execution graphs, Setup, and Gate;
+PyCastle owns the runner.
 
-PyCastle owns the runner while each project owns its prompts, Setup, Gate, and
-Execution graphs. It selects ready GitHub issues, gives each Item an isolated
-worktree, walks the project-owned Item and Run-scope graphs, and publishes the
-integrated Run in one pull request. Verification and recovery are visible Gate
-and Runtime nodes in those graphs.
+It gives each Item an isolated worktree, walks the project-owned Item and
+Run-scope graphs, and publishes the integrated Run in one pull request.
+Verification and recovery are visible Gate and Runtime nodes in those graphs.
 Claude Code and Codex are supported as runtimes, on the host or in Docker.
+
+## Choose a Sandbox
+
+Use the Docker Sandbox for autonomous Runs. The Docker Sandbox is the
+recommended isolation boundary for project execution: Setup, Runtime nodes, and
+Gate nodes execute inside the project-owned Agent image. PyCastle still performs
+orchestration such as Git, GitHub, worktree management, and image building on
+the host.
+
+Choose the host Sandbox only when you intentionally accept Setup, Runtime nodes,
+and Gate nodes running directly on the operator's machine. Codex host execution
+uses its native `workspace-write` sandbox, but Claude host execution currently
+inherits the operator's ambient Claude Code permission mode. PyCastle does not
+override that mode, so an ambient bypass setting also applies to the autonomous
+Run. A durable host-permission policy remains tracked in
+[Host guardrail asymmetry](https://github.com/krishnakartik1/pycastle/issues/62).
 
 ## Requirements
 
