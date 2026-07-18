@@ -70,6 +70,42 @@ host after installing the skill.
 
 ## Quick start
 
+### Configure the GitHub Issue source
+
+PyCastle expects the repository to describe its Issue source to coding agents
+and to provide the `ready-for-agent` and `ready-for-human` workflow labels.
+Install Matt Pocock's engineering skills once if your agent does not already
+offer `/setup-matt-pocock-skills`:
+
+```bash
+npx skills@latest add mattpocock/skills
+```
+
+Select both `setup-matt-pocock-skills` and `triage` for the coding agent you
+use. Then open that agent in the GitHub repository PyCastle will work on and
+invoke:
+
+```text
+/setup-matt-pocock-skills
+```
+
+Choose GitHub Issues and keep the default triage labels. The setup skill writes
+the repository's agent guidance and `docs/agents/` files; it does not create
+labels in GitHub. Review and commit the generated guidance, then create
+PyCastle's two required workflow labels once from the same repository:
+
+```bash
+gh label create ready-for-agent --description "Fully specified, ready for an AFK agent" --color 0E8A16 --force
+gh label create ready-for-human --description "Requires human implementation" --color FBCA04 --force
+```
+
+The `triage` skill can now prepare Issues for an autonomous Run by applying
+`ready-for-agent`. PyCastle changes an Item to `ready-for-human` when it needs a
+person. `pycastle doctor` verifies the authenticated Issue source and both
+labels before a Run can start.
+
+### Initialize the Project fixture
+
 From the repository you want PyCastle to work on, scaffold its project fixture:
 
 ```bash
