@@ -6,6 +6,6 @@
 # the project's complete verification policy.
 set -eu
 
-uv run --extra dev pytest -q
-uv run --extra dev black --check .
-uv run --extra dev ruff check .
+uv run --locked --extra dev pytest -q
+uv run --locked --extra dev black --check .
+uv run --locked --extra dev ruff check .
