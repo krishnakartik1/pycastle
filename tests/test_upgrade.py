@@ -25,18 +25,17 @@ def _project(tmp_path: Path, marker: str = "1.0\n") -> tuple[Path, Path]:
     fixture = project / ".pycastle"
     (fixture / "version").write_text(marker)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=project, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project,
+        check=True,
+    )
     subprocess.run(["git", "add", "."], cwd=project, check=True)
     subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-qm",
-            "fixture",
-        ],
+        ["git", "commit", "-qm", "fixture"],
         cwd=project,
         check=True,
     )
