@@ -426,6 +426,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not outcome.selected:
         if outcome.selection_end == ITEM_SELECTION_END_POLICY_HALT:
             logger.info("Project policy halted Item selection.")
+        elif not outcome.succeeded:
+            logger.error(
+                "Run %s stopped during Item selection; details are in local "
+                "Run records.",
+                outcome.run_id,
+            )
+            return 1
         else:
             logger.info("Nothing to do.")
         return 0

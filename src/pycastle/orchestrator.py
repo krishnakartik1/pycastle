@@ -54,7 +54,7 @@ from .graph import (
     walk_execution_graph,
 )
 from .issues import IssueSource
-from .models import IssueRef, RuntimeResult
+from .models import IssueRef, RuntimeResult, Telemetry
 from .readiness import FrozenReadinessInputs
 from .runtime import AgentCrashError, Runtime
 
@@ -541,7 +541,41 @@ def render_issue_context(issue: IssueRef) -> str:
 
 ITEM_SELECTION_NODE = "item-selection"
 SELECTION_REASON_LIMIT = 4_096
+SELECTION_RESPONSE_LIMIT_BYTES = 64 * 1_024
+SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES = 1_024 * 1_024
 ITEM_SELECTION_END_POLICY_HALT = "project-policy-halted"
+
+
+@dataclass(frozen=True)
+class ItemSelectionDecision:
+    """One validated project-policy response retained for local audit."""
+
+    item: int | None
+    reason: str
+
+
+class ItemSelectionError(Exception):
+    """A safe orchestration failure from one Item selection invocation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        parsed_response: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.parsed_response = parsed_response
+
+
+def _render_item_candidate_envelope(candidates: Sequence[IssueRef]) -> str:
+    """Serialize the exact frozen candidate facts supplied to project policy."""
+    return json.dumps(
+        [candidate.model_dump(mode="json") for candidate in candidates],
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def render_item_selection_prompt(
@@ -553,11 +587,7 @@ def render_item_selection_prompt(
     stale: Sequence[int] = (),
 ) -> str:
     """Compose frozen facts, project policy, and PyCastle's response contract."""
-    facts = json.dumps(
-        [candidate.model_dump(mode="json") for candidate in candidates],
-        indent=2,
-        sort_keys=True,
-    )
+    facts = _render_item_candidate_envelope(candidates)
     completed = [outcome.issue.number for outcome in outcomes if outcome.merged]
     progress = json.dumps(
         {
@@ -593,37 +623,119 @@ def render_item_selection_prompt(
     )
 
 
-def _parse_item_selection(output: str, allowed: set[int]) -> int | None:
+def _parse_item_selection(
+    output: str, allowed: set[int]
+) -> tuple[ItemSelectionDecision, dict[str, object]]:
     """Validate one Runtime selection response at the orchestration boundary."""
     opening = "<selection>"
     closing = "</selection>"
     if output.count(opening) != 1 or output.count(closing) != 1:
-        raise ValueError("Item selection response must contain exactly one block")
+        raise ItemSelectionError(
+            "Item selection response must contain exactly one block",
+            code="selection-block-count",
+        )
     start = output.index(opening) + len(opening)
     end = output.index(closing)
     if end < start:
-        raise ValueError("Item selection response tags are out of order")
+        raise ItemSelectionError(
+            "Item selection response tags are out of order",
+            code="selection-tags-out-of-order",
+        )
+    structured = output[start:end]
+    if len(structured.encode("utf-8")) > SELECTION_RESPONSE_LIMIT_BYTES:
+        raise ItemSelectionError(
+            "Item selection response exceeds the structured response limit",
+            code="selection-response-oversized",
+        )
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document = dict(pairs)
+        if len(document) != len(pairs):
+            raise ItemSelectionError(
+                "Item selection response contains a repeated field",
+                code="selection-fields-invalid",
+            )
+        return document
+
     try:
-        document = json.loads(output[start:end])
+        document = json.loads(structured, object_pairs_hook=unique_object)
     except json.JSONDecodeError as exc:
-        raise ValueError("Item selection response contains invalid JSON") from exc
+        raise ItemSelectionError(
+            "Item selection response contains invalid JSON",
+            code="selection-json-invalid",
+        ) from exc
     if not isinstance(document, dict) or set(document) != {"item", "reason"}:
-        raise ValueError("Item selection response has invalid fields")
+        raise ItemSelectionError(
+            "Item selection response has invalid fields",
+            code="selection-fields-invalid",
+            parsed_response=document,
+        )
     reason = document["reason"]
     if (
         not isinstance(reason, str)
         or not reason.strip()
         or len(reason) > SELECTION_REASON_LIMIT
     ):
-        raise ValueError("Item selection reason is invalid")
+        raise ItemSelectionError(
+            "Item selection reason is invalid",
+            code="selection-reason-invalid",
+            parsed_response=document,
+        )
     item = document["item"]
-    if item is None:
-        return None
-    if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
-        raise ValueError("Selected Item number is invalid")
-    if item not in allowed:
-        raise ValueError("Selected Item is not in the remaining candidate pool")
-    return item
+    if item is not None:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise ItemSelectionError(
+                "Selected Item number is invalid",
+                code="selection-item-invalid",
+                parsed_response=document,
+            )
+        if item not in allowed:
+            raise ItemSelectionError(
+                "Selected Item is not in the remaining candidate pool",
+                code="selection-item-out-of-pool",
+                parsed_response=document,
+            )
+    return ItemSelectionDecision(item, reason), document
+
+
+def _write_item_selection_record(
+    *,
+    fixture_dir: Path,
+    run_id: str,
+    round_number: int,
+    candidate_envelope: str,
+    prompt_name: str,
+    directions: str,
+    runtime_transcript: str | None,
+    runtime_telemetry: Telemetry | None,
+    runtime_error: str | None,
+    parsed_response: object | None,
+    validation_status: Literal["accepted", "failed"],
+    validation_code: str,
+) -> None:
+    """Retain one exact selection exchange only in the ignored local Run record."""
+    record = {
+        "schema_version": 1,
+        "candidate_envelope": candidate_envelope,
+        "prompt": {
+            "name": prompt_name,
+            "sha256": hashlib.sha256(directions.encode("utf-8")).hexdigest(),
+        },
+        "runtime_transcript": runtime_transcript,
+        "runtime_telemetry": (
+            runtime_telemetry.model_dump(mode="json")
+            if runtime_telemetry is not None
+            else None
+        ),
+        "runtime_error": runtime_error,
+        "parsed_response": parsed_response,
+        "validation": {
+            "status": validation_status,
+            "code": validation_code,
+        },
+    }
+    path = _telemetry_dir(fixture_dir, run_id) / f"selection-{round_number:03d}.json"
+    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
 
 
 def _select_item(
@@ -634,6 +746,9 @@ def _select_item(
     worktree: Path,
     prompt_name: str,
     execution: FrozenRunExecution,
+    fixture_dir: Path,
+    run_id: str,
+    round_number: int,
     attempted: Sequence[int] = (),
     stale: Sequence[int] = (),
 ) -> IssueRef | None:
@@ -643,25 +758,91 @@ def _select_item(
         raise ValueError(
             f"Frozen Item selection prompt is missing: {prompt_name!r}"
         ) from None
-    result = runtime.run(
-        render_item_selection_prompt(
-            candidates,
-            outcomes,
-            directions,
-            attempted=attempted,
-            stale=stale,
-        ),
-        cwd=worktree,
-        node=ITEM_SELECTION_NODE,
+    candidate_envelope = _render_item_candidate_envelope(candidates)
+
+    def record(
+        status: Literal["accepted", "failed"],
+        code: str,
+        *,
+        result: RuntimeResult | None = None,
+        runtime_error: str | None = None,
+        parsed_response: object | None = None,
+    ) -> None:
+        _write_item_selection_record(
+            fixture_dir=fixture_dir,
+            run_id=run_id,
+            round_number=round_number,
+            candidate_envelope=candidate_envelope,
+            prompt_name=prompt_name,
+            directions=directions,
+            runtime_transcript=result.output if result is not None else None,
+            runtime_telemetry=result.telemetry if result is not None else None,
+            runtime_error=runtime_error,
+            parsed_response=parsed_response,
+            validation_status=status,
+            validation_code=code,
+        )
+
+    if (
+        len(candidate_envelope.encode("utf-8"))
+        > SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES
+    ):
+        error = ItemSelectionError(
+            "Item candidate envelope exceeds the selection invocation limit",
+            code="candidate-envelope-oversized",
+        )
+        record("failed", error.code)
+        raise error
+    prompt = render_item_selection_prompt(
+        candidates,
+        outcomes,
+        directions,
+        attempted=attempted,
+        stale=stale,
     )
+    try:
+        result = runtime.run(prompt, cwd=worktree, node=ITEM_SELECTION_NODE)
+    except Exception as exc:
+        error = ItemSelectionError(
+            "Item selection Runtime failed",
+            code="selection-runtime-failed",
+        )
+        record(
+            "failed",
+            error.code,
+            runtime_error=f"{type(exc).__name__}: {exc}",
+        )
+        raise error from exc
     if not isinstance(result, RuntimeResult):
-        raise TypeError("Item selection Runtime returned a malformed result")
-    number = _parse_item_selection(
-        result.output, {candidate.number for candidate in candidates}
+        error = ItemSelectionError(
+            "Item selection Runtime returned a malformed result",
+            code="selection-runtime-result-invalid",
+        )
+        record("failed", error.code)
+        raise error
+    try:
+        decision, parsed_response = _parse_item_selection(
+            result.output, {candidate.number for candidate in candidates}
+        )
+    except ItemSelectionError as error:
+        record(
+            "failed",
+            error.code,
+            result=result,
+            parsed_response=error.parsed_response,
+        )
+        raise
+    record(
+        "accepted",
+        "selection-accepted",
+        result=result,
+        parsed_response=parsed_response,
     )
-    if number is None:
+    if decision.item is None:
         return None
-    return next(candidate for candidate in candidates if candidate.number == number)
+    return next(
+        candidate for candidate in candidates if candidate.number == decision.item
+    )
 
 
 def _telemetry_dir(fixture_dir: Path, run_id: str) -> Path:
@@ -937,6 +1118,22 @@ def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
         raise BranchError(
             f"git branch deletion failed for {branch}{_git_failure_detail(result)}"
         )
+
+
+def _delete_failed_run_branch(run: RunContext, *, workspace: Path) -> None:
+    """Remove local and previously-pushed Run refs after pre-integration failure."""
+    if run.remote_checkpoint_succeeded:
+        result = run.runner(
+            ["git", "push", "origin", "--delete", run.branch],
+            capture=True,
+            cwd=workspace,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise BranchError(
+                f"remote Run branch deletion failed for {run.branch}"
+                f"{_git_failure_detail(result)}"
+            )
+    delete_local_branch(run.branch, runner=run.runner, cwd=workspace)
 
 
 @contextmanager
@@ -1792,22 +1989,41 @@ def run_batch(
         try:
             remaining = list(selected)
             claimed_attempts = 0
+            selection_round = 0
             while remaining and claimed_attempts < iterations:
-                with _disposable_selection_worktree(
-                    run,
-                    worktree_root=worktree_root,
-                    workspace=workspace,
-                ) as selection_worktree:
-                    issue = _select_item(
-                        remaining,
-                        outcome.issues,
-                        runtime=runtime,
-                        worktree=selection_worktree,
-                        prompt_name=run_definition.item.selection.prompt,
-                        execution=execution,
-                        attempted=outcome.attempted,
-                        stale=outcome.stale,
+                selection_round += 1
+                try:
+                    with _disposable_selection_worktree(
+                        run,
+                        worktree_root=worktree_root,
+                        workspace=workspace,
+                    ) as selection_worktree:
+                        issue = _select_item(
+                            remaining,
+                            outcome.issues,
+                            runtime=runtime,
+                            worktree=selection_worktree,
+                            prompt_name=run_definition.item.selection.prompt,
+                            execution=execution,
+                            fixture_dir=fixture_dir,
+                            run_id=run_id,
+                            round_number=selection_round,
+                            attempted=outcome.attempted,
+                            stale=outcome.stale,
+                        )
+                except ItemSelectionError:
+                    if outcome.completed:
+                        raise
+                    outcome.succeeded = False
+                    outcome.stopping_point = "Item selection"
+                    _append_log(
+                        fixture_dir,
+                        run_id,
+                        "Item selection failed; details retained in local Run records.",
                     )
+                    cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+                    _delete_failed_run_branch(run, workspace=workspace)
+                    return outcome
                 if issue is None:
                     outcome.selection_end = ITEM_SELECTION_END_POLICY_HALT
                     _append_log(

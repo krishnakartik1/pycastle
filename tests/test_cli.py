@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from importlib.metadata import version
 from pathlib import Path
@@ -367,6 +368,9 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
         "durable-change",
         "runtime-failure",
         "invalid-response",
+        "out-of-pool",
+        "oversized-response",
+        "candidate-overflow",
         "cancelled",
     ),
 )
@@ -383,6 +387,7 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     (prompts / "select.md").write_text("Choose the most actionable candidate.")
     (prompts / "prepare.md").write_text("Prepare the Run.")
     (prompts / "work.md").write_text("Implement the selected Item.")
+    (fixture / ".gitignore").write_text("/runs/\n")
     (fixture / "main.py").write_text(
         "from pycastle.graph import (build_item,build_run,execution_graph,"
         "gate_node,runtime_node,runtime_selection)\n"
@@ -428,7 +433,11 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     item = IssueRef(
         number=42,
         title="Project-owned choice",
-        body="The complete frozen body.",
+        body=(
+            "X" * 1_100_000
+            if selection_outcome == "candidate-overflow"
+            else "The complete frozen body."
+        ),
         labels=["ready-for-agent", "priority:high"],
         assignees=["krishna"],
         comments=[IssueComment(author="reviewer", body="Frozen comment.")],
@@ -518,16 +527,28 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                         cwd.parent / "run-later-candidate-171" / "DURABLE_CHANGE"
                     ).write_text("selection reached outside its disposable worktree\n")
                 if selection_outcome == "runtime-failure":
-                    raise RuntimeError("selection Runtime failed")
+                    raise RuntimeError(
+                        "selection Runtime failed with private provider detail"
+                    )
                 if selection_outcome == "cancelled":
                     raise KeyboardInterrupt
                 return RuntimeResult(
                     output=(
-                        "not a selection response"
+                        "private transcript without a selection response"
                         if selection_outcome == "invalid-response"
                         else (
-                            '<selection>{"item": 42, "reason": '
-                            '"Highest-priority actionable candidate."}</selection>'
+                            '<selection>{"item": 999, "reason": '
+                            '"private out-of-pool reason"}</selection>'
+                            if selection_outcome == "out-of-pool"
+                            else (
+                                "<selection>" + (" " * 65_537) + "</selection>"
+                                if selection_outcome == "oversized-response"
+                                else (
+                                    '<selection>{"item": 42, "reason": '
+                                    '"Highest-priority actionable candidate."}'
+                                    "</selection>"
+                                )
+                            )
                         )
                     ),
                     telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
@@ -558,12 +579,14 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
             match="selection changed the durable Run branch or worktree",
         ):
             main(["run", "--sandbox", "host", "--runtime", "stub"])
-    elif selection_outcome == "runtime-failure":
-        with pytest.raises(RuntimeError, match="selection Runtime failed"):
-            main(["run", "--sandbox", "host", "--runtime", "stub"])
-    elif selection_outcome == "invalid-response":
-        with pytest.raises(ValueError, match="exactly one block"):
-            main(["run", "--sandbox", "host", "--runtime", "stub"])
+    elif selection_outcome in {
+        "runtime-failure",
+        "invalid-response",
+        "out-of-pool",
+        "oversized-response",
+        "candidate-overflow",
+    }:
+        assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 1
     elif selection_outcome == "cancelled":
         assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 130
     else:
@@ -572,9 +595,98 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     if selection_outcome != "valid":
         source.is_still_eligible.assert_not_called()
         source.claim.assert_not_called()
-        assert len(selection_worktrees) == 1
-        assert selection_worktrees[0].name == "selection-later-candidate-171"
-        assert not selection_worktrees[0].exists()
+        expected_invocations = 0 if selection_outcome == "candidate-overflow" else 1
+        assert len(selection_worktrees) == expected_invocations
+        if selection_worktrees:
+            assert selection_worktrees[0].name == "selection-later-candidate-171"
+            assert not selection_worktrees[0].exists()
+        else:
+            assert not (
+                fixture / "worktrees" / "selection-later-candidate-171"
+            ).exists()
+        if selection_outcome in {
+            "runtime-failure",
+            "invalid-response",
+            "out-of-pool",
+            "oversized-response",
+            "candidate-overflow",
+        }:
+            assert source.mock_calls == []
+            record = json.loads(
+                (
+                    fixture / "runs" / "later-candidate-171" / "selection-001.json"
+                ).read_text()
+            )
+            assert record["candidate_envelope"].index('"number": 1') < record[
+                "candidate_envelope"
+            ].index('"number": 42')
+            assert record["prompt"]["name"] == "select.md"
+            assert len(record["prompt"]["sha256"]) == 64
+            assert record["validation"]["status"] == "failed"
+            if selection_outcome == "invalid-response":
+                assert (
+                    record["runtime_transcript"]
+                    == "private transcript without a selection response"
+                )
+                assert record["parsed_response"] is None
+            elif selection_outcome == "runtime-failure":
+                assert record["runtime_transcript"] is None
+                assert "private provider detail" in record["runtime_error"]
+            elif selection_outcome == "out-of-pool":
+                assert record["parsed_response"] == {
+                    "item": 999,
+                    "reason": "private out-of-pool reason",
+                }
+                assert record["validation"]["code"] == "selection-item-out-of-pool"
+            elif selection_outcome == "oversized-response":
+                assert record["validation"]["code"] == "selection-response-oversized"
+                assert record["parsed_response"] is None
+            else:
+                assert record["validation"]["code"] == "candidate-envelope-oversized"
+                assert record["runtime_transcript"] is None
+            assert "private transcript" not in caplog.text
+            assert "private provider detail" not in caplog.text
+            assert "private out-of-pool reason" not in caplog.text
+            assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+            assert [
+                "git",
+                "push",
+                "origin",
+                "--delete",
+                "pycastle/run-later-candidate-171",
+            ] in process_calls
+            assert (
+                subprocess.run(
+                    [
+                        "git",
+                        "check-ignore",
+                        str(
+                            fixture
+                            / "runs"
+                            / "later-candidate-171"
+                            / "selection-001.json"
+                        ),
+                    ],
+                    cwd=tmp_path,
+                    capture_output=True,
+                    check=False,
+                ).returncode
+                == 0
+            )
+            assert (
+                subprocess.run(
+                    [
+                        "git",
+                        "show-ref",
+                        "--verify",
+                        "refs/heads/pycastle/run-later-candidate-171",
+                    ],
+                    cwd=tmp_path,
+                    capture_output=True,
+                    check=False,
+                ).returncode
+                != 0
+            )
         return
 
     assert outcomes[0].completed == [42]

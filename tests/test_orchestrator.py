@@ -171,3 +171,63 @@ def test_runtime_cannot_change_later_frozen_prompts_or_setup(tmp_path: Path) -> 
     assert "repair prompt" in repair_prompts[0]
     assert "mutated prompt" not in repair_prompts[0]
     assert trace.read_text().splitlines() == ["original", "original"]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "no structured response",
+        (
+            '<selection>{"item": 1, "reason": "one"}</selection>'
+            '<selection>{"item": 1, "reason": "two"}</selection>'
+        ),
+        ('<selection>{"item": 1, "reason": "one"}</selection></selection>'),
+        '</selection>{"item": 1, "reason": "wrong order"}<selection>',
+        '<selection>{"item":</selection>',
+        "<selection>[]</selection>",
+        '<selection>{"item": 1, "reason": "valid", "extra": true}</selection>',
+        ('<selection>{"item": 1, "item": 2, "reason": "repeated field"}</selection>'),
+        '<selection>{"item": 1}</selection>',
+        '<selection>{"item": true, "reason": "invalid bool"}</selection>',
+        '<selection>{"item": "1", "reason": "invalid string"}</selection>',
+        '<selection>{"item": 1.0, "reason": "invalid float"}</selection>',
+        '<selection>{"item": 0, "reason": "not positive"}</selection>',
+        '<selection>{"item": -1, "reason": "not positive"}</selection>',
+        '<selection>{"item": 999, "reason": "not remaining"}</selection>',
+        '<selection>{"item": 1, "reason": null}</selection>',
+        '<selection>{"item": 1, "reason": ""}</selection>',
+        '<selection>{"item": 1, "reason": "   "}</selection>',
+        (
+            '<selection>{"item": 1, "reason": "'
+            + ("r" * (orchestrator.SELECTION_REASON_LIMIT + 1))
+            + '"}</selection>'
+        ),
+        (
+            "<selection>"
+            + (" " * (orchestrator.SELECTION_RESPONSE_LIMIT_BYTES + 1))
+            + "</selection>"
+        ),
+    ],
+)
+def test_item_selection_protocol_rejects_hostile_structured_responses(
+    output: str,
+) -> None:
+    with pytest.raises(orchestrator.ItemSelectionError):
+        orchestrator._parse_item_selection(output, {1, 2})
+
+
+@pytest.mark.parametrize("item", [2, None])
+def test_item_selection_protocol_ignores_outside_text(
+    item: int | None,
+) -> None:
+    output = (
+        "private Runtime narration before\n"
+        f'<selection>{{"item": {json.dumps(item)}, "reason": "bounded"}}</selection>'
+        "\nprivate Runtime narration after"
+    )
+
+    decision, parsed = orchestrator._parse_item_selection(output, {1, 2})
+
+    assert decision.item == item
+    assert decision.reason == "bounded"
+    assert parsed == {"item": item, "reason": "bounded"}
