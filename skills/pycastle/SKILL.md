@@ -5,12 +5,11 @@ description: Onboard a project, check readiness, operate a PyCastle Run, and coo
 
 # PyCastle lifecycle
 
-PyCastle release: `0.1.3`
+PyCastle release: `0.1.4`
 
 Use this vendor-neutral workflow to operate PyCastle for the current repository.
-Treat `v0.1.3` as the only compatible runner and skill Git tag. Do not use
-`v0.1.2`: its Upgrade validator rejects a standard Project fixture containing
-Gate nodes.
+Treat `v0.1.4` as the only compatible runner and skill Git tag. Earlier releases
+predate the complete project-owned Item selection contract.
 
 ## Select the Runtime
 
@@ -27,18 +26,18 @@ Call that choice `<runtime>` in the commands below.
 
 Before `init`, Doctor, or Run, execute `pycastle --version`. Parse the command's
 documented `pycastle <version>` output and require the normalized version to equal
-`0.1.3` exactly. A malformed output, prerelease, local version, or any other value
+`0.1.4` exactly. A malformed output, prerelease, local version, or any other value
 is a version mismatch.
 
 On a version mismatch, stop. Reinstall both the runner and this canonical skill
-from `v0.1.3`; do not continue with a merely compatible-looking version:
+from `v0.1.4`; do not continue with a merely compatible-looking version:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.3
-git clone --depth 1 --branch v0.1.3 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.3
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.4
+git clone --depth 1 --branch v0.1.4 https://github.com/krishnakartik1/pycastle /tmp/pycastle-v0.1.4
 ```
 
-Then install or link `/tmp/pycastle-v0.1.3/skills/pycastle/` into the invoking
+Then install or link `/tmp/pycastle-v0.1.4/skills/pycastle/` into the invoking
 host's skill discovery directory and restart/reload that host. Re-run
 `pycastle --version`; do not proceed until it exactly matches this embedded release.
 
@@ -105,9 +104,15 @@ manual boundary it makes no writes and instructs the owner to add the reserved
 `PYCASTLE_HOST_UID` and `PYCASTLE_HOST_GID` declarations and reconcile the
 image-declared non-root user. The owner edits, reviews, and commits the
 project-owned Dockerfile. Run `pycastle upgrade` again from that clean checkout,
-then review and commit its marker change and rerun Doctor. Do not inspect or
-interpret the release marker, reinitialize the fixture, or rewrite the
-Dockerfile automatically.
+then review and commit its marker change. For the 0.1.4 manual boundary it also
+makes no writes until the owner adds and reviews a project-owned selection prompt
+and wraps the Item execution graph in an Item definition using `build_item` and
+`runtime_selection`. Run `pycastle upgrade` again after committing those owner
+changes, then review and commit its marker change and rerun Doctor. Do not inspect
+or interpret the release marker, reinitialize the fixture, or rewrite project-owned
+files automatically. When one upgrade spans both manual boundaries, PyCastle
+keeps the operation transactional and advances the marker only after both
+owner-authored contracts are present.
 
 Use only the already-eligible `ready-for-agent` Items in Doctor's resolved batch.
 Zero eligible Items is a successful no-op. If fewer than five are eligible, accept

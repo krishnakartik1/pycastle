@@ -34,16 +34,17 @@ Run. A durable host-permission policy remains tracked in
 
 ## Install
 
-Release `v0.1.3` contains the current lifecycle skill. Once that
+Release `v0.1.4` contains the current lifecycle skill. Once that
 tag is published, install it directly from GitHub:
 
 ```bash
-uv pip install git+https://github.com/krishnakartik1/pycastle@v0.1.3
+uv pip install git+https://github.com/krishnakartik1/pycastle@v0.1.4
 ```
 
-Release `v0.1.3` supersedes `v0.1.2`: the earlier runner cannot complete
-Upgrade for a standard Project fixture containing Gate nodes. The correction is
-a runner patch and does not introduce a new Project fixture migration.
+Release `v0.1.4` introduces the project-owned Item selection contract and its
+owner-authored Project fixture migration. Release `v0.1.3` was a runner-only
+patch superseding `v0.1.2`: it corrected Upgrade validation for standard Project
+fixtures containing Gate nodes and did not introduce a fixture migration.
 
 Run that inside an active virtual environment, or pass `--system` to `uv pip`
 when intentionally installing into the system environment. Once the package is
@@ -63,7 +64,7 @@ Claude Code. Obtain its canonical source from the same Git tag as the installed
 runner:
 
 ```bash
-git clone --depth 1 --branch v0.1.3 https://github.com/krishnakartik1/pycastle ~/.local/share/pycastle-v0.1.3
+git clone --depth 1 --branch v0.1.4 https://github.com/krishnakartik1/pycastle ~/.local/share/pycastle-v0.1.4
 ```
 
 Link that one `skills/pycastle/` directory into the discovery location for the
@@ -72,11 +73,11 @@ host you use:
 ```bash
 # Codex
 mkdir -p ~/.codex/skills
-ln -s ~/.local/share/pycastle-v0.1.3/skills/pycastle ~/.codex/skills/pycastle
+ln -s ~/.local/share/pycastle-v0.1.4/skills/pycastle ~/.codex/skills/pycastle
 
 # Claude Code
 mkdir -p ~/.claude/skills
-ln -s ~/.local/share/pycastle-v0.1.3/skills/pycastle ~/.claude/skills/pycastle
+ln -s ~/.local/share/pycastle-v0.1.4/skills/pycastle ~/.claude/skills/pycastle
 ```
 
 The wheel/tool and skill must always come from the same Git tag. The skill embeds
@@ -250,10 +251,10 @@ such as `git`, `gh`, worktree management, and image building stays on the host.
 ## Upgrade a Project fixture
 
 Choose a PyCastle release tag, reinstall that exact runner, and then explicitly
-migrate each initialized repository. For example, for `v0.1.3`:
+migrate each initialized repository. For example, for `v0.1.4`:
 
 ```bash
-uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.3
+uv tool install --force git+https://github.com/krishnakartik1/pycastle@v0.1.4
 cd /path/to/initialized/repository
 pycastle upgrade
 ```
@@ -261,7 +262,7 @@ pycastle upgrade
 The equivalent `pipx` workflow is:
 
 ```bash
-pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.3
+pipx install --force git+https://github.com/krishnakartik1/pycastle@v0.1.4
 cd /path/to/initialized/repository
 pycastle upgrade
 ```
@@ -285,6 +286,21 @@ Upgrade passes:
 4. Run `pycastle upgrade` again from the clean checkout. It validates the
    declarations and advances the fixture marker.
 5. Review and commit the marker change, then rerun Doctor.
+
+Release 0.1.3 was a runner-only correction and has no Project fixture migration.
+The 0.1.4 Item selection migration is also deliberately owner-authored:
+
+1. Run `pycastle upgrade` from a clean checkout. It reports the required
+   project-owned Item selection contract and writes nothing.
+2. Add and review a selection prompt under `.pycastle/prompts/`.
+3. Wrap the Item execution graph in an Item definition using `build_item`, and
+   pair it with `runtime_selection` for the new prompt.
+4. Commit those owner-authored changes, then run `pycastle upgrade` again.
+5. Review and commit the marker change, then rerun Doctor.
+
+When upgrading across both owner-authored boundaries in one jump, Upgrade stays
+transactional and advances the fixture marker only after both contracts are
+present.
 
 When Docker is selected, `.pycastle/Dockerfile` is the source of truth for the
 Agent image. Doctor and Run build it with the clean repository root as context
