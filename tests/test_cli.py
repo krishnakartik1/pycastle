@@ -809,6 +809,266 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
     )
 
 
+def _run_stale_recheck_from_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    recheck_failure: OSError | None = None,
+) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str], list[str]]:
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose the next dependency-ready Item.")
+    (prompts / "work.md").write_text("Implement the selected Item.")
+    (prompts / "summarize.md").write_text("Summarize the bounded Run outcomes.")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "gate_node,runtime_node,runtime_selection)\n"
+        "run=build_run("
+        "item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md',on_success='verify'),"
+        "gate_node('verify')])),"
+        "after=execution_graph(start='summarize',nodes=["
+        "runtime_node('summarize','summarize.md',on_success='verify-run'),"
+        "gate_node('verify-run')])"
+        ")\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(
+        f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        f"#!/bin/sh\nprintf 'gate:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    gate.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    candidates = tuple(
+        IssueRef(
+            number=number,
+            title=title,
+            body=f"Frozen body for Item {number}.",
+            comments=[
+                IssueComment(
+                    author="maintainer", body=f"Frozen comment for Item {number}."
+                )
+            ],
+            labels=["ready-for-agent", priority],
+            assignees=["krishna"],
+        )
+        for number, title, priority in (
+            (11, "Stale foundation", "priority:high"),
+            (22, "Still actionable", "priority:normal"),
+        )
+    )
+    configuration = ReadinessConfiguration(
+        repository="owner/repo",
+        base_branch="main",
+        github_default_branch="main",
+        runtime="stub",
+        sandbox="host",
+        agent_image=None,
+        assignee="krishna",
+        include_unassigned=False,
+        item_limit=1,
+    )
+    frozen = FrozenReadinessInputs(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(),
+        readiness._freeze_project_fixture(fixture, load_run(fixture)),
+        tuple(candidate.model_copy(deep=True) for candidate in candidates),
+        configuration.sandbox,
+        configuration.runtime,
+        configuration.agent_image,
+    )
+    report = ReadinessReport(
+        schema_version=1,
+        outcome=ReadinessOutcome.READY,
+        runner_version="0.1.0",
+        configuration=configuration,
+        checks=tuple(
+            ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+        ),
+        eligible_items=tuple(
+            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        ),
+        selected_items=frozen.items,
+        frozen_inputs=frozen,
+    )
+    candidates[0].body = "Changed after readiness."
+    candidates[1].body = "Changed after readiness."
+
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    selection_prompts: list[str] = []
+    after_prompts: list[str] = []
+    choices = iter((11, 22))
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            if node == "item-selection":
+                selection_prompts.append(prompt)
+                choice = next(choices)
+                return RuntimeResult(
+                    output=(
+                        f'<selection>{{"item": {choice}, "reason": '
+                        '"Project dependency order."}</selection>'
+                    ),
+                    telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+                )
+            result = super().run(prompt, cwd=cwd, node=node)
+            if node == "work":
+                (cwd / "completed-item.txt").write_text("done\n")
+            elif node == "summarize":
+                after_prompts.append(prompt)
+            return result
+
+    source = MagicMock()
+    if recheck_failure is None:
+        source.is_still_eligible.side_effect = (False, True)
+    else:
+        source.is_still_eligible.side_effect = recheck_failure
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "stale-fallthrough-177")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+    exit_code = main(
+        ["run", "--sandbox", "host", "--runtime", "stub", "--iterations", "1"]
+    )
+    return (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+    )
+
+
+def test_stale_policy_choice_falls_through_without_consuming_run_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        _process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+    ) = _run_stale_recheck_from_cli(monkeypatch, tmp_path)
+
+    assert exit_code == 0
+    assert outcomes[0].selected == [11, 22]
+    assert outcomes[0].stale == [11]
+    assert outcomes[0].attempted == [22]
+    assert outcomes[0].completed == [22]
+    assert outcomes[0].selection_end == "claimed-attempt-limit-reached"
+    assert len(selection_prompts) == 2
+    assert '"number": 11' in selection_prompts[0]
+    assert '"number": 22' in selection_prompts[0]
+    assert '"number": 11' not in selection_prompts[1]
+    assert "Frozen body for Item 11." not in selection_prompts[1]
+    assert "Frozen body for Item 22." in selection_prompts[1]
+    assert "Changed after readiness." not in "\n".join(selection_prompts)
+    assert '"attempted": []' in selection_prompts[1]
+    assert '"stale": [\n    11\n  ]' in selection_prompts[1]
+    assert len(after_prompts) == 1
+    assert "#11: Stale foundation [stale]" in after_prompts[0]
+    assert "#22: Still actionable [completed]" in after_prompts[0]
+    rechecked = [recheck.args[0] for recheck in source.is_still_eligible.call_args_list]
+    assert [item.number for item in rechecked] == [11, 22]
+    assert [item.body for item in rechecked] == [
+        "Frozen body for Item 11.",
+        "Frozen body for Item 22.",
+    ]
+    assert all(
+        recheck.kwargs == {"assignee": "krishna", "include_unassigned": False}
+        for recheck in source.is_still_eligible.call_args_list
+    )
+    source.claim.assert_called_once_with(22, assignee="krishna")
+    source.list_ready.assert_not_called()
+
+
+def test_item_recheck_error_fails_run_instead_of_marking_item_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+    ) = _run_stale_recheck_from_cli(
+        monkeypatch,
+        tmp_path,
+        recheck_failure=OSError("tracker unavailable"),
+    )
+
+    assert exit_code == 1
+    assert outcomes[0].selected == [11]
+    assert outcomes[0].stale == []
+    assert outcomes[0].attempted == []
+    assert outcomes[0].completed == []
+    assert outcomes[0].succeeded is False
+    assert outcomes[0].stopping_point == (
+        "Item #11 eligibility recheck failure: tracker unavailable"
+    )
+    assert len(selection_prompts) == 1
+    assert after_prompts == []
+    source.claim.assert_not_called()
+    source.list_ready.assert_not_called()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+
+
 def _run_policy_halt_from_cli(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

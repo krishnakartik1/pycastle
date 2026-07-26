@@ -1712,9 +1712,6 @@ def run_batch(
                     if not isinstance(eligible, bool):
                         raise TypeError("Item eligibility recheck did not return bool")
                 except Exception as exc:
-                    if not outcome.completed:
-                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-                        raise
                     outcome.succeeded = False
                     outcome.stopping_point = (
                         f"Item #{issue.number} eligibility recheck failure: {exc}"
