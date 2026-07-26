@@ -46,12 +46,12 @@ def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
     finally:
         sys.dont_write_bytecode = previous_bytecode
 
-    if (
-        not isinstance(definition.item, ItemDefinition)
-        or not isinstance(definition.item.selection, RuntimeSelection)
-        or not isinstance(definition.item.graph, ExecutionGraph)
-    ):
+    if not isinstance(definition.item, ItemDefinition):
         raise ProjectFixtureValidationError("Invalid Item definition.")
+    if not isinstance(definition.item.selection, RuntimeSelection):
+        raise ProjectFixtureValidationError("Invalid Item selection policy.")
+    if not isinstance(definition.item.graph, ExecutionGraph):
+        raise ProjectFixtureValidationError("Invalid Item execution graph.")
 
     prompt_root = fixture_dir / "prompts"
     if prompt_root.is_symlink() or not prompt_root.is_dir():

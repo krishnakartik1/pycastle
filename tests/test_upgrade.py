@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from pycastle.graph import GateNode, RuntimeNode, load_run
 from pycastle.migrations import MIGRATIONS, dockerfile_declares_host_identity
 from pycastle.scaffold import scaffold_fixture
 from pycastle.upgrade import (
@@ -270,8 +269,12 @@ def test_fixture_validator_rejects_prompt_outside_prompts_directory(
     _, fixture = _project(tmp_path)
     (fixture / "outside.md").write_text("outside\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
-        "run = build_run(item=execution_graph(start='work', nodes=[runtime_node('work', '../outside.md')]))\n"
+        "from pycastle.graph import (build_item, build_run, execution_graph, "
+        "runtime_node, runtime_selection)\n"
+        "run = build_run(item=build_item("
+        "selection=runtime_selection('select-item.md'), "
+        "graph=execution_graph(start='work', nodes=["
+        "runtime_node('work', '../outside.md')])))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="outside prompts"):
@@ -291,7 +294,9 @@ def test_fixture_validator_does_not_execute_gate(tmp_path: Path) -> None:
 def test_fixture_validator_requires_an_item_execution_graph(tmp_path: Path) -> None:
     _, fixture = _project(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import RunDefinition\n" "run = RunDefinition(item=None)\n"
+        "from pycastle.graph import ItemDefinition, RunDefinition, RuntimeSelection\n"
+        "run = RunDefinition(item=ItemDefinition("
+        "RuntimeSelection('select-item.md'), None))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="Item execution graph"):
@@ -301,10 +306,12 @@ def test_fixture_validator_requires_an_item_execution_graph(tmp_path: Path) -> N
 def test_fixture_validator_rejects_an_unknown_terminal(tmp_path: Path) -> None:
     _, fixture = _project(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode, Terminal\n"
-        "run = RunDefinition(item=ExecutionGraph(start='work', nodes={\n"
+        "from pycastle.graph import (ExecutionGraph, ItemDefinition, RunDefinition, "
+        "RuntimeNode, RuntimeSelection, Terminal)\n"
+        "run = RunDefinition(item=ItemDefinition("
+        "RuntimeSelection('select-item.md'), ExecutionGraph(start='work', nodes={\n"
         "    'work': RuntimeNode('work', 'plan.md', on_success=Terminal('UNKNOWN'))\n"
-        "}))\n"
+        "})))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="Unknown Terminal"):
@@ -314,10 +321,12 @@ def test_fixture_validator_rejects_an_unknown_terminal(tmp_path: Path) -> None:
 def test_fixture_validator_rejects_a_node_key_name_mismatch(tmp_path: Path) -> None:
     _, fixture = _project(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode\n"
-        "run = RunDefinition(item=ExecutionGraph(start='alias', nodes={\n"
+        "from pycastle.graph import (ExecutionGraph, ItemDefinition, RunDefinition, "
+        "RuntimeNode, RuntimeSelection)\n"
+        "run = RunDefinition(item=ItemDefinition("
+        "RuntimeSelection('select-item.md'), ExecutionGraph(start='alias', nodes={\n"
         "    'alias': RuntimeNode('work', 'plan.md')\n"
-        "}))\n"
+        "})))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="node key"):
@@ -327,10 +336,12 @@ def test_fixture_validator_rejects_a_node_key_name_mismatch(tmp_path: Path) -> N
 def test_fixture_validator_rejects_empty_direct_graph_fields(tmp_path: Path) -> None:
     _, fixture = _project(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import ExecutionGraph, RunDefinition, RuntimeNode\n"
-        "run = RunDefinition(item=ExecutionGraph(start='', nodes={\n"
+        "from pycastle.graph import (ExecutionGraph, ItemDefinition, RunDefinition, "
+        "RuntimeNode, RuntimeSelection)\n"
+        "run = RunDefinition(item=ItemDefinition("
+        "RuntimeSelection('select-item.md'), ExecutionGraph(start='', nodes={\n"
         "    '': RuntimeNode('', 'plan.md')\n"
-        "}))\n"
+        "})))\n"
     )
 
     with pytest.raises(FixtureUpgradeError, match="Item execution graph"):
@@ -390,15 +401,100 @@ def test_012_manual_migration_accepts_owner_authored_args_and_only_advances_mark
     assert result.applied_versions == ()
 
 
-def test_013_runner_patch_upgrades_actual_project_fixture_via_012_docker_identity_migration(
+def test_013_manual_migration_requires_owner_authored_item_selection(
     tmp_path: Path,
 ) -> None:
-    project, fixture = _project(tmp_path, marker="0.1.1\n")
+    project, fixture = _project(tmp_path, marker="0.1.2\n")
+    (fixture / "prompts" / "select-item.md").unlink()
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "run = build_run(item=execution_graph(start='plan', nodes=["
+        "runtime_node('plan', 'plan.md')]))\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit", "-q"], cwd=project, check=True
+    )
+    before = {
+        path.relative_to(fixture): path.read_bytes()
+        for path in fixture.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(
+        FixtureUpgradeError,
+        match="owner-authored.*selection prompt.*wrap.*Item definition",
+    ):
+        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+
+    after = {
+        path.relative_to(fixture): path.read_bytes()
+        for path in fixture.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+    selection_prompt = "Choose based on this project's priorities.\n"
+    item_definition = (
+        "from pycastle.graph import (build_item, build_run, execution_graph, "
+        "runtime_node, runtime_selection)\n"
+        "run = build_run(item=build_item("
+        "selection=runtime_selection('select-item.md'),"
+        "graph=execution_graph(start='plan', nodes=["
+        "runtime_node('plan', 'plan.md')])))\n"
+    )
+    (fixture / "prompts" / "select-item.md").write_text(selection_prompt)
+    (fixture / "main.py").write_text(item_definition)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "author Item selection policy"],
+        cwd=project,
+        check=True,
+    )
 
     result = upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
 
-    definition = load_run(fixture)
-    assert isinstance(definition.item.nodes["plan"], RuntimeNode)
-    assert isinstance(definition.item.nodes["verify"], GateNode)
+    assert (fixture / "main.py").read_text() == item_definition
+    assert (fixture / "prompts" / "select-item.md").read_text() == selection_prompt
     assert (fixture / "version").read_text() == "0.1.3\n"
     assert result.applied_versions == ()
+    assert result.marker_updated
+
+
+def test_013_manual_migration_keeps_partial_owner_changes_blocked(
+    tmp_path: Path,
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.2\n")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "run = build_run(item=execution_graph(start='plan', nodes=["
+        "runtime_node('plan', 'plan.md')]))\n"
+    )
+    (fixture / "prompts" / "select-item.md").write_text(
+        "Choose based on this project's priorities.\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit", "-q"], cwd=project, check=True
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="owner-authored"):
+        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+
+    assert (fixture / "version").read_text() == "0.1.2\n"
+
+
+def test_013_manual_migration_keeps_invalid_owner_changes_blocked(
+    tmp_path: Path,
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.2\n")
+    (fixture / "main.py").write_text("run = this is not valid Python\n")
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "--amend", "--no-edit", "-q"], cwd=project, check=True
+    )
+
+    with pytest.raises(FixtureUpgradeError, match="owner-authored"):
+        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+
+    assert (fixture / "version").read_text() == "0.1.2\n"

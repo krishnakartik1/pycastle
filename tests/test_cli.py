@@ -30,7 +30,7 @@ from pycastle.readiness import (
     Status,
 )
 from pycastle.runtime import StubRuntime
-from pycastle.upgrade import FixtureMigration
+from pycastle.upgrade import FixtureMigration, FixtureUpgradeError, upgrade_fixture
 
 
 @pytest.fixture(autouse=True)
@@ -285,10 +285,10 @@ def test_run_passes_a_generated_run_id_to_the_orchestrator(
     assert captured["run_id"] == "20260613-101500"
 
 
-def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
+def test_migrated_fixture_selects_claims_completes_and_publishes_an_item(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Drive CLI dispatch, real Git worktrees, and deterministic external adapters."""
+    """Drive owner migration and the resulting Run through public CLI seams."""
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
@@ -298,6 +298,9 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
         "run=build_run(item=execution_graph(start='work',nodes=["
         "gate_node('verify'),runtime_node('work','work.md',on_success='verify')]))\n"
     )
+    (fixture / "Dockerfile").write_text("FROM scratch\n")
+    (fixture / "sandbox").write_text("host\n")
+    (fixture / "version").write_text("0.1.2\n")
     timeline = tmp_path / "timeline"
     for name in ("setup", "gate"):
         hook = fixture / name
@@ -312,6 +315,44 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     )
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    with pytest.raises(FixtureUpgradeError, match="owner-authored"):
+        upgrade_fixture(
+            tmp_path,
+            runner_version="0.1.3",
+            migrations=fixture_migrations.MIGRATIONS,
+        )
+    assert (fixture / "version").read_text() == "0.1.2\n"
+    assert not (prompts / "select.md").exists()
+
+    (prompts / "select.md").write_text("Choose an Item.")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,gate_node,runtime_selection)\n"
+        "run=build_run(item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "gate_node('verify'),runtime_node('work','work.md',on_success='verify')])))\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "author Item selection policy"],
+        cwd=tmp_path,
+        check=True,
+    )
+    upgraded = upgrade_fixture(
+        tmp_path,
+        runner_version="0.1.3",
+        migrations=fixture_migrations.MIGRATIONS,
+    )
+    assert upgraded.marker_updated
+    assert (fixture / "version").read_text() == "0.1.3\n"
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance fixture release"],
+        cwd=tmp_path,
+        check=True,
+    )
 
     process_calls: list[list[str]] = []
 
@@ -1658,14 +1699,18 @@ def _run_cycle_from_cli(
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose an Item.")
     (prompts / "work.md").write_text("work")
     (prompts / "repair.md").write_text("repair")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
-        "run=build_run(item=execution_graph(start='work',nodes=["
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,gate_node,runtime_selection)\n"
+        "run=build_run(item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
         "runtime_node('work','work.md',on_success='verify'),"
         "gate_node('verify',on_failure='repair'),"
-        "runtime_node('repair','repair.md',on_success='verify')]))\n"
+        "runtime_node('repair','repair.md',on_success='verify')])))\n"
     )
     timeline = tmp_path / "timeline"
     setup = fixture / "setup"
@@ -1740,7 +1785,7 @@ def test_cli_repairs_item_through_explicit_gate_cycle_and_publishes(
     )
     assert code == 0
     assert outcomes[0].completed == [1]
-    assert nodes == ["work", "repair"]
+    assert nodes == ["item-selection", "work", "repair"]
     assert (tmp_path / "timeline").read_text().splitlines().count("gate") == 2
     source.mark_for_human.assert_not_called()
     assert any(
@@ -1757,7 +1802,7 @@ def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
     )
     assert code != 0
     assert outcomes[0].completed == []
-    assert nodes == ["work"] + ["repair"] * 10
+    assert nodes == ["item-selection", "work"] + ["repair"] * 10
     timeline = (tmp_path / "timeline").read_text().splitlines()
     assert timeline.count("gate") == 10
     # Run bootstrap, initial work, and ten visits to each cycle node.
@@ -1785,11 +1830,15 @@ def test_cli_setup_failure_preserves_only_safe_run_outcomes(
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose an Item.")
     (prompts / "work.md").write_text("work")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,runtime_node\n"
-        "run=build_run(item=execution_graph(start='work',nodes=["
-        "runtime_node('work','work.md')]))\n"
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,runtime_selection)\n"
+        "run=build_run(item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md')])))\n"
     )
     item_count = tmp_path / "item-setup-count"
     setup = fixture / "setup"
@@ -1926,14 +1975,16 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
-    for name in ("item", "review", "report", "repair"):
+    for name in ("select", "item", "review", "report", "repair"):
         (prompts / f"{name}.md").write_text(name)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,gate_node,runtime_selection)\n"
         "run=build_run(\n"
-        " item=execution_graph(start='item-work',nodes=["
+        " item=build_item(selection=runtime_selection('select.md'),"
+        " graph=execution_graph(start='item-work',nodes=["
         "runtime_node('item-work','item.md',on_success='item-verify'),"
-        "gate_node('item-verify')]),\n"
+        "gate_node('item-verify')])),\n"
         " after=execution_graph(start='run-review',nodes=["
         "runtime_node('run-review','review.md',on_success='run-report'),"
         "runtime_node('run-report','report.md',on_success='run-verify'),"
@@ -2082,7 +2133,9 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
     assert outcomes[0].completed == [1, 2]
     assert not (fixture / "runs" / "cli-run-136" / "project").exists()
     assert nodes == [
+        "item-selection",
         "item-work",
+        "item-selection",
         "item-work",
         "run-review",
         "run-report",

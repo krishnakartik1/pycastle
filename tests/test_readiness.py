@@ -80,7 +80,7 @@ def _valid_fixture(path: Path) -> Path:
     fixture = path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
-    (fixture / "version").write_text("0.1.2\n")
+    (fixture / "version").write_text("0.1.3\n")
     (fixture / "main.py").write_text(
         "from pycastle.graph import (build_item, build_run, execution_graph, "
         "runtime_node, runtime_selection)\n"
