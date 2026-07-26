@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from pycastle.fixture_validation import validate_project_fixture_structure
 from pycastle.graph import DONE, HUMAN, GateNode, RuntimeNode, load_run
 from pycastle.scaffold import FixtureExistsError, scaffold_fixture
 
@@ -91,10 +92,17 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
     scaffold_fixture(tmp_path, sandbox="host")
     run = load_run(tmp_path / ".pycastle")
     assert run.before is None
-    assert list(run.item.nodes) == ["plan", "implement", "review", "verify", "repair"]
+    assert run.item.selection.prompt == "select-item.md"
+    assert list(run.item.graph.nodes) == [
+        "plan",
+        "implement",
+        "review",
+        "verify",
+        "repair",
+    ]
     assert {
         name: (node.on_success, node.on_failure)
-        for name, node in run.item.nodes.items()
+        for name, node in run.item.graph.nodes.items()
     } == {
         "plan": ("implement", HUMAN),
         "implement": ("review", HUMAN),
@@ -102,11 +110,11 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
         "verify": (DONE, "repair"),
         "repair": ("verify", HUMAN),
     }
-    assert isinstance(run.item.nodes["verify"], GateNode)
-    assert isinstance(run.item.nodes["repair"], RuntimeNode)
-    assert run.item.nodes["verify"].on_failure == "repair"
-    assert run.item.nodes["verify"].on_success == DONE
-    assert run.item.nodes["repair"].on_success == "verify"
+    assert isinstance(run.item.graph.nodes["verify"], GateNode)
+    assert isinstance(run.item.graph.nodes["repair"], RuntimeNode)
+    assert run.item.graph.nodes["verify"].on_failure == "repair"
+    assert run.item.graph.nodes["verify"].on_success == DONE
+    assert run.item.graph.nodes["repair"].on_success == "verify"
     assert run.after is not None
     assert run.after.nodes["run-verify"].on_failure == "run-repair"
     assert run.after.nodes["run-verify"].on_success == DONE
@@ -126,10 +134,31 @@ def test_initialized_graph_has_explicit_verify_and_repair_topology(
         "run-verify": (DONE, "run-repair"),
         "run-repair": ("run-report", HUMAN),
     }
-    for graph in (run.item, run.after):
+    for graph in (run.item.graph, run.after):
         for node in graph.nodes.values():
             if isinstance(node, RuntimeNode):
                 assert (tmp_path / ".pycastle/prompts" / node.prompt).is_file()
+
+
+def test_initialized_project_owns_a_semantic_item_selection_policy(
+    tmp_path: Path,
+) -> None:
+    scaffold_fixture(tmp_path, sandbox="host")
+    fixture = tmp_path / ".pycastle"
+
+    run = validate_project_fixture_structure(fixture)
+    policy_path = fixture / "prompts" / run.item.selection.prompt
+    policy = " ".join(policy_path.read_text().lower().split())
+
+    assert "highest-priority actionable item" in policy
+    assert "dependencies" in policy
+    assert "candidate" in policy and "repository" in policy
+    assert "missing foundations" in policy
+    assert "unblocks other" in policy
+    assert "priority labels" in policy
+    assert "lower item number" in policy and "final tie-breaker" in policy
+    assert "no candidate is actionable" in policy
+    assert "prd" not in policy
 
 
 def test_dockerfile_is_neutral_and_has_project_extension(tmp_path: Path) -> None:

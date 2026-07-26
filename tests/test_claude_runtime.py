@@ -230,7 +230,15 @@ def test_result_event_is_error_raises_crash(
 
 
 def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> None:
-    proc = _fake_proc([], returncode=1)
+    proc = _fake_proc(
+        [
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "partial answer"}]},
+            }
+        ],
+        returncode=1,
+    )
     proc.stderr = io.StringIO("boom")
     mock_popen.return_value = proc
 
@@ -241,6 +249,10 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
     # can branch on them without parsing the message string.
     assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 1
+    assert exc_info.value.transcript == "partial answer"
+    assert exc_info.value.stderr == "boom"
+    assert exc_info.value.telemetry is not None
+    assert exc_info.value.telemetry.runtime == "claude"
 
 
 def test_nonzero_exit_reads_stderr_for_logging(
@@ -258,6 +270,52 @@ def test_nonzero_exit_reads_stderr_for_logging(
 
     assert "permission denied" in caplog.text
     proc.wait.assert_called_once()
+
+
+def test_item_selection_crash_retains_private_output_without_normal_logging(
+    mock_popen: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = _fake_proc(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "private candidate body"}]
+                },
+            }
+        ],
+        returncode=2,
+    )
+    proc.stderr = io.StringIO("private provider stderr\n")
+    mock_popen.return_value = proc
+
+    with caplog.at_level("ERROR", logger="pycastle.runtime"):
+        with pytest.raises(AgentCrashError) as exc_info:
+            ClaudeRuntime().run("p", cwd=tmp_path, node="item-selection")
+
+    assert exc_info.value.transcript == "private candidate body"
+    assert exc_info.value.stderr == "private provider stderr\n"
+    assert "private candidate body" not in caplog.text
+    assert "private provider stderr" not in caplog.text
+    assert "private details retained locally" in caplog.text
+
+
+def test_verbose_item_selection_crash_may_stream_private_stderr(
+    mock_popen: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = _fake_proc([], returncode=2)
+    proc.stderr = io.StringIO("private verbose stderr\n")
+    mock_popen.return_value = proc
+
+    with caplog.at_level("ERROR", logger="pycastle.runtime"):
+        with pytest.raises(AgentCrashError):
+            ClaudeRuntime(verbose=True).run("p", cwd=tmp_path, node="item-selection")
+
+    assert "private verbose stderr" in caplog.text
 
 
 def test_empty_stream_with_clean_exit_does_not_crash(

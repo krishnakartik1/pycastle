@@ -24,19 +24,22 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
-from .commands import run_cmd
+from . import selection
+from .commands import MAX_CAPTURE_BYTES, run_cmd
 from .execution import (
     ExecutionRecord,
     execute_hook,
@@ -54,13 +57,25 @@ from .graph import (
     walk_execution_graph,
 )
 from .issues import IssueSource
-from .models import IssueRef, RuntimeResult
+from .models import IssueRef, RuntimeResult, Telemetry
 from .readiness import FrozenReadinessInputs
 from .runtime import AgentCrashError, Runtime
+from .selection import ItemSelectionError, SelectionEnd, SelectionFailure
 
 logger = logging.getLogger(__name__)
 
 Runner = Callable[..., Any]
+ITEM_SELECTION_NODE = selection.ITEM_SELECTION_NODE
+SELECTION_REASON_LIMIT = selection.SELECTION_REASON_LIMIT
+SELECTION_RESPONSE_LIMIT_BYTES = selection.SELECTION_RESPONSE_LIMIT_BYTES
+SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES = (
+    selection.SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES
+)
+_parse_item_selection = selection.parse_response
+_render_item_candidate_envelope = selection.render_candidate_envelope
+_render_item_selection_prompt = selection.render_prompt
+_without_github_credentials_for_selection = selection.without_github_credentials
+_write_item_selection_record = selection.write_audit_record
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,14 @@ class WorktreeError(RuntimeError):
     """
 
 
+class SelectionWorktreeCleanupError(WorktreeError):
+    """Selection cleanup failed after PyCastle captured a durable checkpoint."""
+
+    def __init__(self, message: str, *, expected_commit: str) -> None:
+        super().__init__(message)
+        self.expected_commit = expected_commit
+
+
 class BranchError(RuntimeError):
     """A prerequisite ``git branch`` exited non-zero.
 
@@ -118,6 +141,27 @@ class PruneError(RuntimeError):
 
 class RunCheckpointError(RuntimeError):
     """A successful Run node could not be committed durably."""
+
+
+@dataclass(frozen=True)
+class IgnoredPublicationArtifact:
+    """One ignored file whose contents can affect Run publication."""
+
+    kind: Literal["file", "symlink"]
+    content: bytes | str
+    mode: int | None = None
+
+
+@dataclass(frozen=True)
+class DurableRunCheckpoint:
+    """Git-visible state plus ignored publication state for a Run worktree."""
+
+    commit: str
+    ignored_publication: tuple[tuple[str, IgnoredPublicationArtifact], ...]
+
+
+class ItemClaimError(RuntimeError):
+    """The Issue source did not confirm ownership of a selected Item."""
 
 
 def prune_run_branches(
@@ -452,8 +496,12 @@ class RunOutcome:
     run_id: str
     run_branch: str
     selected: list[int] = field(default_factory=list)
+    attempted: list[int] = field(default_factory=list)
     stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
+    selection_end: SelectionEnd | None = None
+    selection_failure: SelectionFailure | None = None
+    selection_failure_checkpoint: str | None = None
     pr_opened: bool = False
     pr_ready: bool = False
     succeeded: bool = True
@@ -467,9 +515,9 @@ class RunOutcome:
 
     @property
     def skipped(self) -> list[int]:
-        """Selected issue numbers not folded into the Run branch."""
+        """Claimed Item attempts not folded into the Run branch."""
         completed = set(self.completed)
-        return [number for number in self.selected if number not in completed]
+        return [number for number in self.attempted if number not in completed]
 
 
 @dataclass
@@ -482,6 +530,7 @@ class RunContext:
     fixture_dir: Path
     runner: Runner
     remote_checkpoint_succeeded: bool = False
+    selection_failure_checkpoint: str | None = None
 
 
 @dataclass
@@ -517,15 +566,18 @@ def render_issue_context(issue: IssueRef) -> str:
 
     The node prompts tell the runtime to read the issue's "What to build" and
     "Acceptance criteria", so it must actually be handed the issue. This renders
-    a ``# Issue #<n>: <title>`` header followed by the body when non-empty, then
-    every author-attributed issue comment in source order. The title keeps its
-    punctuation and markdown (unlike :func:`slugify`). Missing parts are omitted,
-    so an issue with no comments renders byte-for-byte as it did before comments
-    were added to :class:`~pycastle.models.IssueRef`.
+    a ``# Issue #<n>: <title>`` header followed by the complete frozen labels and
+    assignees, the body when non-empty, then every author-attributed issue
+    comment in source order. The title keeps its punctuation and markdown
+    (unlike :func:`slugify`).
     """
     header = f"# Issue #{issue.number}: {issue.title}".rstrip()
     body = issue.body.strip()
-    parts = [header]
+    facts = (
+        f"Labels (JSON): {json.dumps(issue.labels, ensure_ascii=False)}\n\n"
+        f"Assignees (JSON): {json.dumps(issue.assignees, ensure_ascii=False)}"
+    )
+    parts = [header, f"## Frozen Item facts\n\n{facts}"]
     if body:
         parts.append(body)
     if issue.comments:
@@ -535,6 +587,154 @@ def render_issue_context(issue: IssueRef) -> str:
         )
         parts.append(f"## Issue Comments\n\n{comments}")
     return "\n\n".join(parts)
+
+
+def render_item_selection_prompt(
+    candidates: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    directions: str,
+    *,
+    remaining_attempt_capacity: int,
+    attempted: Sequence[int] = (),
+    stale: Sequence[int] = (),
+) -> str:
+    """Compose frozen facts, project policy, and PyCastle's response contract."""
+    completed = [outcome.issue.number for outcome in outcomes if outcome.merged]
+    return _render_item_selection_prompt(
+        candidates,
+        completed,
+        directions,
+        remaining_attempt_capacity=remaining_attempt_capacity,
+        attempted=attempted,
+        stale=stale,
+    )
+
+
+def _select_item(
+    candidates: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    *,
+    runtime: Runtime,
+    worktree: Path,
+    prompt_name: str,
+    execution: FrozenRunExecution,
+    fixture_dir: Path,
+    run_id: str,
+    round_number: int,
+    remaining_attempt_capacity: int,
+    attempted: Sequence[int] = (),
+    stale: Sequence[int] = (),
+) -> IssueRef | None:
+    try:
+        directions = execution.prompts[prompt_name]
+    except KeyError:
+        raise ValueError(
+            f"Frozen Item selection prompt is missing: {prompt_name!r}"
+        ) from None
+    candidate_envelope = _render_item_candidate_envelope(candidates)
+
+    def record(
+        status: Literal["accepted", "failed"],
+        code: str,
+        *,
+        result: RuntimeResult | None = None,
+        runtime_transcript: str | None = None,
+        runtime_stderr: str | None = None,
+        runtime_telemetry: Telemetry | None = None,
+        runtime_error: str | None = None,
+        parsed_response: object | None = None,
+    ) -> None:
+        _write_item_selection_record(
+            fixture_dir=fixture_dir,
+            run_id=run_id,
+            round_number=round_number,
+            candidate_envelope=candidate_envelope,
+            prompt_name=prompt_name,
+            directions=directions,
+            runtime_transcript=(
+                result.output if result is not None else runtime_transcript
+            ),
+            runtime_stderr=runtime_stderr,
+            runtime_telemetry=(
+                result.telemetry if result is not None else runtime_telemetry
+            ),
+            runtime_error=runtime_error,
+            parsed_response=parsed_response,
+            validation_status=status,
+            validation_code=code,
+        )
+
+    if (
+        len(candidate_envelope.encode("utf-8"))
+        > SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES
+    ):
+        error = ItemSelectionError(
+            "Item candidate envelope exceeds the selection invocation limit",
+            code=SelectionFailure.CANDIDATE_ENVELOPE_OVERSIZED,
+        )
+        record("failed", error.code)
+        raise error
+    prompt = render_item_selection_prompt(
+        candidates,
+        outcomes,
+        directions,
+        remaining_attempt_capacity=remaining_attempt_capacity,
+        attempted=attempted,
+        stale=stale,
+    )
+    execution.invoke_setup(
+        worktree,
+        scope="run",
+        identity=f"item-selection-{round_number}",
+        ordinal=1,
+    )
+    try:
+        with _without_github_credentials_for_selection():
+            result = runtime.run(prompt, cwd=worktree, node=ITEM_SELECTION_NODE)
+    except Exception as exc:
+        error = ItemSelectionError(
+            "Item selection Runtime failed",
+            code=SelectionFailure.RUNTIME_FAILED,
+        )
+        record(
+            "failed",
+            error.code,
+            runtime_transcript=getattr(exc, "transcript", None),
+            runtime_stderr=getattr(exc, "stderr", None),
+            runtime_telemetry=getattr(exc, "telemetry", None),
+            runtime_error=f"{type(exc).__name__}: {exc}",
+        )
+        raise error from exc
+    if not isinstance(result, RuntimeResult):
+        error = ItemSelectionError(
+            "Item selection Runtime returned a malformed result",
+            code=SelectionFailure.RUNTIME_RESULT_INVALID,
+        )
+        record("failed", error.code)
+        raise error
+    try:
+        decision, parsed_response = _parse_item_selection(
+            result.output, {candidate.number for candidate in candidates}
+        )
+    except ItemSelectionError as error:
+        record(
+            "failed",
+            error.code,
+            result=result,
+            parsed_response=error.parsed_response,
+        )
+        raise
+    record(
+        "accepted",
+        "selection-accepted",
+        result=result,
+        parsed_response=parsed_response,
+    )
+    if decision.item is None:
+        return None
+    return next(
+        candidate for candidate in candidates if candidate.number == decision.item
+    )
 
 
 def _telemetry_dir(fixture_dir: Path, run_id: str) -> Path:
@@ -627,6 +827,11 @@ def _append_run_telemetry(
 def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
     """Append one line to the run log and emit it through ``logging``."""
     logger.info(message)
+    _append_local_log(fixture_dir, run_id, message)
+
+
+def _append_local_log(fixture_dir: Path, run_id: str, message: str) -> None:
+    """Append private Run evidence without emitting it to the console."""
     run_dir = _telemetry_dir(fixture_dir, run_id)
     with (run_dir / "run.log").open("a") as handle:
         handle.write(message + "\n")
@@ -690,6 +895,427 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
 
 
+def _git_checkpoint_value(
+    argv: list[str],
+    *,
+    runner: Runner,
+    cwd: Path,
+    description: str,
+) -> str:
+    """Read one required Git checkpoint fact or fail closed."""
+    result = runner(argv, capture=True, cwd=cwd)
+    value = getattr(result, "stdout", "")
+    if getattr(result, "returncode", 1) != 0 or not isinstance(value, str):
+        raise RunCheckpointError(
+            f"Could not verify the durable Run {description}"
+            f"{_git_failure_detail(result)}"
+        )
+    return value.strip()
+
+
+def _ignored_publication_paths(run: RunContext) -> tuple[str, ...]:
+    """List ignored files only inside the Project fixture publication namespace."""
+    result = run.runner(
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".pycastle",
+        ],
+        capture=True,
+        cwd=run.worktree,
+    )
+    output = getattr(result, "stdout", "")
+    if getattr(result, "returncode", 1) != 0 or not isinstance(output, str):
+        raise RunCheckpointError(
+            "Could not inspect ignored Run publication artifacts"
+            f"{_git_failure_detail(result)}"
+        )
+    if len(output.encode("utf-8")) >= MAX_CAPTURE_BYTES:
+        raise RunCheckpointError(
+            "Ignored Run publication artifact index exceeds the verification limit"
+        )
+    paths = tuple(path for path in output.split("\0") if path)
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts or parts[0] != ".pycastle" or ".." in parts:
+            raise RunCheckpointError("Git returned an unsafe publication path")
+    return paths
+
+
+def _capture_ignored_publication(
+    run: RunContext,
+) -> tuple[tuple[str, IgnoredPublicationArtifact], ...]:
+    """Snapshot ignored publication files without traversing dependency trees."""
+    artifacts: list[tuple[str, IgnoredPublicationArtifact]] = []
+    for relative in _ignored_publication_paths(run):
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            artifact = IgnoredPublicationArtifact("symlink", os.readlink(path))
+        elif stat.S_ISREG(metadata.st_mode):
+            artifact = IgnoredPublicationArtifact(
+                "file",
+                path.read_bytes(),
+                stat.S_IMODE(metadata.st_mode),
+            )
+        else:
+            raise RunCheckpointError(
+                f"Unsupported ignored Run publication artifact: {relative}"
+            )
+        artifacts.append((relative, artifact))
+    return tuple(sorted(artifacts))
+
+
+def _capture_durable_run_checkpoint(
+    run: RunContext, expected_commit: str
+) -> DurableRunCheckpoint:
+    """Capture the immutable commit and ignored publication artifacts."""
+    return DurableRunCheckpoint(
+        expected_commit,
+        _capture_ignored_publication(run),
+    )
+
+
+def _ignored_publication_matches(
+    run: RunContext,
+    expected: tuple[tuple[str, IgnoredPublicationArtifact], ...],
+) -> bool:
+    """Compare the bounded namespace without reading newly-created large files."""
+    if tuple(sorted(_ignored_publication_paths(run))) != tuple(
+        relative for relative, _artifact in expected
+    ):
+        return False
+    for relative, artifact in expected:
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = path.lstat()
+            if artifact.kind == "symlink":
+                if not stat.S_ISLNK(metadata.st_mode):
+                    return False
+                if os.readlink(path) != artifact.content:
+                    return False
+            else:
+                assert isinstance(artifact.content, bytes)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size != len(artifact.content)
+                    or stat.S_IMODE(metadata.st_mode) != artifact.mode
+                    or path.read_bytes() != artifact.content
+                ):
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def _verify_durable_run_checkpoint(
+    run: RunContext, checkpoint: DurableRunCheckpoint
+) -> None:
+    """Prove selection did not change durable Git or publication state."""
+    branch_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", f"{run.branch}^{{commit}}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="branch",
+    )
+    worktree_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree HEAD",
+    )
+    checked_out_branch = _git_checkpoint_value(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree branch",
+    )
+    status = _git_checkpoint_value(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree status",
+    )
+    if (
+        branch_commit != checkpoint.commit
+        or worktree_commit != checkpoint.commit
+        or checked_out_branch != run.branch
+        or status
+        or not _ignored_publication_matches(run, checkpoint.ignored_publication)
+    ):
+        raise RunCheckpointError(
+            "Item selection changed the durable Run branch or worktree"
+        )
+
+
+def _remove_publication_path(path: Path, namespace: Path) -> None:
+    """Remove one validated path and any newly-empty parents in `.pycastle`."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    parent = path.parent
+    while parent != namespace and parent.is_relative_to(namespace):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def _restore_ignored_publication(
+    run: RunContext,
+    expected: tuple[tuple[str, IgnoredPublicationArtifact], ...],
+) -> None:
+    """Restore the exact ignored publication snapshot in the owned Run worktree."""
+    namespace = run.worktree / ".pycastle"
+    expected_map = dict(expected)
+    current_paths = _ignored_publication_paths(run)
+    for relative in sorted(
+        current_paths, key=lambda value: value.count("/"), reverse=True
+    ):
+        if relative not in expected_map:
+            path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+            _remove_publication_path(path, namespace)
+    for relative, artifact in expected:
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        if path.is_symlink() or path.exists():
+            _remove_publication_path(path, namespace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if artifact.kind == "symlink":
+            assert isinstance(artifact.content, str)
+            path.symlink_to(artifact.content)
+        else:
+            assert isinstance(artifact.content, bytes)
+            path.write_bytes(artifact.content)
+            assert artifact.mode is not None
+            path.chmod(artifact.mode)
+
+
+def _restore_durable_run_checkpoint(
+    run: RunContext, checkpoint: DurableRunCheckpoint
+) -> None:
+    """Restore only PyCastle-owned Run state to its last verified checkpoint."""
+    commands = (
+        [
+            "git",
+            "update-ref",
+            f"refs/heads/{run.branch}",
+            checkpoint.commit,
+        ],
+        ["git", "reset", "--hard", checkpoint.commit],
+        ["git", "clean", "-fd"],
+    )
+    for argv in commands:
+        result = run.runner(argv, capture=True, cwd=run.worktree)
+        if getattr(result, "returncode", 1) != 0:
+            raise RunCheckpointError(
+                "Could not restore the durable Run checkpoint"
+                f"{_git_failure_detail(result)}"
+            )
+    try:
+        _restore_ignored_publication(run, checkpoint.ignored_publication)
+    except OSError as exc:
+        raise RunCheckpointError(
+            f"Could not restore ignored Run publication artifacts: {exc}"
+        ) from exc
+    _verify_durable_run_checkpoint(run, checkpoint)
+
+
+def _selection_worktree_registered(
+    worktree: Path,
+    *,
+    runner: Runner,
+    workspace: Path,
+) -> bool:
+    """Return whether Git still records the disposable selection checkout."""
+    result = runner(
+        ["git", "worktree", "list", "--porcelain", "-z"],
+        capture=True,
+        cwd=workspace,
+    )
+    output = getattr(result, "stdout", "")
+    if (
+        getattr(result, "returncode", 1) != 0
+        or not isinstance(output, str)
+        or len(output.encode("utf-8")) >= MAX_CAPTURE_BYTES
+    ):
+        raise WorktreeError(
+            "Could not verify disposable Item selection worktree cleanup"
+            f"{_git_failure_detail(result)}"
+        )
+    return f"worktree {worktree}" in output.split("\0")
+
+
+@contextmanager
+def _disposable_selection_worktree(
+    run: RunContext,
+    *,
+    worktree_root: Path,
+    workspace: Path,
+) -> Iterator[Path]:
+    """Yield a detached writable checkout and verify containment on exit."""
+    expected_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", f"{run.branch}^{{commit}}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="checkpoint",
+    )
+    # The immutable final-push source must survive every failure from worktree
+    # creation onward. A non-zero `worktree add` can still have created a path,
+    # registered a checkout, or changed the durable Run through a hostile
+    # command boundary.
+    run.selection_failure_checkpoint = expected_commit
+    checkpoint = _capture_durable_run_checkpoint(run, expected_commit)
+    _verify_durable_run_checkpoint(run, checkpoint)
+    selection_worktree = worktree_root / f"selection-{run.run_id}"
+    primary_error: BaseException | None = None
+    worktree_created = False
+    body_completed = False
+    try:
+        result = run.runner(
+            [
+                "git",
+                "worktree",
+                "add",
+                "--detach",
+                str(selection_worktree),
+                expected_commit,
+            ],
+            capture=True,
+            cwd=workspace,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise WorktreeError(
+                f"git worktree add failed for Item selection at "
+                f"{selection_worktree}{_git_failure_detail(result)}"
+            )
+        worktree_created = True
+        yield selection_worktree
+        body_completed = True
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: SelectionWorktreeCleanupError | None = None
+        remove: Any | None = None
+        prune: Any | None = None
+        try:
+            remove = run.runner(
+                ["git", "worktree", "remove", str(selection_worktree), "--force"],
+                capture=True,
+                cwd=workspace,
+            )
+        except Exception as exc:
+            cleanup_error = SelectionWorktreeCleanupError(
+                "Could not remove the disposable Item selection worktree" f": {exc}",
+                expected_commit=expected_commit,
+            )
+        # A failed add may leave an unregistered directory that Git cannot
+        # remove. It is still a PyCastle-owned disposable path, so remove it
+        # before pruning any partial registry entry.
+        if not worktree_created and (
+            selection_worktree.exists() or selection_worktree.is_symlink()
+        ):
+            try:
+                if selection_worktree.is_symlink() or selection_worktree.is_file():
+                    selection_worktree.unlink()
+                else:
+                    shutil.rmtree(selection_worktree)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = SelectionWorktreeCleanupError(
+                        "Could not remove the partial Item selection worktree"
+                        f": {exc}",
+                        expected_commit=expected_commit,
+                    )
+        try:
+            prune = run.runner(
+                ["git", "worktree", "prune"],
+                capture=True,
+                cwd=workspace,
+            )
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = SelectionWorktreeCleanupError(
+                    "Could not remove the disposable Item selection worktree"
+                    f": {exc}",
+                    expected_commit=expected_commit,
+                )
+        registered = True
+        try:
+            registered = _selection_worktree_registered(
+                selection_worktree,
+                runner=run.runner,
+                workspace=workspace,
+            )
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = SelectionWorktreeCleanupError(
+                    f"Could not verify disposable Item selection cleanup: {exc}",
+                    expected_commit=expected_commit,
+                )
+        if cleanup_error is None and (
+            (worktree_created and getattr(remove, "returncode", 1) != 0)
+            or getattr(prune, "returncode", 1) != 0
+            or selection_worktree.exists()
+            or selection_worktree.is_symlink()
+            or registered
+        ):
+            cleanup_error = SelectionWorktreeCleanupError(
+                "Could not remove the disposable Item selection worktree"
+                f"{_git_failure_detail(remove) or _git_failure_detail(prune)}",
+                expected_commit=expected_commit,
+            )
+
+        checkpoint_error: Exception | None = None
+        try:
+            _verify_durable_run_checkpoint(run, checkpoint)
+        except Exception as exc:
+            checkpoint_error = exc
+            try:
+                _restore_durable_run_checkpoint(run, checkpoint)
+            except Exception as restore_error:
+                checkpoint_error.add_note(
+                    f"Durable Run restoration also failed: {restore_error}"
+                )
+
+        secondary_errors = tuple(
+            error for error in (cleanup_error, checkpoint_error) if error is not None
+        )
+        if primary_error is not None and secondary_errors:
+            for error in secondary_errors:
+                primary_error.add_note(
+                    f"Item selection containment also failed: {error}"
+                )
+            try:
+                _append_local_log(
+                    run.fixture_dir,
+                    run.run_id,
+                    "Item selection containment also failed while preserving "
+                    f"{type(primary_error).__name__}: "
+                    + "; ".join(str(error) for error in secondary_errors),
+                )
+            except BaseException as record_error:
+                primary_error.add_note(
+                    "Could not retain secondary Item selection containment "
+                    f"evidence: {record_error}"
+                )
+        elif cleanup_error is not None:
+            if checkpoint_error is not None:
+                cleanup_error.add_note(str(checkpoint_error))
+            raise cleanup_error
+        elif checkpoint_error is not None:
+            raise checkpoint_error
+        if worktree_created and body_completed and not secondary_errors:
+            run.selection_failure_checkpoint = None
+
+
 def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
     """Remove Git state that cannot represent a publishable Run checkpoint."""
     result = runner(["git", "branch", "-D", branch], capture=True, cwd=cwd)
@@ -697,6 +1323,22 @@ def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
         raise BranchError(
             f"git branch deletion failed for {branch}{_git_failure_detail(result)}"
         )
+
+
+def _delete_failed_run_branch(run: RunContext, *, workspace: Path) -> None:
+    """Remove local and previously-pushed Run refs after pre-integration failure."""
+    if run.remote_checkpoint_succeeded:
+        result = run.runner(
+            ["git", "push", "origin", "--delete", run.branch],
+            capture=True,
+            cwd=workspace,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise BranchError(
+                f"remote Run branch deletion failed for {run.branch}"
+                f"{_git_failure_detail(result)}"
+            )
+    delete_local_branch(run.branch, runner=run.runner, cwd=workspace)
 
 
 @contextmanager
@@ -955,7 +1597,10 @@ def _work_issue(
     # claim failures as well as interruptions.
     if cancellation is not None:
         cancellation.in_flight = issue
-    issue_source.claim(issue.number, assignee=assignee)
+    try:
+        issue_source.claim(issue.number, assignee=assignee)
+    except Exception as exc:
+        raise ItemClaimError("Item claim failed") from exc
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
     if verbose:
@@ -1139,20 +1784,32 @@ RUN_REPORT_LIMIT = 65_536
 
 
 def render_run_context(
-    run_id: str, selected: Sequence[IssueRef], outcomes: Sequence[IssueOutcome]
+    run_id: str,
+    candidates: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    *,
+    stale: Sequence[int] = (),
+    selection_end: SelectionEnd | None = None,
 ) -> str:
     """Render the bounded factual envelope supplied to each Run node."""
     outcome_by_number = {o.issue.number: o for o in outcomes}
+    stale_numbers = set(stale)
     rows = []
-    for issue in selected:
+    for issue in candidates:
         outcome = outcome_by_number.get(issue.number)
-        state = (
-            "pending"
-            if outcome is None
-            else ("completed" if outcome.merged else "skipped")
-        )
+        if outcome is not None:
+            state = "completed" if outcome.merged else "skipped"
+        elif issue.number in stale_numbers:
+            state = "stale"
+        elif selection_end is not None:
+            state = "not-selected"
+        else:
+            state = "pending"
         rows.append(f"- #{issue.number}: {issue.title} [{state}]")
-    return f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+    context = f"# PyCastle Run {run_id}\n\n## Item candidate pool\n\n" + "\n".join(rows)
+    if selection_end is not None:
+        context += f"\n\n## Item selection\n\nEnded: {selection_end}"
+    return context
 
 
 def _checkpoint_run_node(
@@ -1347,7 +2004,7 @@ def run_batch(
     *,
     runtime: Runtime,
     issue_source: IssueSource,
-    selected: Sequence[IssueRef],
+    candidates: Sequence[IssueRef],
     fixture_dir: Path,
     repo: str,
     base_branch: str,
@@ -1363,12 +2020,12 @@ def run_batch(
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
-    ``selected`` is the ordered batch frozen by readiness. A per-run branch is cut in its own
-    worktree so the main checkout stays put; each selected issue is then worked
-    in its own worktree off the run branch and, on a clean merge, folded into the
-    run branch. One pull request is opened for the run, closing every issue that
-    merged. ``run_id`` is injected (not read from a clock) to keep runs
-    deterministic for tests.
+    ``candidates`` is the candidate pool frozen by readiness. A per-run branch
+    is cut in its own worktree so the main checkout stays put; each
+    policy-selected issue is then worked in its own worktree off the Run branch
+    and, on a clean merge, folded into that branch. One pull request is opened
+    for the Run, closing every issue that merged. ``run_id`` is injected (not
+    read from a clock) to keep Runs deterministic for tests.
 
     Runtime-node and Gate-node outcomes follow only their declared Execution
     graph edges. Every Runtime visit is fresh, and its successor receives only
@@ -1388,14 +2045,16 @@ def run_batch(
         raise TypeError("Run requires FrozenReadinessInputs")
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
-    selected = tuple(issue.model_copy(deep=True) for issue in selected)
-    frozen_items = frozen_inputs.items
+    candidates = tuple(issue.model_copy(deep=True) for issue in candidates)
+    frozen_items = frozen_inputs.candidate_pool
     if not isinstance(frozen_items, tuple) or not all(
         isinstance(issue, IssueRef) for issue in frozen_items
     ):
-        raise ValueError("Frozen readiness Item batch is invalid")
-    if selected != frozen_items:
-        raise ValueError("Selected Items differ from frozen readiness batch")
+        raise ValueError("Frozen readiness Item candidate pool is invalid")
+    if candidates != frozen_items:
+        raise ValueError(
+            "Item candidates differ from the frozen readiness candidate pool"
+        )
     if not re.fullmatch(r"[0-9a-f]{40,64}", frozen_inputs.base_commit):
         raise ValueError("Frozen readiness base commit is invalid")
     branch_start = frozen_inputs.base_commit
@@ -1403,9 +2062,8 @@ def run_batch(
     outcome = RunOutcome(
         run_id=run_id,
         run_branch=run_branch,
-        selected=[issue.number for issue in selected],
     )
-    if not selected:
+    if not candidates:
         return outcome
 
     frozen_project = frozen_inputs.project_fixture
@@ -1476,7 +2134,8 @@ def run_batch(
     _append_log(
         fixture_dir,
         run_id,
-        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {branch_start})",
+        f"Run {run_id}: {len(candidates)} candidate(s) on {run_branch} "
+        f"(base {branch_start})",
     )
 
     cancellation = CancellationState()
@@ -1496,7 +2155,7 @@ def run_batch(
                     worktree=run_worktree,
                     graph=run_definition.before,
                     execution=execution,
-                    context=render_run_context(run_id, selected, []),
+                    context=render_run_context(run_id, candidates, []),
                     scope="run",
                     identity="before-run",
                     checkpoint=lambda node: _checkpoint_run_node(
@@ -1527,11 +2186,13 @@ def run_batch(
         outcome.stopping_point = f"before-Run checkpoint: {exc}"
         _append_log(fixture_dir, run_id, outcome.stopping_point)
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _delete_failed_run_branch(run, workspace=workspace)
         return outcome
     if before is not None and before.terminal is HUMAN:
         outcome.succeeded = False
         outcome.stopping_point = "before-Run HUMAN"
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _delete_failed_run_branch(run, workspace=workspace)
         return outcome
 
     # Track the issue currently in flight so an interrupt (SIGINT) or any
@@ -1539,7 +2200,72 @@ def run_batch(
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
     with _sigint_as_keyboard_interrupt():
         try:
-            for issue in selected:
+            remaining = list(candidates)
+            claimed_attempts = 0
+            selection_round = 0
+            while remaining and claimed_attempts < iterations:
+                selection_round += 1
+                try:
+                    with _disposable_selection_worktree(
+                        run,
+                        worktree_root=worktree_root,
+                        workspace=workspace,
+                    ) as selection_worktree:
+                        issue = _select_item(
+                            remaining,
+                            outcome.issues,
+                            runtime=runtime,
+                            worktree=selection_worktree,
+                            prompt_name=run_definition.item.selection.prompt,
+                            execution=execution,
+                            fixture_dir=fixture_dir,
+                            run_id=run_id,
+                            round_number=selection_round,
+                            remaining_attempt_capacity=iterations - claimed_attempts,
+                            attempted=outcome.attempted,
+                            stale=outcome.stale,
+                        )
+                except Exception as exc:
+                    outcome.succeeded = False
+                    outcome.stopping_point = "Item selection"
+                    outcome.selection_failure_checkpoint = (
+                        run.selection_failure_checkpoint
+                    )
+                    if isinstance(exc, ItemSelectionError):
+                        outcome.selection_failure = exc.code
+                    else:
+                        outcome.selection_failure = (
+                            SelectionFailure.INFRASTRUCTURE_FAILED
+                        )
+                        if isinstance(exc, SetupError):
+                            outcome.setup_failure = exc.failure
+                    try:
+                        _append_log(
+                            fixture_dir,
+                            run_id,
+                            "Item selection failed; details retained in local "
+                            "Run records.",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not retain the Item selection failure summary."
+                        )
+                    break
+                if issue is None:
+                    outcome.selection_end = SelectionEnd.POLICY_HALT
+                    _append_log(
+                        fixture_dir,
+                        run_id,
+                        "Project policy halted Item selection.",
+                    )
+                    break
+                remaining.remove(issue)
+                outcome.selected.append(issue.number)
+                _append_log(
+                    fixture_dir,
+                    run_id,
+                    f"Selected Item #{issue.number}: {issue.title}",
+                )
                 try:
                     eligible = issue_source.is_still_eligible(
                         issue,
@@ -1549,9 +2275,6 @@ def run_batch(
                     if not isinstance(eligible, bool):
                         raise TypeError("Item eligibility recheck did not return bool")
                 except Exception as exc:
-                    if not outcome.completed:
-                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-                        raise
                     outcome.succeeded = False
                     outcome.stopping_point = (
                         f"Item #{issue.number} eligibility recheck failure: {exc}"
@@ -1566,6 +2289,8 @@ def run_batch(
                         f"Item #{issue.number} is stale; skipped without mutation",
                     )
                     continue
+                claimed_attempts += 1
+                outcome.attempted.append(issue.number)
                 try:
                     item_outcome = _work_issue(
                         issue,
@@ -1575,7 +2300,7 @@ def run_batch(
                         worktree_root=worktree_root,
                         assignee=assignee,
                         workspace=workspace,
-                        item_graph=run_definition.item,
+                        item_graph=run_definition.item.graph,
                         execution=execution,
                         cancellation=cancellation,
                         verbose=verbose,
@@ -1606,18 +2331,34 @@ def run_batch(
                         runner=runner,
                         cwd=workspace,
                     )
-                    issue_source.release(issue.number)
+                    try:
+                        issue_source.release(issue.number)
+                    except Exception:
+                        logger.exception(
+                            "Could not release Item #%s after infrastructure failure.",
+                            issue.number,
+                        )
                     cancellation.in_flight = None
-                    if not outcome.completed:
-                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-                        raise
+                    if isinstance(exc, ItemClaimError):
+                        claimed_attempts -= 1
+                        outcome.attempted.pop()
+                    runner(
+                        ["git", "branch", "-D", issue_branch_name(issue)],
+                        capture=True,
+                        cwd=workspace,
+                    )
                     outcome.succeeded = False
                     outcome.stopping_point = (
-                        f"Item #{issue.number} infrastructure failure: {exc}"
+                        f"Item #{issue.number} infrastructure failure"
                     )
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
                     break
                 outcome.issues.append(item_outcome)
+            if outcome.succeeded and outcome.selection_end is None:
+                if claimed_attempts >= iterations:
+                    outcome.selection_end = SelectionEnd.ATTEMPT_LIMIT_REACHED
+                elif not remaining:
+                    outcome.selection_end = SelectionEnd.CANDIDATE_POOL_EXHAUSTED
         except KeyboardInterrupt:
             _cleanup_cancelled(
                 issue=cancellation.in_flight,
@@ -1632,7 +2373,7 @@ def run_batch(
     if completed:
         run_gate: GateOutcome | None = None
         publication_error: str | None = None
-        suppress_report_harvest = False
+        suppress_report_harvest = outcome.selection_failure is not None
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
@@ -1648,7 +2389,11 @@ def run_batch(
                             graph=run_definition.after,
                             execution=execution,
                             context=render_run_context(
-                                run_id, selected, outcome.issues
+                                run_id,
+                                candidates,
+                                outcome.issues,
+                                stale=outcome.stale,
+                                selection_end=outcome.selection_end,
                             ),
                             scope="run",
                             identity="after-run",
@@ -1698,13 +2443,14 @@ def run_batch(
             base_branch=base_branch,
             run=run,
             completed=completed,
-            selected=selected,
+            selected=outcome.selected,
             skipped=outcome.skipped,
             gate=run_gate,
             report=report,
             publication_error=publication_error,
             successful=outcome.succeeded,
             stopping_point=outcome.stopping_point,
+            selection_failure=outcome.selection_failure,
             setup_failure=outcome.setup_failure,
         )
         outcome.pr_opened = publication.pr_opened
@@ -1725,6 +2471,8 @@ def run_batch(
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
     cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+    if not completed:
+        _delete_failed_run_branch(run, workspace=workspace)
     return outcome
 
 
@@ -1734,13 +2482,14 @@ def _open_pull_request(
     base_branch: str,
     run: RunContext,
     completed: list[int],
-    selected: Sequence[IssueRef],
+    selected: Sequence[int],
     skipped: list[int],
     gate: GateOutcome | None,
     report: str | None,
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
+    selection_failure: SelectionFailure | None,
     setup_failure: SetupFailure | None = None,
 ) -> PublicationOutcome:
     """Final-push, draft-create, report, then ready a successful Run PR."""
@@ -1890,18 +2639,19 @@ def _open_pull_request(
             f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
             f"({result}, {gate.duration_seconds:.2f}s)"
         )
-    selected_numbers = [issue.number for issue in selected]
     marker = f"<!-- pycastle-run-report:{run.run_id} -->"
     comment = (
         f"{marker}\n## PyCastle Run {run.run_id}\n\n"
         f"- State: **{state}**\n"
-        f"- Selected Items: {', '.join(f'#{n}' for n in selected_numbers) or 'none'}\n"
+        f"- Selected Items: {', '.join(f'#{n}' for n in selected) or 'none'}\n"
         f"- Completed Items: {', '.join(f'#{n}' for n in completed) or 'none'}\n"
         f"- Skipped Items: {', '.join(f'#{n}' for n in skipped) or 'none'}\n"
         f"- Run Gate: {gate_line}\n"
     )
     if stopping_point:
         comment += f"- Stopping point: {stopping_point}\n"
+    if selection_failure:
+        comment += f"- Item selection failure: `{selection_failure}`\n"
     if setup_failure is not None:
         termination = setup_failure.termination
         kind = termination.get("kind")
@@ -2039,7 +2789,15 @@ def _push_run_branch(
     node: str | None = None,
 ) -> bool:
     """Push the current Run checkpoint, logging failures without raising."""
-    argv = ["git", "push", "-u", "origin", run.branch]
+    if final and run.selection_failure_checkpoint is not None:
+        argv = [
+            "git",
+            "push",
+            "origin",
+            (f"{run.selection_failure_checkpoint}:refs/heads/{run.branch}"),
+        ]
+    else:
+        argv = ["git", "push", "-u", "origin", run.branch]
     node_name = node or ("final-push" if final else "durability-push")
     try:
         result = run.runner(

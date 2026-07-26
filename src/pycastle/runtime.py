@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -34,11 +35,50 @@ class AgentCrashError(RuntimeError):
     (retry, skip, escalate) without parsing the message string.
     """
 
-    def __init__(self, message: str, *, node: str, exit_code: int) -> None:
-        """Record the failing node and the process exit code."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        node: str,
+        exit_code: int,
+        transcript: str = "",
+        stderr: str = "",
+        telemetry: Telemetry | None = None,
+    ) -> None:
+        """Record the failure and any output parsed before process exit."""
         super().__init__(message)
         self.node = node
         self.exit_code = exit_code
+        self.transcript = transcript
+        self.stderr = stderr
+        self.telemetry = telemetry
+
+
+def _log_crash(
+    runtime: str,
+    node: str,
+    exit_code: int,
+    stderr: str,
+    *,
+    verbose: bool,
+) -> None:
+    """Log safe selection failures while retaining ordinary diagnostics."""
+    if node == "item-selection" and not verbose:
+        logger.error(
+            "[%s] %s exited with code %s; private details retained locally",
+            node,
+            runtime,
+            exit_code,
+        )
+        return
+    detail = stderr if node == "item-selection" else stderr[:500]
+    logger.error(
+        "[%s] %s exited with code %s: %s",
+        node,
+        runtime,
+        exit_code,
+        detail,
+    )
 
 
 @runtime_checkable
@@ -64,6 +104,23 @@ class StubRuntime:
 
     def run(self, prompt: str, *, cwd: Path, node: str) -> RuntimeResult:
         """Write the marker file and return fixed output and telemetry."""
+        if node == "item-selection":
+            match = re.search(r"Allowed Item numbers \(JSON\): (\[[^\r\n]*\])", prompt)
+            allowed = json.loads(match.group(1)) if match is not None else []
+            item = min(allowed, default=None)
+            return RuntimeResult(
+                output=(
+                    "<selection>"
+                    + json.dumps(
+                        {
+                            "item": item,
+                            "reason": "Stub selected the lowest remaining Item.",
+                        }
+                    )
+                    + "</selection>"
+                ),
+                telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+            )
         marker = cwd / STUB_MARKER
         marker.write_text(
             f"# PyCastle stub runtime\n\nRuntime node: {node}\nPrompt bytes: {len(prompt)}\n"
@@ -254,16 +311,22 @@ class ClaudeRuntime:
 
         is_error = bool(result_info and result_info["is_error"]) or proc.returncode != 0
         if is_error:
-            logger.error(
-                "[%s] claude exited with code %s: %s",
+            output = "".join(output_buf) if output_buf else result_text
+            telemetry = _build_telemetry(self.name, node, result_info)
+            _log_crash(
+                self.name,
                 node,
                 proc.returncode,
-                stderr_text[:500],
+                stderr_text,
+                verbose=self.verbose,
             )
             raise AgentCrashError(
                 f"claude crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
+                transcript=output,
+                stderr=stderr_text,
+                telemetry=telemetry,
             )
 
         output = "".join(output_buf) if output_buf else result_text
@@ -629,16 +692,27 @@ class CodexRuntime:
         stderr_text = proc.stderr.read() if proc.stderr else ""
 
         if proc.returncode != 0:
-            logger.error(
-                "[%s] codex exited with code %s: %s",
+            telemetry = _build_codex_telemetry(
+                node,
+                thread_id=thread_id,
+                usage=usage,
+                num_turns=num_turns,
+                elapsed_ms=elapsed_ms,
+            )
+            _log_crash(
+                self.name,
                 node,
                 proc.returncode,
-                stderr_text[:500],
+                stderr_text,
+                verbose=self.verbose,
             )
             raise AgentCrashError(
                 f"codex crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
+                transcript="".join(output_buf),
+                stderr=stderr_text,
+                telemetry=telemetry,
             )
 
         telemetry = _build_codex_telemetry(

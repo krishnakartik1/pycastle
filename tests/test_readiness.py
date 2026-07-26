@@ -10,12 +10,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from pycastle import cli, sandbox
-from pycastle.models import IssueRef
+from pycastle.models import IssueComment, IssueRef
 from pycastle.readiness import (
     CHECK_IDS,
+    CandidateItem,
     CheckResult,
     DefaultReadinessAdapter,
-    EligibleItem,
     ReadinessConfiguration,
     ReadinessDependencies,
     ReadinessOutcome,
@@ -34,12 +34,14 @@ def test_readiness_has_three_explicit_overall_outcomes() -> None:
         configuration(),
         ReadinessDependencies(
             probe=passing,
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
     )
     no_work = evaluate_readiness(
         configuration(),
-        ReadinessDependencies(probe=passing, eligible_items=lambda _configuration: []),
+        ReadinessDependencies(
+            probe=passing, item_candidate_pool=lambda _configuration: []
+        ),
     )
     not_ready = evaluate_readiness(
         configuration(),
@@ -47,7 +49,7 @@ def test_readiness_has_three_explicit_overall_outcomes() -> None:
             probe=lambda check_id, _configuration: CheckResult(
                 Status.FAIL if check_id == "working_tree" else Status.PASS, "result"
             ),
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
     )
 
@@ -66,7 +68,9 @@ def test_no_work_skips_execution_coordination_checks() -> None:
 
     report = evaluate_readiness(
         configuration(),
-        ReadinessDependencies(probe=probe, eligible_items=lambda _configuration: []),
+        ReadinessDependencies(
+            probe=probe, item_candidate_pool=lambda _configuration: []
+        ),
     )
 
     assert report.outcome is ReadinessOutcome.NO_WORK
@@ -80,16 +84,18 @@ def _valid_fixture(path: Path) -> Path:
     fixture = path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
-    (fixture / "version").write_text("0.1.2\n")
+    (fixture / "version").write_text("0.1.3\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "from pycastle.graph import (build_item, build_run, execution_graph, "
+        "runtime_node, runtime_selection)\n"
         "run = build_run(\n"
         " before=execution_graph(start='prepare', nodes=[runtime_node('prepare', 'before.md')]),\n"
-        " item=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')]),\n"
+        " item=build_item(selection=runtime_selection('select.md'), "
+        "graph=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')])),\n"
         " after=execution_graph(start='report', nodes=[runtime_node('report', 'after.md')]),\n"
         ")\n"
     )
-    for name in ("before.md", "item.md", "after.md"):
+    for name in ("select.md", "before.md", "item.md", "after.md"):
         (prompts / name).write_text(name)
     gate = fixture / "gate"
     gate.write_text("#!/bin/sh\nexit 0\n")
@@ -135,27 +141,29 @@ class RecordingRunner:
             output = '{"nameWithOwner":"owner/repo"}\n'
         elif call[:3] == ("gh", "label", "list"):
             output = '[{"name":"ready-for-agent"},{"name":"ready-for-human"}]'
-        elif call[:3] == ("gh", "issue", "list"):
+        elif "repos/owner/repo/issues" in call:
             output = json.dumps(
                 [
-                    {
-                        "number": 9,
-                        "title": "Nine",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "octocat"}],
-                    },
-                    {
-                        "number": 2,
-                        "title": "Two",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "octocat"}],
-                    },
-                    {
-                        "number": 1,
-                        "title": "Other",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "someone"}],
-                    },
+                    [
+                        {
+                            "number": 9,
+                            "title": "Nine",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "octocat"}],
+                        },
+                        {
+                            "number": 2,
+                            "title": "Two",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "octocat"}],
+                        },
+                        {
+                            "number": 1,
+                            "title": "Other",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "someone"}],
+                        },
+                    ]
                 ]
             )
         else:
@@ -182,7 +190,7 @@ def test_host_stub_production_adapter_reports_complete_ready_snapshot(
     assert {check.id: check.status for check in report.checks}[
         "runtime_authentication"
     ] is Status.NOT_APPLICABLE
-    assert report.eligible_items == (EligibleItem(2, "Two"), EligibleItem(9, "Nine"))
+    assert report.candidate_items == (CandidateItem(2, "Two"), CandidateItem(9, "Nine"))
     assert report.frozen_inputs is not None
     assert (
         report.frozen_inputs.base_commit == "0123456789abcdef0123456789abcdef01234567"
@@ -217,9 +225,11 @@ def test_fixture_structure_accepts_out_of_order_runtime_and_gate_nodes(
 ) -> None:
     fixture = _valid_fixture(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
-        "run=build_run(item=execution_graph(start='work',nodes=["
-        "gate_node('verify'),runtime_node('work','item.md',on_success='verify')]))\n"
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,gate_node,runtime_selection)\n"
+        "run=build_run(item=build_item(selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=[gate_node('verify'),"
+        "runtime_node('work','item.md',on_success='verify')])))\n"
     )
 
     result = DefaultReadinessAdapter(fixture, tmp_path).check_fixture_structure(
@@ -270,7 +280,7 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
                 "checkout dirty" if check_id == "working_tree" else "ready",
                 remediation="clean checkout" if check_id == "working_tree" else None,
             ),
-            eligible_items=lambda _configuration: [EligibleItem(4, "Unicode ✓")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(4, "Unicode ✓")],
         ),
     )
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
@@ -287,7 +297,7 @@ def test_doctor_human_and_json_outputs_are_complete_and_single_document(
     assert stdout.count("\n") == 1
     document = json.loads(stdout)
     assert document["schema_version"] == 1
-    assert document["eligible_items"] == [{"number": 4, "title": "Unicode ✓"}]
+    assert document["candidate_items"] == [{"number": 4, "title": "Unicode ✓"}]
 
 
 def configuration() -> ReadinessConfiguration:
@@ -530,7 +540,7 @@ def test_host_runtime_authentication_failure_never_reports_child_output(
                 if check_id == "runtime_authentication"
                 else CheckResult(Status.PASS, "Ready")
             ),
-            eligible_items=lambda _config: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _config: [CandidateItem(1, "One")],
         ),
     )
 
@@ -647,9 +657,9 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
         configuration(),
         ReadinessDependencies(
             probe=probe,
-            eligible_items=lambda _configuration: [
-                EligibleItem(7, "Seven"),
-                EligibleItem(2, "Two"),
+            item_candidate_pool=lambda _configuration: [
+                CandidateItem(7, "Seven"),
+                CandidateItem(2, "Two"),
             ],
         ),
     )
@@ -657,7 +667,7 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
     assert calls == [
         check_id
         for check_id in CHECK_IDS
-        if check_id not in {"eligible_items", "frozen_execution_inputs"}
+        if check_id not in {"item_candidate_pool", "frozen_execution_inputs"}
     ]
     assert [check.id for check in report.checks] == list(CHECK_IDS)
     assert report.outcome is ReadinessOutcome.READY
@@ -668,10 +678,10 @@ def test_report_has_stable_order_schema_and_number_title_only_items() -> None:
         "runner_version",
         "configuration",
         "checks",
-        "eligible_items",
+        "candidate_items",
     ]
     assert document["schema_version"] == 1
-    assert document["eligible_items"] == [
+    assert document["candidate_items"] == [
         {"number": 2, "title": "Two"},
         {"number": 7, "title": "Seven"},
     ]
@@ -692,7 +702,9 @@ def test_failed_prerequisite_blocks_dependents_and_independent_checks_continue()
 
     report = evaluate_readiness(
         configuration(),
-        ReadinessDependencies(probe=probe, eligible_items=lambda _configuration: []),
+        ReadinessDependencies(
+            probe=probe, item_candidate_pool=lambda _configuration: []
+        ),
     )
     by_id = {check.id: check for check in report.checks}
 
@@ -708,13 +720,106 @@ def test_zero_items_is_a_successful_no_work_outcome() -> None:
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
-            eligible_items=lambda _configuration: [],
+            item_candidate_pool=lambda _configuration: [],
         ),
     )
-    check = next(check for check in report.checks if check.id == "eligible_items")
-    assert check.id == "eligible_items"
+    check = next(check for check in report.checks if check.id == "item_candidate_pool")
+    assert check.id == "item_candidate_pool"
     assert check.status is Status.PASS
     assert report.outcome is ReadinessOutcome.NO_WORK
+
+
+def test_readiness_builds_complete_candidate_pool_independent_of_run_limit() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 9,
+                "title": "Assigned candidate",
+                "body": "higher priority",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "octocat"}],
+                "comments": [],
+            },
+            {
+                "number": 2,
+                "title": "Owned elsewhere",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "someone"}],
+                "comments": [],
+            },
+            {
+                "number": 7,
+                "title": "Unassigned candidate",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [],
+                "comments": [],
+            },
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+    config = ReadinessConfiguration(
+        **{
+            **configuration().__dict__,
+            "include_unassigned": True,
+            "item_limit": 1,
+        }
+    )
+    adapter = DefaultReadinessAdapter(
+        Path("."),
+        Path("."),
+        runner=runner,
+        include_item_content=True,
+    )
+
+    candidates = adapter.item_candidate_pool(config)
+
+    assert [candidate.number for candidate in candidates] == [7, 9]
+
+
+def test_doctor_lists_candidate_metadata_without_loading_item_content() -> None:
+    item_pages = json.dumps(
+        [
+            [
+                {
+                    "number": 9,
+                    "title": "Later candidate",
+                    "body": "must not enter Doctor",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "assignees": [{"login": "octocat"}],
+                },
+                {
+                    "number": 2,
+                    "title": "Earlier candidate",
+                    "body": "must not enter Doctor",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "assignees": [{"login": "octocat"}],
+                },
+            ]
+        ]
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        endpoint = next(
+            (argument for argument in argv if argument.startswith("repos/")), ""
+        )
+        if endpoint != "repos/owner/repo/issues":
+            raise AssertionError(f"Doctor loaded Item content: {argv}")
+        return subprocess.CompletedProcess(argv, 0, item_pages, "")
+
+    adapter = DefaultReadinessAdapter(Path("."), Path("."), runner=runner)
+
+    candidates = adapter.item_candidate_pool(configuration())
+
+    assert [(item.number, item.title) for item in candidates] == [
+        (2, "Earlier candidate"),
+        (9, "Later candidate"),
+    ]
+    assert all(not item.body and not item.comments for item in candidates)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -726,21 +831,21 @@ def test_zero_items_is_a_successful_no_work_outcome() -> None:
     ],
 )
 def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
-    def invalid_items(_configuration: ReadinessConfiguration) -> list[EligibleItem]:
+    def invalid_items(_configuration: ReadinessConfiguration) -> list[CandidateItem]:
         raise error
 
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
-            eligible_items=invalid_items,
+            item_candidate_pool=invalid_items,
         ),
     )
 
-    check = next(check for check in report.checks if check.id == "eligible_items")
-    assert check.id == "eligible_items"
+    check = next(check for check in report.checks if check.id == "item_candidate_pool")
+    assert check.id == "item_candidate_pool"
     assert check.status is Status.FAIL
-    assert report.eligible_items == ()
+    assert report.candidate_items == ()
     assert report.outcome is ReadinessOutcome.NOT_READY
 
 
@@ -748,12 +853,12 @@ def test_invalid_item_metadata_makes_doctor_unready(error: Exception) -> None:
     "items",
     [
         None,
-        (EligibleItem(1, "One"),),
-        [EligibleItem(0, "Zero")],
-        [EligibleItem(-1, "Negative")],
-        [EligibleItem(True, "Boolean")],
-        [EligibleItem("1", "String")],
-        [EligibleItem(1, None)],
+        (CandidateItem(1, "One"),),
+        [CandidateItem(0, "Zero")],
+        [CandidateItem(-1, "Negative")],
+        [CandidateItem(True, "Boolean")],
+        [CandidateItem("1", "String")],
+        [CandidateItem(1, None)],
     ],
 )
 def test_invalid_item_values_make_doctor_unready(items: object) -> None:
@@ -761,15 +866,17 @@ def test_invalid_item_values_make_doctor_unready(items: object) -> None:
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
-            eligible_items=lambda _configuration: items,  # type: ignore[return-value]
+            item_candidate_pool=lambda _configuration: items,  # type: ignore[return-value]
         ),
     )
 
     assert (
-        next(check for check in report.checks if check.id == "eligible_items").status
+        next(
+            check for check in report.checks if check.id == "item_candidate_pool"
+        ).status
         is Status.FAIL
     )
-    assert report.eligible_items == ()
+    assert report.candidate_items == ()
     assert report.outcome is ReadinessOutcome.NOT_READY
 
 
@@ -783,7 +890,7 @@ def test_invalid_probe_result_becomes_a_failed_check_and_evaluation_continues() 
         configuration(),
         ReadinessDependencies(
             probe=probe,
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
     )
     by_id = {check.id: check for check in report.checks}
@@ -801,7 +908,7 @@ def test_child_diagnostics_are_not_retained_in_report() -> None:
             probe=lambda _id, _configuration: CheckResult(
                 Status.FAIL, "Probe failed", unsafe_detail=secret
             ),
-            eligible_items=lambda _configuration: [],
+            item_candidate_pool=lambda _configuration: [],
         ),
     )
     assert secret not in render_json(report)
@@ -814,7 +921,7 @@ def test_probe_text_is_bounded() -> None:
             probe=lambda _id, _configuration: CheckResult(
                 Status.FAIL, "s" * 501, remediation="r" * 501
             ),
-            eligible_items=lambda _configuration: [],
+            item_candidate_pool=lambda _configuration: [],
         ),
     )
 
@@ -856,7 +963,7 @@ def test_report_drops_unknown_and_oversized_facts() -> None:
                     "missing": ["gh"],
                 },
             ),
-            eligible_items=lambda _configuration: [EligibleItem(1, "Safe")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "Safe")],
         ),
     )
 
@@ -880,7 +987,7 @@ def test_report_rejects_hostile_resolved_configuration_values() -> None:
         config,
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
     )
 
@@ -900,7 +1007,7 @@ def test_keyboard_interrupt_stops_evaluation_without_a_partial_report() -> None:
     with pytest.raises(KeyboardInterrupt):
         evaluate_readiness(
             configuration(),
-            ReadinessDependencies(probe=probe, eligible_items=lambda _config: []),
+            ReadinessDependencies(probe=probe, item_candidate_pool=lambda _config: []),
         )
 
     assert calls == ["required_commands", "git_repository", "working_tree"]
@@ -912,7 +1019,7 @@ def test_progress_is_concise_and_deterministically_ordered() -> None:
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "Ready"),
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
         progress=lambda *event: events.append(event),
     )
@@ -951,7 +1058,7 @@ def test_run_stops_before_first_side_effect_when_readiness_fails(
                 Status.FAIL if check_id == "working_tree" else Status.PASS,
                 "dirty" if check_id == "working_tree" else "ready",
             ),
-            eligible_items=lambda _configuration: [EligibleItem(1, "One")],
+            item_candidate_pool=lambda _configuration: [CandidateItem(1, "One")],
         ),
     )
 
@@ -968,14 +1075,14 @@ def test_run_stops_before_first_side_effect_when_readiness_fails(
     assert cli._cmd_run(args) == 1
 
 
-def test_run_maps_only_zero_eligible_items_to_noop_success(
+def test_run_maps_only_zero_candidate_items_to_noop_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-            eligible_items=lambda _configuration: [],
+            item_candidate_pool=lambda _configuration: [],
         ),
     )
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
@@ -1024,10 +1131,12 @@ def test_external_item_resolution_failures_are_not_empty_batch_noops(
         config,
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-            eligible_items=adapter.eligible_items,
+            item_candidate_pool=adapter.item_candidate_pool,
         ),
     )
-    eligible = next(check for check in report.checks if check.id == "eligible_items")
+    eligible = next(
+        check for check in report.checks if check.id == "item_candidate_pool"
+    )
 
     assert eligible.status is Status.FAIL
     assert eligible.facts.get("count") is None
@@ -1035,32 +1144,32 @@ def test_external_item_resolution_failures_are_not_empty_batch_noops(
 
 
 @pytest.mark.parametrize(
-    ("eligible_items", "selected_items"),
+    ("candidate_items", "candidate_pool"),
     [
-        ((EligibleItem(1, "One"),), ()),
+        ((CandidateItem(1, "One"),), ()),
         (
-            (EligibleItem(1, "One"), EligibleItem(2, "Two")),
+            (CandidateItem(1, "One"), CandidateItem(2, "Two")),
             (IssueRef(number=1, title="One"),),
         ),
         (
-            (EligibleItem(1, "One"),),
+            (CandidateItem(1, "One"),),
             (IssueRef(number=1, title="Different"),),
         ),
     ],
 )
-def test_run_rejects_incomplete_or_mismatched_frozen_batch_before_side_effects(
+def test_run_rejects_incomplete_or_mismatched_frozen_candidate_pool_before_side_effects(
     monkeypatch: pytest.MonkeyPatch,
-    eligible_items: tuple[EligibleItem, ...],
-    selected_items: tuple[IssueRef, ...],
+    candidate_items: tuple[CandidateItem, ...],
+    candidate_pool: tuple[IssueRef, ...],
 ) -> None:
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-            eligible_items=lambda _configuration: list(eligible_items),
+            item_candidate_pool=lambda _configuration: list(candidate_items),
         ),
     )
-    object.__setattr__(report, "selected_items", selected_items)
+    object.__setattr__(report, "candidate_pool", candidate_pool)
 
     side_effect = MagicMock(side_effect=AssertionError("Run side effect started"))
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
@@ -1079,25 +1188,38 @@ def test_readiness_freezes_full_items_but_reports_only_safe_metadata() -> None:
         number=7,
         title="Seven",
         body="private body",
+        labels=["ready-for-agent", "priority:high"],
         assignees=["octocat"],
+        comments=[IssueComment(author="reviewer", body="private comment")],
     )
+    source_items = [item]
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-            eligible_items=lambda _configuration: [item],
+            item_candidate_pool=lambda _configuration: source_items,
         ),
     )
 
+    source_items.append(IssueRef(number=8, title="Ready after snapshot"))
+    item.title = "mutated"
     item.body = "mutated"
+    item.labels.clear()
     item.assignees.append("someone")
+    item.comments[0].body = "mutated"
 
-    assert report.eligible_items == (EligibleItem(7, "Seven"),)
-    assert report.selected_items[0].body == "private body"
-    assert report.selected_items[0].assignees == ["octocat"]
+    assert report.candidate_items == (CandidateItem(7, "Seven"),)
+    assert report.candidate_pool[0].title == "Seven"
+    assert report.candidate_pool[0].body == "private body"
+    assert report.candidate_pool[0].labels == ["ready-for-agent", "priority:high"]
+    assert report.candidate_pool[0].assignees == ["octocat"]
+    assert report.candidate_pool[0].comments[0].body == "private comment"
     document = json.loads(render_json(report))
-    assert document["eligible_items"] == [{"number": 7, "title": "Seven"}]
-    assert "selected_items" not in document
+    assert document["candidate_items"] == [{"number": 7, "title": "Seven"}]
+    assert "candidate_pool" not in document
+    assert "eligible_items" not in document
+    assert not hasattr(report, "eligible_items")
+    assert not hasattr(report, "selected_items")
 
 
 def test_run_main_does_not_use_legacy_preflight(
@@ -1119,7 +1241,7 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
     def snapshot(number: int) -> object:
         def freeze(config: object, items: tuple[IssueRef, ...]) -> object:
             frozen = MagicMock()
-            frozen.items = items
+            frozen.candidate_pool = items
             frozen.sandbox = config.sandbox
             frozen.runtime = config.runtime
             frozen.agent_image = config.agent_image
@@ -1129,7 +1251,7 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
             configuration(),
             ReadinessDependencies(
                 probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-                eligible_items=lambda _configuration: [
+                item_candidate_pool=lambda _configuration: [
                     IssueRef(number=number, title=f"Item {number}")
                 ],
                 freeze_inputs=freeze,
@@ -1162,5 +1284,5 @@ def test_run_re_evaluates_after_doctor_and_freezes_only_current_items(
     assert cli._cmd_doctor(doctor_args) == 0
     assert cli._cmd_run(run_args) == 0
     assert evaluations.call_count == 2
-    selected = run_loop.call_args.kwargs["selected"]
-    assert [item.number for item in selected] == [2]
+    candidates = run_loop.call_args.kwargs["candidates"]
+    assert [item.number for item in candidates] == [2]

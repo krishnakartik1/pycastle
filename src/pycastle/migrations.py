@@ -9,6 +9,8 @@ from pathlib import Path
 
 from packaging.version import Version
 
+from .fixture_validation import safe_prompt_path
+from .graph import ExecutionGraph, ItemDefinition, RuntimeSelection, load_run
 from .upgrade_errors import FixtureUpgradeError
 
 FixtureCheck = Callable[[Path], bool]
@@ -62,11 +64,46 @@ def _require_owner_host_identity_adoption(_fixture: Path) -> None:
     )
 
 
+def fixture_declares_project_owned_item_selection(fixture: Path) -> bool:
+    """Return whether the owner supplied the complete Item selection contract."""
+    try:
+        definition = load_run(fixture)
+        item = definition.item
+    except Exception:
+        # Fixture Python is owner-authored; any load failure means the target
+        # contract is not yet complete, while interrupts still propagate.
+        return False
+    return (
+        isinstance(item, ItemDefinition)
+        and isinstance(item.selection, RuntimeSelection)
+        and isinstance(item.graph, ExecutionGraph)
+        and safe_prompt_path(fixture / "prompts", item.selection.prompt) is not None
+    )
+
+
+def _require_owner_item_selection_adoption(_fixture: Path) -> None:
+    raise FixtureUpgradeError(
+        "PyCastle 0.1.3 requires an owner-authored Project fixture migration. "
+        "Add and review a project-owned selection prompt under "
+        "`.pycastle/prompts/`, then wrap the existing Item execution graph in "
+        "an Item definition with `build_item`, pairing that graph with "
+        "`runtime_selection` for the new prompt. Review and commit both "
+        "changes, then rerun `pycastle upgrade` from a clean checkout. "
+        "PyCastle did not modify the Project fixture."
+    )
+
+
 MIGRATIONS: tuple[FixtureMigration, ...] = (
     FixtureMigration(
         "0.1.2",
         dockerfile_declares_host_identity,
         _require_owner_host_identity_adoption,
         dockerfile_declares_host_identity,
+    ),
+    FixtureMigration(
+        "0.1.3",
+        fixture_declares_project_owned_item_selection,
+        _require_owner_item_selection_adoption,
+        fixture_declares_project_owned_item_selection,
     ),
 )

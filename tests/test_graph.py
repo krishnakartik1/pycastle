@@ -10,11 +10,13 @@ from pycastle.graph import (
     GateNode,
     NodeOutcome,
     RuntimeNode,
+    build_item,
     build_run,
     execution_graph,
     gate_node,
     load_run,
     runtime_node,
+    runtime_selection,
     walk_execution_graph,
 )
 
@@ -64,11 +66,14 @@ def test_graph_rejects_invalid_runtime_prompts(prompt: object) -> None:
         )
 
 
-def test_run_requires_item_and_allows_optional_scope_graphs() -> None:
-    item = execution_graph(start="item", nodes=[gate_node("item")])
+def test_run_requires_item_definition_and_allows_optional_scope_graphs() -> None:
+    item_graph = execution_graph(start="item", nodes=[gate_node("item")])
+    selection = runtime_selection("select.md")
+    item = build_item(selection=selection, graph=item_graph)
     after = execution_graph(start="after", nodes=[gate_node("after")])
     run = build_run(item=item, after=after)
     assert run.item is item and run.before is None and run.after is after
+    assert run.item.selection is selection and run.item.graph is item_graph
 
 
 def test_cycle_attempts_ten_visits_and_stops_before_eleventh() -> None:
@@ -147,10 +152,12 @@ def test_load_run_reads_new_fixture_vocabulary(tmp_path: Path) -> None:
     fixture = tmp_path / ".pycastle"
     fixture.mkdir()
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,gate_node\n"
-        "run=build_run(item=execution_graph(start='g',nodes=[gate_node('g')]))\n"
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "gate_node,runtime_selection)\n"
+        "run=build_run(item=build_item(selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='g',nodes=[gate_node('g')])))\n"
     )
-    assert isinstance(load_run(fixture).item.nodes["g"], GateNode)
+    assert isinstance(load_run(fixture).item.graph.nodes["g"], GateNode)
 
 
 def test_legacy_graph_surface_is_absent() -> None:

@@ -9,8 +9,10 @@ from pathlib import Path
 from .graph import (
     ExecutionGraph,
     GateNode,
+    ItemDefinition,
     RunDefinition,
     RuntimeNode,
+    RuntimeSelection,
     execution_graph,
     load_run,
 )
@@ -22,6 +24,31 @@ class ProjectFixtureValidationError(ValueError):
 
 def _regular_file(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
+
+
+def safe_prompt_path(prompt_root: Path, prompt_name: str) -> Path | None:
+    """Resolve one regular prompt contained below a non-symlink prompt root."""
+    if (
+        not isinstance(prompt_name, str)
+        or not prompt_name
+        or prompt_root.is_symlink()
+        or not prompt_root.is_dir()
+    ):
+        return None
+    try:
+        prompts = prompt_root.resolve()
+        candidate = prompts / prompt_name
+        relative_parts = candidate.relative_to(prompts).parts
+        resolved = candidate.resolve()
+    except (OSError, ValueError):
+        return None
+    has_symlink = any(
+        (prompts.joinpath(*relative_parts[:index])).is_symlink()
+        for index in range(1, len(relative_parts) + 1)
+    )
+    if prompts not in resolved.parents or not resolved.is_file() or has_symlink:
+        return None
+    return resolved
 
 
 def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
@@ -44,16 +71,24 @@ def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
     finally:
         sys.dont_write_bytecode = previous_bytecode
 
-    if not isinstance(definition.item, ExecutionGraph):
+    if not isinstance(definition.item, ItemDefinition):
+        raise ProjectFixtureValidationError("Invalid Item definition.")
+    if not isinstance(definition.item.selection, RuntimeSelection):
+        raise ProjectFixtureValidationError("Invalid Item selection policy.")
+    if not isinstance(definition.item.graph, ExecutionGraph):
         raise ProjectFixtureValidationError("Invalid Item execution graph.")
 
     prompt_root = fixture_dir / "prompts"
     if prompt_root.is_symlink() or not prompt_root.is_dir():
         raise ProjectFixtureValidationError("Invalid prompts directory.")
-    prompts = prompt_root.resolve()
+    if safe_prompt_path(prompt_root, definition.item.selection.prompt) is None:
+        raise ProjectFixtureValidationError(
+            "Item selection policy references a missing or unsafe prompt "
+            f"{definition.item.selection.prompt}."
+        )
     for scope, graph in (
         ("Before-Run execution graph", definition.before),
-        ("Item execution graph", definition.item),
+        ("Item execution graph", definition.item.graph),
         ("After-Run execution graph", definition.after),
     ):
         if graph is None:
@@ -65,8 +100,7 @@ def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
                 raise ProjectFixtureValidationError(f"Invalid node in {scope}.")
             if key != node.name:
                 raise ProjectFixtureValidationError(
-                    f"{scope} node key {key!r} does not match node name "
-                    f"{node.name!r}."
+                    f"{scope} node key {key!r} does not match node name {node.name!r}."
                 )
         try:
             execution_graph(start=graph.start, nodes=list(graph.nodes.values()))
@@ -75,31 +109,13 @@ def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
         for node in graph.nodes.values():
             if isinstance(node, GateNode):
                 continue
-            candidate = prompts / node.prompt
-            try:
-                relative_parts = candidate.relative_to(prompts).parts
-            except ValueError as exc:
-                raise ProjectFixtureValidationError(
-                    f"{scope} Runtime node {node.name!r} references prompt outside "
-                    f"prompts/: {node.prompt}."
-                ) from exc
-            try:
-                path = candidate.resolve()
-            except OSError as exc:
-                raise ProjectFixtureValidationError(
-                    f"{scope} Runtime node {node.name!r} references an unsafe prompt: "
-                    f"{node.prompt}."
-                ) from exc
-            has_symlink = any(
-                (prompts.joinpath(*relative_parts[:index])).is_symlink()
-                for index in range(1, len(relative_parts) + 1)
-            )
-            if prompts not in path.parents:
+            prompt_path = Path(node.prompt)
+            if prompt_path.is_absolute() or ".." in prompt_path.parts:
                 raise ProjectFixtureValidationError(
                     f"{scope} Runtime node {node.name!r} references prompt outside "
                     f"prompts/: {node.prompt}."
                 )
-            if not path.is_file() or has_symlink:
+            if safe_prompt_path(prompt_root, node.prompt) is None:
                 raise ProjectFixtureValidationError(
                     f"{scope} Runtime node {node.name!r} references missing or unsafe "
                     f"prompt {node.prompt}."
@@ -122,5 +138,6 @@ def validate_project_fixture_structure(fixture_dir: Path) -> RunDefinition:
 
 __all__ = [
     "ProjectFixtureValidationError",
+    "safe_prompt_path",
     "validate_project_fixture_structure",
 ]
