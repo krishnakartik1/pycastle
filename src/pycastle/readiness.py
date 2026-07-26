@@ -583,8 +583,7 @@ def render_human(report: ReadinessReport) -> str:
     lines = [
         f"PyCastle Doctor: {report.outcome.value.replace('_', ' ')}",
         f"Repository: {repository}",
-        f"Base branch: {base_branch} "
-        f"(GitHub default: {github_default or 'unknown'})",
+        f"Base branch: {base_branch} (GitHub default: {github_default or 'unknown'})",
     ]
     for check in report.checks:
         label = check.status.value.replace("_", " ")
@@ -1130,7 +1129,8 @@ def _freeze_project_fixture(
         candidate = fixture_dir / marker
         if candidate.is_file() and not candidate.is_symlink():
             paths.add(candidate)
-    for graph in (definition.before, definition.item, definition.after):
+    paths.add(fixture_dir / "prompts" / definition.item.selection.prompt)
+    for graph in (definition.before, definition.item.graph, definition.after):
         if graph is not None:
             paths.update(
                 fixture_dir / "prompts" / node.prompt

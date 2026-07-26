@@ -15,6 +15,7 @@ from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
 from pycastle.graph import load_run
 from pycastle.issues import IssueRef
+from pycastle.models import IssueComment, RuntimeResult, Telemetry
 from pycastle.orchestrator import IssueOutcome, RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
@@ -352,6 +353,187 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0, outcomes
     assert timeline.read_text().splitlines() == ["setup", "setup", "setup", "gate"]
     source.claim.assert_called_once_with(1, assignee="krishna")
+    assert any(
+        call[:3] == ["gh", "pr", "create"] and "--draft" in call
+        for call in process_calls
+    )
+    assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+
+
+def test_project_policy_selects_and_completes_one_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Drive one explicit Item definition through selection and publication."""
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose the most actionable candidate.")
+    (prompts / "prepare.md").write_text("Prepare the Run.")
+    (prompts / "work.md").write_text("Implement the selected Item.")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "gate_node,runtime_node,runtime_selection)\n"
+        "run=build_run("
+        "before=execution_graph(start='prepare',nodes=["
+        "runtime_node('prepare','prepare.md')]),"
+        "item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md',on_success='verify'),"
+        "gate_node('verify')]))"
+        ")\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(
+        f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        f"#!/bin/sh\nprintf 'gate:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    gate.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    item = IssueRef(
+        number=42,
+        title="Project-owned choice",
+        body="The complete frozen body.",
+        labels=["ready-for-agent", "priority:high"],
+        assignees=["krishna"],
+        comments=[IssueComment(author="reviewer", body="Frozen comment.")],
+    )
+    configuration = ReadinessConfiguration(
+        repository="owner/repo",
+        base_branch="main",
+        github_default_branch="main",
+        runtime="stub",
+        sandbox="host",
+        agent_image=None,
+        assignee="krishna",
+        include_unassigned=False,
+        item_limit=1,
+    )
+    project = readiness._freeze_project_fixture(fixture, load_run(fixture))
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    frozen = FrozenReadinessInputs(
+        base_commit,
+        project,
+        (item,),
+        configuration.sandbox,
+        configuration.runtime,
+        configuration.agent_image,
+    )
+    report = ReadinessReport(
+        schema_version=1,
+        outcome=ReadinessOutcome.READY,
+        runner_version="0.1.0",
+        configuration=configuration,
+        checks=tuple(
+            ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+        ),
+        eligible_items=(EligibleItem(item.number, item.title),),
+        selected_items=(item,),
+        frozen_inputs=frozen,
+    )
+
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    prompts_seen: dict[str, str] = {}
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            prompts_seen[node] = prompt
+            if node == "item-selection":
+                return RuntimeResult(
+                    output=(
+                        '<selection>{"item": 42, "reason": '
+                        '"Highest-priority actionable candidate."}</selection>'
+                    ),
+                    telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+                )
+            return super().run(prompt, cwd=cwd, node=node)
+
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "policy-one-170")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+    caplog.set_level("INFO")
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+
+    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+    assert outcomes[0].completed == [42]
+    assert list(prompts_seen) == ["prepare", "item-selection", "work"]
+    selection_prompt = prompts_seen["item-selection"]
+    assert selection_prompt.index("The complete frozen body.") < selection_prompt.index(
+        "Choose the most actionable candidate."
+    )
+    assert selection_prompt.index(
+        "Choose the most actionable candidate."
+    ) < selection_prompt.index("<selection>")
+    assert "Frozen comment." in selection_prompt
+    assert "priority:high" in selection_prompt
+    assert "Implement the selected Item." in prompts_seen["work"]
+    assert "The complete frozen body." in prompts_seen["work"]
+    source.is_still_eligible.assert_called_once_with(
+        item, assignee="krishna", include_unassigned=False
+    )
+    source.claim.assert_called_once_with(42, assignee="krishna")
+    assert "Selected Item #42: Project-owned choice" in caplog.text
+    assert "Highest-priority actionable candidate." not in caplog.text
+    assert timeline.read_text().splitlines() == [
+        "setup:run",
+        "setup:run",
+        "setup:item",
+        "setup:item",
+        "gate:item",
+    ]
     assert any(
         call[:3] == ["gh", "pr", "create"] and "--draft" in call
         for call in process_calls

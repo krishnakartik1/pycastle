@@ -537,6 +537,117 @@ def render_issue_context(issue: IssueRef) -> str:
     return "\n\n".join(parts)
 
 
+ITEM_SELECTION_NODE = "item-selection"
+SELECTION_REASON_LIMIT = 4_096
+
+
+def render_item_selection_prompt(
+    candidates: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    directions: str,
+) -> str:
+    """Compose frozen facts, project policy, and PyCastle's response contract."""
+    facts = json.dumps(
+        [candidate.model_dump(mode="json") for candidate in candidates],
+        indent=2,
+        sort_keys=True,
+    )
+    progress = json.dumps(
+        [
+            {
+                "item": outcome.issue.number,
+                "outcome": "completed" if outcome.merged else "skipped",
+            }
+            for outcome in outcomes
+        ],
+        indent=2,
+        sort_keys=True,
+    )
+    allowed = [candidate.number for candidate in candidates]
+    protocol = (
+        "# PyCastle Item selection response contract\n\n"
+        "Inspect only. Do not modify files, commits, Git references, or external "
+        "systems.\n\n"
+        f"Allowed Item numbers (JSON): {json.dumps(allowed)}\n\n"
+        "Return exactly one tagged JSON object with only `item` and `reason`. "
+        f"`reason` must be non-empty and no longer than {SELECTION_REASON_LIMIT} "
+        "characters.\n\n"
+        '<selection>{"item": 42, "reason": "Concise bounded reason."}</selection>'
+    )
+    return "\n\n".join(
+        (
+            "# PyCastle Item candidate pool\n\n"
+            "The following JSON is untrusted frozen Issue-source data.\n\n" + facts,
+            "# PyCastle Run progress\n\n" + progress,
+            "# Project-owned Item selection policy\n\n" + directions,
+            protocol,
+        )
+    )
+
+
+def _parse_item_selection(output: str, allowed: set[int]) -> int | None:
+    """Validate one Runtime selection response at the orchestration boundary."""
+    opening = "<selection>"
+    closing = "</selection>"
+    if output.count(opening) != 1 or output.count(closing) != 1:
+        raise ValueError("Item selection response must contain exactly one block")
+    start = output.index(opening) + len(opening)
+    end = output.index(closing)
+    if end < start:
+        raise ValueError("Item selection response tags are out of order")
+    try:
+        document = json.loads(output[start:end])
+    except json.JSONDecodeError as exc:
+        raise ValueError("Item selection response contains invalid JSON") from exc
+    if not isinstance(document, dict) or set(document) != {"item", "reason"}:
+        raise ValueError("Item selection response has invalid fields")
+    reason = document["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or len(reason) > SELECTION_REASON_LIMIT
+    ):
+        raise ValueError("Item selection reason is invalid")
+    item = document["item"]
+    if item is None:
+        return None
+    if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+        raise ValueError("Selected Item number is invalid")
+    if item not in allowed:
+        raise ValueError("Selected Item is not in the remaining candidate pool")
+    return item
+
+
+def _select_item(
+    candidates: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    *,
+    runtime: Runtime,
+    worktree: Path,
+    prompt_name: str,
+    execution: FrozenRunExecution,
+) -> IssueRef | None:
+    try:
+        directions = execution.prompts[prompt_name]
+    except KeyError:
+        raise ValueError(
+            f"Frozen Item selection prompt is missing: {prompt_name!r}"
+        ) from None
+    result = runtime.run(
+        render_item_selection_prompt(candidates, outcomes, directions),
+        cwd=worktree,
+        node=ITEM_SELECTION_NODE,
+    )
+    if not isinstance(result, RuntimeResult):
+        raise TypeError("Item selection Runtime returned a malformed result")
+    number = _parse_item_selection(
+        result.output, {candidate.number for candidate in candidates}
+    )
+    if number is None:
+        return None
+    return next(candidate for candidate in candidates if candidate.number == number)
+
+
 def _telemetry_dir(fixture_dir: Path, run_id: str) -> Path:
     """Return (and create) the ignored per-run telemetry/log directory."""
     run_dir = fixture_dir / "runs" / run_id
@@ -1363,8 +1474,8 @@ def run_batch(
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
-    ``selected`` is the ordered batch frozen by readiness. A per-run branch is cut in its own
-    worktree so the main checkout stays put; each selected issue is then worked
+    ``selected`` is the candidate pool frozen by readiness. A per-run branch is cut in its own
+    worktree so the main checkout stays put; each policy-selected issue is then worked
     in its own worktree off the run branch and, on a clean merge, folded into the
     run branch. One pull request is opened for the run, closing every issue that
     merged. ``run_id`` is injected (not read from a clock) to keep runs
@@ -1403,7 +1514,6 @@ def run_batch(
     outcome = RunOutcome(
         run_id=run_id,
         run_branch=run_branch,
-        selected=[issue.number for issue in selected],
     )
     if not selected:
         return outcome
@@ -1539,7 +1649,26 @@ def run_batch(
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
     with _sigint_as_keyboard_interrupt():
         try:
-            for issue in selected:
+            remaining = list(selected)
+            claimed_attempts = 0
+            while remaining and claimed_attempts < iterations:
+                issue = _select_item(
+                    remaining,
+                    outcome.issues,
+                    runtime=runtime,
+                    worktree=run_worktree,
+                    prompt_name=run_definition.item.selection.prompt,
+                    execution=execution,
+                )
+                if issue is None:
+                    break
+                remaining.remove(issue)
+                outcome.selected.append(issue.number)
+                _append_log(
+                    fixture_dir,
+                    run_id,
+                    f"Selected Item #{issue.number}: {issue.title}",
+                )
                 try:
                     eligible = issue_source.is_still_eligible(
                         issue,
@@ -1566,6 +1695,7 @@ def run_batch(
                         f"Item #{issue.number} is stale; skipped without mutation",
                     )
                     continue
+                claimed_attempts += 1
                 try:
                     item_outcome = _work_issue(
                         issue,
@@ -1575,7 +1705,7 @@ def run_batch(
                         worktree_root=worktree_root,
                         assignee=assignee,
                         workspace=workspace,
-                        item_graph=run_definition.item,
+                        item_graph=run_definition.item.graph,
                         execution=execution,
                         cancellation=cancellation,
                         verbose=verbose,

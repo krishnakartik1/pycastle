@@ -47,8 +47,19 @@ class ExecutionGraph:
 
 
 @dataclass(frozen=True)
+class RuntimeSelection:
+    prompt: str
+
+
+@dataclass(frozen=True)
+class ItemDefinition:
+    selection: RuntimeSelection
+    graph: ExecutionGraph
+
+
+@dataclass(frozen=True)
 class RunDefinition:
-    item: ExecutionGraph
+    item: ItemDefinition
     before: ExecutionGraph | None = None
     after: ExecutionGraph | None = None
 
@@ -108,14 +119,28 @@ def execution_graph(*, start: str, nodes: Sequence[ExecutionNode]) -> ExecutionG
     return ExecutionGraph(start, by_name)
 
 
+def runtime_selection(prompt: str) -> RuntimeSelection:
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("Item selection prompt must be a non-empty string")
+    return RuntimeSelection(prompt)
+
+
+def build_item(*, selection: RuntimeSelection, graph: ExecutionGraph) -> ItemDefinition:
+    if not isinstance(selection, RuntimeSelection):
+        raise TypeError("selection must be a RuntimeSelection")
+    if not isinstance(graph, ExecutionGraph):
+        raise TypeError("graph must be an ExecutionGraph")
+    return ItemDefinition(selection, graph)
+
+
 def build_run(
     *,
-    item: ExecutionGraph,
+    item: ItemDefinition,
     before: ExecutionGraph | None = None,
     after: ExecutionGraph | None = None,
 ) -> RunDefinition:
-    if not isinstance(item, ExecutionGraph):
-        raise TypeError("item must be an ExecutionGraph")
+    if not isinstance(item, ItemDefinition):
+        raise TypeError("item must be an ItemDefinition")
     if before is not None and not isinstance(before, ExecutionGraph):
         raise TypeError("before must be an ExecutionGraph or None")
     if after is not None and not isinstance(after, ExecutionGraph):

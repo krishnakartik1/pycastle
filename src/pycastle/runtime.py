@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -64,6 +65,23 @@ class StubRuntime:
 
     def run(self, prompt: str, *, cwd: Path, node: str) -> RuntimeResult:
         """Write the marker file and return fixed output and telemetry."""
+        if node == "item-selection":
+            match = re.search(r"Allowed Item numbers \(JSON\): (\[[^\r\n]*\])", prompt)
+            allowed = json.loads(match.group(1)) if match is not None else []
+            item = min(allowed, default=None)
+            return RuntimeResult(
+                output=(
+                    "<selection>"
+                    + json.dumps(
+                        {
+                            "item": item,
+                            "reason": "Stub selected the lowest remaining Item.",
+                        }
+                    )
+                    + "</selection>"
+                ),
+                telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+            )
         marker = cwd / STUB_MARKER
         marker.write_text(
             f"# PyCastle stub runtime\n\nRuntime node: {node}\nPrompt bytes: {len(prompt)}\n"
