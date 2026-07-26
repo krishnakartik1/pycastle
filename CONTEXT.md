@@ -56,10 +56,27 @@ An optional **Execution graph** walked at Run scope after Item work is integrate
 _Avoid_: after-Run phase graph, post-hook, pipeline.
 
 **Run definition**:
-The project-owned declaration that combines one required **Item execution
-graph** with optional **Before-Run execution graph** and **After-Run execution
-graph** declarations.
+The project-owned declaration that combines one required **Item definition**
+with optional **Before-Run execution graph** and **After-Run execution graph**
+declarations.
 _Avoid_: workflow, pipeline, full graph.
+
+**Item definition**:
+The required part of a **Run definition** that pairs one **Item selection
+policy** with the **Item execution graph** walked for each selected Item.
+_Avoid_: Item graph, Item workflow, Item loop.
+
+**Item candidate pool**:
+The fixed set of ready **Items** one **Run** may choose from. Its membership is
+established before the Run begins; newly ready Items wait for a later Run.
+_Avoid_: backlog, live queue, ordered batch.
+
+**Item selection policy**:
+The project-owned instructions used after the **Before-Run execution graph** and
+before each **Item execution graph** to choose one remaining member of the
+Run's **Item candidate pool**, informed by the Run's progress. It never owns
+claims or **Issue source** mutations.
+_Avoid_: scheduler, planner phase, selection node.
 
 **Terminal**:
 A destination that ends an **Execution graph**. `DONE` completes the current
