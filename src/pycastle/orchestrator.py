@@ -120,6 +120,10 @@ class RunCheckpointError(RuntimeError):
     """A successful Run node could not be committed durably."""
 
 
+class ItemClaimError(RuntimeError):
+    """The Issue source did not confirm ownership of a selected Item."""
+
+
 def prune_run_branches(
     *,
     repo: str,
@@ -545,6 +549,24 @@ SELECTION_REASON_LIMIT = 4_096
 SELECTION_RESPONSE_LIMIT_BYTES = 64 * 1_024
 SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES = 1_024 * 1_024
 ITEM_SELECTION_END_POLICY_HALT = "project-policy-halted"
+_SELECTION_REMOVED_ENV = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "SSH_AUTH_SOCK",
+)
+_SELECTION_PROTECTED_ENV = {
+    "GIT_ASKPASS": "/bin/false",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_KEY_0": "credential.helper",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_TERMINAL_PROMPT": "0",
+    "SSH_ASKPASS": "/bin/false",
+}
 
 
 @dataclass(frozen=True)
@@ -568,6 +590,37 @@ class ItemSelectionError(Exception):
         super().__init__(message)
         self.code = code
         self.parsed_response = parsed_response
+
+
+@contextmanager
+def _without_github_credentials_for_selection() -> Iterator[None]:
+    """Hide known host GitHub credential channels for one Runtime invocation.
+
+    Runtime authentication locations (HOME, CODEX_HOME, and CLAUDE_CONFIG_DIR)
+    remain available. This narrows inherited host authority through documented
+    token, gh-config, Git credential-helper, askpass, and SSH-agent paths. The
+    selected Sandbox remains the security boundary: arbitrary readable host
+    files cannot be made inaccessible by a process-environment contract.
+    """
+    names = (
+        *_SELECTION_REMOVED_ENV,
+        *_SELECTION_PROTECTED_ENV,
+        "GH_CONFIG_DIR",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    with tempfile.TemporaryDirectory(prefix="pycastle-selection-gh-") as gh_config:
+        try:
+            for name in _SELECTION_REMOVED_ENV:
+                os.environ.pop(name, None)
+            os.environ.update(_SELECTION_PROTECTED_ENV)
+            os.environ["GH_CONFIG_DIR"] = gh_config
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _render_item_candidate_envelope(candidates: Sequence[IssueRef]) -> str:
@@ -606,7 +659,9 @@ def render_item_selection_prompt(
         "The workspace has the ordinary writable permissions of the selected "
         "Sandbox. Inspect only: do not modify files, commits, Git references, "
         "or external systems. This is behavioral guidance, not a security "
-        "boundary. GitHub credentials are not supplied for Item selection.\n\n"
+        "boundary. PyCastle withholds known GitHub token, gh configuration, "
+        "Git credential-helper, askpass, and SSH-agent channels. The Sandbox "
+        "does not make arbitrary readable host files inaccessible.\n\n"
         f"Allowed Item numbers (JSON): {json.dumps(allowed)}\n\n"
         "Return exactly one tagged JSON object with only `item` and `reason`. "
         f"`reason` must be non-empty and no longer than {SELECTION_REASON_LIMIT} "
@@ -766,6 +821,8 @@ def _select_item(
         code: str,
         *,
         result: RuntimeResult | None = None,
+        runtime_transcript: str | None = None,
+        runtime_telemetry: Telemetry | None = None,
         runtime_error: str | None = None,
         parsed_response: object | None = None,
     ) -> None:
@@ -776,8 +833,12 @@ def _select_item(
             candidate_envelope=candidate_envelope,
             prompt_name=prompt_name,
             directions=directions,
-            runtime_transcript=result.output if result is not None else None,
-            runtime_telemetry=result.telemetry if result is not None else None,
+            runtime_transcript=(
+                result.output if result is not None else runtime_transcript
+            ),
+            runtime_telemetry=(
+                result.telemetry if result is not None else runtime_telemetry
+            ),
             runtime_error=runtime_error,
             parsed_response=parsed_response,
             validation_status=status,
@@ -801,8 +862,15 @@ def _select_item(
         attempted=attempted,
         stale=stale,
     )
+    execution.invoke_setup(
+        worktree,
+        scope="run",
+        identity=f"item-selection-{round_number}",
+        ordinal=1,
+    )
     try:
-        result = runtime.run(prompt, cwd=worktree, node=ITEM_SELECTION_NODE)
+        with _without_github_credentials_for_selection():
+            result = runtime.run(prompt, cwd=worktree, node=ITEM_SELECTION_NODE)
     except Exception as exc:
         error = ItemSelectionError(
             "Item selection Runtime failed",
@@ -811,6 +879,8 @@ def _select_item(
         record(
             "failed",
             error.code,
+            runtime_transcript=getattr(exc, "transcript", None),
+            runtime_telemetry=getattr(exc, "telemetry", None),
             runtime_error=f"{type(exc).__name__}: {exc}",
         )
         raise error from exc
@@ -1393,7 +1463,10 @@ def _work_issue(
     # claim failures as well as interruptions.
     if cancellation is not None:
         cancellation.in_flight = issue
-    issue_source.claim(issue.number, assignee=assignee)
+    try:
+        issue_source.claim(issue.number, assignee=assignee)
+    except Exception as exc:
+        raise ItemClaimError("Item claim failed") from exc
     _append_log(fixture_dir, run_id, f"Working #{issue.number} on {branch}")
 
     if verbose:
@@ -1578,7 +1651,7 @@ RUN_REPORT_LIMIT = 65_536
 
 def render_run_context(
     run_id: str,
-    selected: Sequence[IssueRef],
+    candidates: Sequence[IssueRef],
     outcomes: Sequence[IssueOutcome],
     *,
     stale: Sequence[int] = (),
@@ -1588,7 +1661,7 @@ def render_run_context(
     outcome_by_number = {o.issue.number: o for o in outcomes}
     stale_numbers = set(stale)
     rows = []
-    for issue in selected:
+    for issue in candidates:
         outcome = outcome_by_number.get(issue.number)
         if outcome is not None:
             state = "completed" if outcome.merged else "skipped"
@@ -1797,7 +1870,7 @@ def run_batch(
     *,
     runtime: Runtime,
     issue_source: IssueSource,
-    selected: Sequence[IssueRef],
+    candidates: Sequence[IssueRef],
     fixture_dir: Path,
     repo: str,
     base_branch: str,
@@ -1813,12 +1886,12 @@ def run_batch(
 ) -> RunOutcome:
     """Work up to ``iterations`` ready issues into one integrated pull request.
 
-    ``selected`` is the candidate pool frozen by readiness. A per-run branch is cut in its own
-    worktree so the main checkout stays put; each policy-selected issue is then worked
-    in its own worktree off the run branch and, on a clean merge, folded into the
-    run branch. One pull request is opened for the run, closing every issue that
-    merged. ``run_id`` is injected (not read from a clock) to keep runs
-    deterministic for tests.
+    ``candidates`` is the candidate pool frozen by readiness. A per-run branch
+    is cut in its own worktree so the main checkout stays put; each
+    policy-selected issue is then worked in its own worktree off the Run branch
+    and, on a clean merge, folded into that branch. One pull request is opened
+    for the Run, closing every issue that merged. ``run_id`` is injected (not
+    read from a clock) to keep Runs deterministic for tests.
 
     Runtime-node and Gate-node outcomes follow only their declared Execution
     graph edges. Every Runtime visit is fresh, and its successor receives only
@@ -1838,14 +1911,16 @@ def run_batch(
         raise TypeError("Run requires FrozenReadinessInputs")
     # Copy again at the orchestration boundary so callers cannot mutate the
     # active membership, order, or Item content during project execution.
-    selected = tuple(issue.model_copy(deep=True) for issue in selected)
-    frozen_items = frozen_inputs.items
+    candidates = tuple(issue.model_copy(deep=True) for issue in candidates)
+    frozen_items = frozen_inputs.candidate_pool
     if not isinstance(frozen_items, tuple) or not all(
         isinstance(issue, IssueRef) for issue in frozen_items
     ):
-        raise ValueError("Frozen readiness Item batch is invalid")
-    if selected != frozen_items:
-        raise ValueError("Selected Items differ from frozen readiness batch")
+        raise ValueError("Frozen readiness Item candidate pool is invalid")
+    if candidates != frozen_items:
+        raise ValueError(
+            "Item candidates differ from the frozen readiness candidate pool"
+        )
     if not re.fullmatch(r"[0-9a-f]{40,64}", frozen_inputs.base_commit):
         raise ValueError("Frozen readiness base commit is invalid")
     branch_start = frozen_inputs.base_commit
@@ -1854,7 +1929,7 @@ def run_batch(
         run_id=run_id,
         run_branch=run_branch,
     )
-    if not selected:
+    if not candidates:
         return outcome
 
     frozen_project = frozen_inputs.project_fixture
@@ -1925,7 +2000,8 @@ def run_batch(
     _append_log(
         fixture_dir,
         run_id,
-        f"Run {run_id}: {len(selected)} issue(s) on {run_branch} (base {branch_start})",
+        f"Run {run_id}: {len(candidates)} candidate(s) on {run_branch} "
+        f"(base {branch_start})",
     )
 
     cancellation = CancellationState()
@@ -1945,7 +2021,7 @@ def run_batch(
                     worktree=run_worktree,
                     graph=run_definition.before,
                     execution=execution,
-                    context=render_run_context(run_id, selected, []),
+                    context=render_run_context(run_id, candidates, []),
                     scope="run",
                     identity="before-run",
                     checkpoint=lambda node: _checkpoint_run_node(
@@ -1976,11 +2052,13 @@ def run_batch(
         outcome.stopping_point = f"before-Run checkpoint: {exc}"
         _append_log(fixture_dir, run_id, outcome.stopping_point)
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _delete_failed_run_branch(run, workspace=workspace)
         return outcome
     if before is not None and before.terminal is HUMAN:
         outcome.succeeded = False
         outcome.stopping_point = "before-Run HUMAN"
         cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+        _delete_failed_run_branch(run, workspace=workspace)
         return outcome
 
     # Track the issue currently in flight so an interrupt (SIGINT) or any
@@ -1988,7 +2066,7 @@ def run_batch(
     # ready state. SIGINT is turned into a KeyboardInterrupt so it unwinds here.
     with _sigint_as_keyboard_interrupt():
         try:
-            remaining = list(selected)
+            remaining = list(candidates)
             claimed_attempts = 0
             selection_round = 0
             while remaining and claimed_attempts < iterations:
@@ -2012,20 +2090,27 @@ def run_batch(
                             attempted=outcome.attempted,
                             stale=outcome.stale,
                         )
-                except ItemSelectionError as exc:
+                except Exception as exc:
                     outcome.succeeded = False
                     outcome.stopping_point = "Item selection"
-                    outcome.selection_failure = exc.code
-                    _append_log(
-                        fixture_dir,
-                        run_id,
-                        "Item selection failed; details retained in local Run records.",
-                    )
-                    if outcome.completed:
-                        break
-                    cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-                    _delete_failed_run_branch(run, workspace=workspace)
-                    return outcome
+                    if isinstance(exc, ItemSelectionError):
+                        outcome.selection_failure = exc.code
+                    else:
+                        outcome.selection_failure = "selection-infrastructure-failed"
+                        if isinstance(exc, SetupError):
+                            outcome.setup_failure = exc.failure
+                    try:
+                        _append_log(
+                            fixture_dir,
+                            run_id,
+                            "Item selection failed; details retained in local "
+                            "Run records.",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not retain the Item selection failure summary."
+                        )
+                    break
                 if issue is None:
                     outcome.selection_end = ITEM_SELECTION_END_POLICY_HALT
                     _append_log(
@@ -2106,14 +2191,25 @@ def run_batch(
                         runner=runner,
                         cwd=workspace,
                     )
-                    issue_source.release(issue.number)
+                    try:
+                        issue_source.release(issue.number)
+                    except Exception:
+                        logger.exception(
+                            "Could not release Item #%s after infrastructure failure.",
+                            issue.number,
+                        )
                     cancellation.in_flight = None
-                    if not outcome.completed:
-                        cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-                        raise
+                    if isinstance(exc, ItemClaimError):
+                        claimed_attempts -= 1
+                        outcome.attempted.pop()
+                    runner(
+                        ["git", "branch", "-D", issue_branch_name(issue)],
+                        capture=True,
+                        cwd=workspace,
+                    )
                     outcome.succeeded = False
                     outcome.stopping_point = (
-                        f"Item #{issue.number} infrastructure failure: {exc}"
+                        f"Item #{issue.number} infrastructure failure"
                     )
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
                     break
@@ -2154,7 +2250,7 @@ def run_batch(
                             execution=execution,
                             context=render_run_context(
                                 run_id,
-                                selected,
+                                candidates,
                                 outcome.issues,
                                 stale=outcome.stale,
                                 selection_end=outcome.selection_end,
@@ -2235,8 +2331,8 @@ def run_batch(
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
     cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
-    if not completed and outcome.selection_end == ITEM_SELECTION_END_POLICY_HALT:
-        delete_local_branch(run_branch, runner=runner, cwd=workspace)
+    if not completed:
+        _delete_failed_run_branch(run, workspace=workspace)
     return outcome
 
 

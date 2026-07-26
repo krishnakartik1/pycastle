@@ -40,7 +40,7 @@ CHECK_IDS = (
     "github_repository",
     "github_permissions",
     "workflow_labels",
-    "eligible_items",
+    "item_candidate_pool",
     "agent_image",
     "frozen_execution_inputs",
     "runtime",
@@ -176,7 +176,7 @@ class ReadinessConfiguration:
 
 
 @dataclass(frozen=True, order=True)
-class EligibleItem:
+class CandidateItem:
     number: int
     title: str
 
@@ -199,7 +199,7 @@ class FrozenProjectFixture:
 class FrozenReadinessInputs:
     base_commit: str
     project_fixture: FrozenProjectFixture
-    items: tuple[IssueRef, ...] = field(repr=False)
+    candidate_pool: tuple[IssueRef, ...] = field(repr=False)
     sandbox: str
     runtime: str
     agent_image: str | None
@@ -232,9 +232,9 @@ class ReadinessReport:
     runner_version: str
     configuration: ReadinessConfiguration
     checks: tuple[ReadinessCheck, ...]
-    eligible_items: tuple[EligibleItem, ...]
-    # Run-only data. Renderers deliberately expose only ``eligible_items``.
-    selected_items: tuple[IssueRef, ...] = field(
+    candidate_items: tuple[CandidateItem, ...]
+    # Run-only data. Renderers deliberately expose only ``candidate_items``.
+    candidate_pool: tuple[IssueRef, ...] = field(
         default_factory=tuple, repr=False, compare=False
     )
     frozen_inputs: FrozenReadinessInputs | None = field(
@@ -243,7 +243,7 @@ class ReadinessReport:
 
 
 Probe = Callable[[str, ReadinessConfiguration], CheckResult]
-ItemLoader = Callable[[ReadinessConfiguration], list[EligibleItem | IssueRef]]
+ItemLoader = Callable[[ReadinessConfiguration], list[CandidateItem | IssueRef]]
 InputFreezer = Callable[
     [ReadinessConfiguration, tuple[IssueRef, ...]], FrozenReadinessInputs
 ]
@@ -253,7 +253,7 @@ Progress = Callable[[str, str, Status | None], None]
 @dataclass(frozen=True)
 class ReadinessDependencies:
     probe: Probe
-    eligible_items: ItemLoader
+    item_candidate_pool: ItemLoader
     freeze_inputs: InputFreezer | None = None
 
 
@@ -265,22 +265,27 @@ _PREREQUISITES: dict[str, tuple[str, ...]] = {
     "github_repository": ("github_authentication", "git_repository"),
     "github_permissions": ("github_authentication", "github_repository"),
     "workflow_labels": ("github_authentication", "github_repository"),
-    "eligible_items": ("github_authentication", "github_repository"),
+    "item_candidate_pool": ("github_authentication", "github_repository"),
     "agent_image": (
         "fixture_compatibility",
         "fixture_structure",
         "sandbox",
-        "eligible_items",
+        "item_candidate_pool",
     ),
     "frozen_execution_inputs": (
         "base_branch",
         "fixture_structure",
         "sandbox",
-        "eligible_items",
+        "item_candidate_pool",
         "agent_image",
     ),
-    "runtime": ("sandbox", "agent_image", "frozen_execution_inputs", "eligible_items"),
-    "runtime_authentication": ("runtime", "eligible_items"),
+    "runtime": (
+        "sandbox",
+        "agent_image",
+        "frozen_execution_inputs",
+        "item_candidate_pool",
+    ),
+    "runtime_authentication": ("runtime", "item_candidate_pool"),
 }
 
 
@@ -293,8 +298,8 @@ def evaluate_readiness(
     """Evaluate every independent check and block only true dependants."""
     checks: list[ReadinessCheck] = []
     outcomes: dict[str, Status] = {}
-    items: list[EligibleItem] = []
-    selected_items: tuple[IssueRef, ...] = ()
+    items: list[CandidateItem] = []
+    frozen_candidate_pool: tuple[IssueRef, ...] = ()
     frozen_inputs: FrozenReadinessInputs | None = None
     no_work = False
     for check_id in CHECK_IDS:
@@ -333,11 +338,12 @@ def evaluate_readiness(
             else:
                 try:
                     frozen_inputs = dependencies.freeze_inputs(
-                        configuration, selected_items
+                        configuration, frozen_candidate_pool
                     )
                     result = CheckResult(
                         Status.PASS,
-                        "Exact base, Project fixture, Item batch, and host configuration are frozen.",
+                        "Exact base, Project fixture, Item candidate pool, and host "
+                        "configuration are frozen.",
                         {
                             "base_commit": frozen_inputs.base_commit,
                             "fixture_identity": frozen_inputs.project_fixture.identity,
@@ -349,15 +355,15 @@ def evaluate_readiness(
                         "Execution inputs could not be frozen safely.",
                         remediation="Resolve the failed identity checks and retry Doctor.",
                     )
-        elif check_id == "eligible_items":
+        elif check_id == "item_candidate_pool":
             try:
-                loaded_items = dependencies.eligible_items(configuration)
+                loaded_items = dependencies.item_candidate_pool(configuration)
                 if not isinstance(loaded_items, list):
                     raise TypeError("Eligible Item metadata must be a list")
-                safe_items: list[EligibleItem] = []
+                safe_items: list[CandidateItem] = []
                 full_items: list[IssueRef] = []
                 for item in loaded_items:
-                    safe_items.append(_safe_eligible_item(item))
+                    safe_items.append(_safe_candidate_item(item))
                     if isinstance(item, IssueRef):
                         full_items.append(item.model_copy(deep=True))
                 order = sorted(
@@ -365,10 +371,10 @@ def evaluate_readiness(
                 )
                 items = [safe_items[index] for index in order]
                 if len(full_items) == len(loaded_items):
-                    selected_items = tuple(full_items[index] for index in order)
+                    frozen_candidate_pool = tuple(full_items[index] for index in order)
                 result = CheckResult(
                     Status.PASS,
-                    f"{len(items)} eligible Item(s) selected.",
+                    f"{len(items)} Item candidate(s) found.",
                     {"count": len(items)},
                 )
                 no_work = not items
@@ -428,7 +434,7 @@ def evaluate_readiness(
         configuration,
         tuple(checks),
         tuple(items),
-        selected_items,
+        frozen_candidate_pool,
         frozen_inputs,
     )
 
@@ -444,7 +450,7 @@ _FACT_KEYS: dict[str, dict[str, str]] = {
     "agent_image": {"image": "text"},
     "runtime": {"version": "text"},
     "workflow_labels": {"missing": "list"},
-    "eligible_items": {"count": "integer"},
+    "item_candidate_pool": {"count": "integer"},
     "frozen_execution_inputs": {
         "base_commit": "text",
         "fixture_identity": "text",
@@ -458,9 +464,9 @@ def _bounded_text(value: object, limit: int) -> str:
     return "".join(char for char in value if char.isprintable())[:limit]
 
 
-def _safe_eligible_item(item: object) -> EligibleItem:
+def _safe_candidate_item(item: object) -> CandidateItem:
     """Validate and bound Issue metadata before it enters a report."""
-    if not isinstance(item, EligibleItem | IssueRef):
+    if not isinstance(item, CandidateItem | IssueRef):
         raise TypeError("Eligible Item metadata has an invalid shape")
     if (
         not isinstance(item.number, int)
@@ -470,7 +476,7 @@ def _safe_eligible_item(item: object) -> EligibleItem:
         raise ValueError("Eligible Item number must be a positive integer")
     if not isinstance(item.title, str):
         raise TypeError("Eligible Item title must be text")
-    return EligibleItem(item.number, _bounded_text(item.title, 200))
+    return CandidateItem(item.number, _bounded_text(item.title, 200))
 
 
 def _safe_fact_text(value: object, limit: int) -> str:
@@ -539,7 +545,7 @@ def report_document(report: ReadinessReport) -> dict[str, Any]:
             }
             for check in report.checks
         ],
-        "eligible_items": [asdict(item) for item in report.eligible_items],
+        "candidate_items": [asdict(item) for item in report.candidate_items],
     }
 
 
@@ -590,7 +596,7 @@ def render_human(report: ReadinessReport) -> str:
         lines.append(f"[{label}] {check.id}: {check.summary}")
         if check.remediation and check.status in {Status.FAIL, Status.BLOCKED}:
             lines.append(f"  Fix: {check.remediation}")
-    for item in report.eligible_items:
+    for item in report.candidate_items:
         lines.append(f"  #{item.number} {item.title}")
     return "\n".join(lines)
 
@@ -1084,9 +1090,9 @@ test "$(tail -n 1 "$PWD/.pycastle-existing")" = modified
             )
         )
 
-    def eligible_items(
+    def item_candidate_pool(
         self, config: ReadinessConfiguration
-    ) -> list[EligibleItem | IssueRef]:
+    ) -> list[CandidateItem | IssueRef]:
         if not config.assignee:
             raise ValueError("GitHub assignee could not be resolved")
         source = GitHubIssueSource(config.repository, runner=self.runner)
@@ -1098,16 +1104,16 @@ test "$(tail -n 1 "$PWD/.pycastle-existing")" = modified
             else source.list_ready_metadata
         )
         issues = loader(timeout=SHORT_TIMEOUT)
-        selected = candidate_pool(
+        candidates = candidate_pool(
             issues,
             assignee=config.assignee,
             include_unassigned=config.include_unassigned,
         )
-        return selected
+        return candidates
 
     def dependencies(self) -> ReadinessDependencies:
         return ReadinessDependencies(
-            self.probe, self.eligible_items, self.frozen_inputs
+            self.probe, self.item_candidate_pool, self.frozen_inputs
         )
 
     def frozen_inputs(

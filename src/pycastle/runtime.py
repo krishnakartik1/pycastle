@@ -35,11 +35,21 @@ class AgentCrashError(RuntimeError):
     (retry, skip, escalate) without parsing the message string.
     """
 
-    def __init__(self, message: str, *, node: str, exit_code: int) -> None:
-        """Record the failing node and the process exit code."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        node: str,
+        exit_code: int,
+        transcript: str = "",
+        telemetry: Telemetry | None = None,
+    ) -> None:
+        """Record the failure and any output parsed before process exit."""
         super().__init__(message)
         self.node = node
         self.exit_code = exit_code
+        self.transcript = transcript
+        self.telemetry = telemetry
 
 
 @runtime_checkable
@@ -272,6 +282,8 @@ class ClaudeRuntime:
 
         is_error = bool(result_info and result_info["is_error"]) or proc.returncode != 0
         if is_error:
+            output = "".join(output_buf) if output_buf else result_text
+            telemetry = _build_telemetry(self.name, node, result_info)
             logger.error(
                 "[%s] claude exited with code %s: %s",
                 node,
@@ -282,6 +294,8 @@ class ClaudeRuntime:
                 f"claude crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
+                transcript=output,
+                telemetry=telemetry,
             )
 
         output = "".join(output_buf) if output_buf else result_text
@@ -647,6 +661,13 @@ class CodexRuntime:
         stderr_text = proc.stderr.read() if proc.stderr else ""
 
         if proc.returncode != 0:
+            telemetry = _build_codex_telemetry(
+                node,
+                thread_id=thread_id,
+                usage=usage,
+                num_turns=num_turns,
+                elapsed_ms=elapsed_ms,
+            )
             logger.error(
                 "[%s] codex exited with code %s: %s",
                 node,
@@ -657,6 +678,8 @@ class CodexRuntime:
                 f"codex crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
+                transcript="".join(output_buf),
+                telemetry=telemetry,
             )
 
         telemetry = _build_codex_telemetry(

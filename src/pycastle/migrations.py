@@ -9,6 +9,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
+from .fixture_validation import safe_prompt_path
 from .graph import ExecutionGraph, ItemDefinition, RuntimeSelection, load_run
 from .upgrade_errors import FixtureUpgradeError
 
@@ -68,25 +69,15 @@ def fixture_declares_project_owned_item_selection(fixture: Path) -> bool:
     try:
         definition = load_run(fixture)
         item = definition.item
-        prompt_root = (fixture / "prompts").resolve()
-        prompt = prompt_root / item.selection.prompt
-        relative_parts = prompt.relative_to(prompt_root).parts
-        resolved_prompt = prompt.resolve()
     except Exception:
         # Fixture Python is owner-authored; any load failure means the target
         # contract is not yet complete, while interrupts still propagate.
         return False
-    has_symlink = any(
-        (prompt_root.joinpath(*relative_parts[:index])).is_symlink()
-        for index in range(1, len(relative_parts) + 1)
-    )
     return (
         isinstance(item, ItemDefinition)
         and isinstance(item.selection, RuntimeSelection)
         and isinstance(item.graph, ExecutionGraph)
-        and prompt_root in resolved_prompt.parents
-        and resolved_prompt.is_file()
-        and not has_symlink
+        and safe_prompt_path(fixture / "prompts", item.selection.prompt) is not None
     )
 
 

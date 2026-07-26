@@ -71,40 +71,6 @@ def candidate_pool(
     return sorted(eligible, key=lambda issue: issue.number)
 
 
-def select_next(
-    issues: list[IssueRef],
-    *,
-    assignee: str,
-    include_unassigned: bool = False,
-) -> IssueRef | None:
-    """Return the lowest-numbered eligible issue, or ``None`` if there is none."""
-    eligible = filter_for_assignee(
-        issues, assignee, include_unassigned=include_unassigned
-    )
-    return min(eligible, key=lambda issue: issue.number, default=None)
-
-
-def select_batch(
-    issues: list[IssueRef],
-    *,
-    assignee: str,
-    include_unassigned: bool = False,
-    limit: int,
-) -> list[IssueRef]:
-    """Return up to ``limit`` eligible issues, lowest-numbered first.
-
-    The batch generalises :func:`select_next`: it filters to the issues this
-    assignee may work (optionally including unassigned ones) and returns them in
-    ascending issue-number order, capped at ``limit``. A ``limit`` of zero or
-    less yields an empty batch. This stays a pure function so the selection,
-    assignee-filter, and ready-state logic can be tested without mocks.
-    """
-    ordered = candidate_pool(
-        issues, assignee=assignee, include_unassigned=include_unassigned
-    )
-    return ordered[:limit] if limit > 0 else []
-
-
 class IssueSource(ABC):
     """Lists, claims, and labels work items behind a stable interface."""
 
@@ -325,7 +291,7 @@ class GitHubIssueSource(IssueSource):
 
     def claim(self, number: int, *, assignee: str) -> None:
         """Assign the issue and drop the ready label so other runs skip it."""
-        self._run(
+        result = self._run(
             [
                 "gh",
                 "issue",
@@ -340,6 +306,8 @@ class GitHubIssueSource(IssueSource):
             ],
             capture=True,
         )
+        if getattr(result, "returncode", 1) != 0:
+            raise OSError("GitHub Item claim failed")
 
     def mark_for_human(self, number: int) -> None:
         """Add the ready-for-human label so a person picks the issue up.

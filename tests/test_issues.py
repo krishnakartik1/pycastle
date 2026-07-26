@@ -11,9 +11,8 @@ import pytest
 from pycastle.issues import (
     GitHubIssueSource,
     assignee_logins,
+    candidate_pool,
     filter_for_assignee,
-    select_batch,
-    select_next,
 )
 from pycastle.models import IssueRef
 
@@ -38,65 +37,22 @@ def test_filter_for_assignee_can_include_unassigned() -> None:
     assert [i.number for i in kept] == [1, 2]
 
 
-def test_select_next_returns_lowest_numbered_eligible() -> None:
-    issues = [_issue(5, ["krishna"]), _issue(3, ["krishna"]), _issue(9, ["other"])]
-    chosen = select_next(issues, assignee="krishna")
-    assert chosen is not None and chosen.number == 3
-
-
-def test_select_next_returns_none_when_nothing_eligible() -> None:
-    issues = [_issue(1, ["other"])]
-    assert select_next(issues, assignee="krishna") is None
-
-
-def test_select_batch_returns_up_to_limit_lowest_first() -> None:
+def test_candidate_pool_returns_every_eligible_item_in_canonical_order() -> None:
     issues = [_issue(5, ["krishna"]), _issue(3, ["krishna"]), _issue(9, ["krishna"])]
-    chosen = select_batch(issues, assignee="krishna", limit=2)
-    assert [i.number for i in chosen] == [3, 5]
+    candidates = candidate_pool(issues, assignee="krishna")
+    assert [item.number for item in candidates] == [3, 5, 9]
 
 
-def test_select_batch_filters_by_assignee_without_mocks() -> None:
+def test_candidate_pool_filters_by_assignee_without_mocks() -> None:
     issues = [_issue(1, ["other"]), _issue(2, ["krishna"]), _issue(4, [])]
-    chosen = select_batch(issues, assignee="krishna", limit=10)
-    assert [i.number for i in chosen] == [2]
+    candidates = candidate_pool(issues, assignee="krishna")
+    assert [item.number for item in candidates] == [2]
 
 
-def test_select_batch_can_include_unassigned() -> None:
+def test_candidate_pool_can_include_unassigned() -> None:
     issues = [_issue(1, []), _issue(2, ["krishna"]), _issue(3, ["other"])]
-    chosen = select_batch(issues, assignee="krishna", include_unassigned=True, limit=10)
-    assert [i.number for i in chosen] == [1, 2]
-
-
-def test_select_batch_returns_all_when_limit_exceeds_eligible() -> None:
-    issues = [_issue(2, ["krishna"]), _issue(7, ["krishna"])]
-    chosen = select_batch(issues, assignee="krishna", limit=99)
-    assert [i.number for i in chosen] == [2, 7]
-
-
-def test_select_batch_is_empty_for_nonpositive_limit() -> None:
-    issues = [_issue(2, ["krishna"])]
-    assert select_batch(issues, assignee="krishna", limit=0) == []
-
-
-def test_select_batch_returns_all_when_limit_equals_eligible() -> None:
-    # The boundary where limit is exactly the eligible count: take all, in order,
-    # with no off-by-one trimming.
-    issues = [_issue(7, ["krishna"]), _issue(2, ["krishna"]), _issue(5, ["krishna"])]
-    chosen = select_batch(issues, assignee="krishna", limit=3)
-    assert [i.number for i in chosen] == [2, 5, 7]
-
-
-def test_select_batch_caps_unassigned_interaction_at_limit() -> None:
-    # include_unassigned widens the eligible set, but the limit still caps the
-    # batch and selection stays lowest-numbered first across both kinds.
-    issues = [
-        _issue(1, []),
-        _issue(2, ["krishna"]),
-        _issue(3, []),
-        _issue(4, ["other"]),
-    ]
-    chosen = select_batch(issues, assignee="krishna", include_unassigned=True, limit=2)
-    assert [i.number for i in chosen] == [1, 2]
+    candidates = candidate_pool(issues, assignee="krishna", include_unassigned=True)
+    assert [item.number for item in candidates] == [1, 2]
 
 
 def test_github_source_parses_list_output() -> None:
@@ -404,6 +360,16 @@ def test_github_source_claim_assigns_and_drops_label() -> None:
         ],
         capture=True,
     )
+
+
+def test_github_source_claim_fails_when_gh_edit_fails() -> None:
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=1, stderr="denied")
+    )
+    source = GitHubIssueSource("owner/repo", runner=runner)
+
+    with pytest.raises(OSError, match="Item claim failed"):
+        source.claim(42, assignee="krishna")
 
 
 def test_github_source_mark_for_human_adds_the_label() -> None:

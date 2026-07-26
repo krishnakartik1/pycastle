@@ -344,10 +344,10 @@ def _evaluate_cli_readiness(args: argparse.Namespace) -> ReadinessReport:
         )
 
 
-def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
-    """Return whether every eligible Item has matching Run-only content."""
+def _run_has_complete_frozen_candidate_pool(report: ReadinessReport) -> bool:
+    """Return whether every candidate has matching frozen Run-only content."""
     frozen = report.frozen_inputs
-    if frozen is None or frozen.items != report.selected_items:
+    if frozen is None or frozen.candidate_pool != report.candidate_pool:
         return False
     configuration = report.configuration
     if (
@@ -356,12 +356,12 @@ def _run_has_complete_frozen_batch(report: ReadinessReport) -> bool:
         or frozen.agent_image != configuration.agent_image
     ):
         return False
-    if len(report.selected_items) != len(report.eligible_items):
+    if len(report.candidate_pool) != len(report.candidate_items):
         return False
     return all(
-        selected.number == eligible.number and selected.title == eligible.title
-        for selected, eligible in zip(
-            report.selected_items, report.eligible_items, strict=True
+        candidate.number == safe.number and candidate.title == safe.title
+        for candidate, safe in zip(
+            report.candidate_pool, report.candidate_items, strict=True
         )
     )
 
@@ -380,7 +380,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if check.status in {Status.FAIL, Status.BLOCKED}:
                 logger.error("Readiness %s: %s", check.id, check.summary)
         return 1
-    if not _run_has_complete_frozen_batch(report):
+    if not _run_has_complete_frozen_candidate_pool(report):
         logger.error("Readiness did not return a complete matching frozen snapshot.")
         return 1
 
@@ -412,7 +412,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     outcome = run_loop(
         runtime=runtime,
         issue_source=issue_source,
-        selected=report.selected_items,
+        candidates=report.candidate_pool,
         fixture_dir=FIXTURE_DIR,
         repo=repo,
         base_branch=base_branch,
@@ -423,7 +423,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         frozen_inputs=report.frozen_inputs,
     )
-    if not outcome.selected:
+    if not outcome.attempted:
         if outcome.selection_end == ITEM_SELECTION_END_POLICY_HALT:
             logger.info("Project policy halted Item selection.")
         elif not outcome.succeeded:
@@ -435,7 +435,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
         else:
             logger.info("Nothing to do.")
-        return 0
+        return 0 if outcome.succeeded else 1
     logger.info(
         "Run %s worked %d issue(s), merged %s; PR opened: %s",
         outcome.run_id,

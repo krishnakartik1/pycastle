@@ -344,7 +344,15 @@ def test_ignores_unparseable_lines(mock_popen: MagicMock, tmp_path: Path) -> Non
 
 
 def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> None:
-    proc = _fake_proc([], returncode=1)
+    proc = _fake_proc(
+        [
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "partial answer"},
+            }
+        ],
+        returncode=1,
+    )
     proc.stderr = io.StringIO("boom")
     mock_popen.return_value = proc
 
@@ -353,6 +361,9 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
 
     assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 1
+    assert exc_info.value.transcript == "partial answer"
+    assert exc_info.value.telemetry is not None
+    assert exc_info.value.telemetry.runtime == "codex"
 
 
 def test_nonzero_exit_reads_stderr_for_logging(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from importlib.metadata import version
 from pathlib import Path
@@ -11,17 +12,17 @@ from unittest.mock import MagicMock, call
 import pytest
 from packaging.version import Version
 
-from pycastle import cli, readiness
+from pycastle import cli, orchestrator, readiness
 from pycastle import migrations as fixture_migrations
 from pycastle.cli import build_parser, main
 from pycastle.graph import load_run
 from pycastle.issues import IssueRef
 from pycastle.models import IssueComment, RuntimeResult, Telemetry
-from pycastle.orchestrator import IssueOutcome, RunCheckpointError, RunOutcome
+from pycastle.orchestrator import IssueOutcome, RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
     CHECK_IDS,
-    EligibleItem,
+    CandidateItem,
     FrozenReadinessInputs,
     ReadinessCheck,
     ReadinessConfiguration,
@@ -29,7 +30,7 @@ from pycastle.readiness import (
     ReadinessReport,
     Status,
 )
-from pycastle.runtime import StubRuntime
+from pycastle.runtime import AgentCrashError, StubRuntime
 from pycastle.upgrade import FixtureMigration, FixtureUpgradeError, upgrade_fixture
 
 
@@ -84,7 +85,7 @@ def ready_run_preflight(
             )
         else:
             frozen = MagicMock()
-            frozen.items = selected
+            frozen.candidate_pool = selected
             frozen.sandbox = configuration.sandbox
             frozen.runtime = configuration.runtime
             frozen.agent_image = configuration.agent_image
@@ -96,8 +97,8 @@ def ready_run_preflight(
             checks=tuple(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
-            eligible_items=(EligibleItem(1, "One"),),
-            selected_items=selected,
+            candidate_items=(CandidateItem(1, "One"),),
+            candidate_pool=selected,
             frozen_inputs=frozen,
         )
 
@@ -393,7 +394,13 @@ def test_migrated_fixture_selects_claims_completes_and_publishes_an_item(
     monkeypatch.setattr(cli, "run_loop", run_from_cli)
 
     assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0, outcomes
-    assert timeline.read_text().splitlines() == ["setup", "setup", "setup", "gate"]
+    assert timeline.read_text().splitlines() == [
+        "setup",
+        "setup",
+        "setup",
+        "setup",
+        "gate",
+    ]
     source.claim.assert_called_once_with(1, assignee="krishna")
     assert any(
         call[:3] == ["gh", "pr", "create"] and "--draft" in call
@@ -521,11 +528,11 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
         checks=tuple(
             ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
         ),
-        eligible_items=(
-            EligibleItem(earlier.number, earlier.title),
-            EligibleItem(item.number, item.title),
+        candidate_items=(
+            CandidateItem(earlier.number, earlier.title),
+            CandidateItem(item.number, item.title),
         ),
-        selected_items=frozen_items,
+        candidate_pool=frozen_items,
         frozen_inputs=frozen,
     )
     earlier.body = "changed after readiness"
@@ -553,12 +560,42 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
 
     prompts_seen: dict[str, str] = {}
     selection_worktrees: list[Path] = []
+    selection_environment: dict[str, str | None] = {}
+    github_environment = {
+        "GH_TOKEN": "gh-secret",
+        "GITHUB_TOKEN": "github-secret",
+        "GH_ENTERPRISE_TOKEN": "ghe-secret",
+        "GITHUB_ENTERPRISE_TOKEN": "github-enterprise-secret",
+        "SSH_AUTH_SOCK": "/tmp/private-agent.sock",
+        "GH_CONFIG_DIR": "/tmp/private-gh-config",
+        "GIT_CONFIG_GLOBAL": "/tmp/private-gitconfig",
+        "CODEX_HOME": "/tmp/runtime-auth-must-survive",
+    }
+    for name, value in github_environment.items():
+        monkeypatch.setenv(name, value)
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, node: str):
             prompts_seen[node] = prompt
             if node == "item-selection":
                 selection_worktrees.append(cwd)
+                selection_environment.update(
+                    {
+                        name: os.environ.get(name)
+                        for name in (
+                            *github_environment,
+                            "GIT_ASKPASS",
+                            "GIT_CONFIG_COUNT",
+                            "GIT_CONFIG_KEY_0",
+                            "GIT_CONFIG_NOSYSTEM",
+                            "GIT_CONFIG_VALUE_0",
+                            "GIT_TERMINAL_PROMPT",
+                        )
+                    }
+                )
+                gh_config = Path(os.environ["GH_CONFIG_DIR"])
+                assert gh_config.is_dir()
+                assert list(gh_config.iterdir()) == []
                 assert (cwd / "PYCASTLE_STUB.md").is_file()
                 (cwd / "SELECTION_ONLY.md").write_text(
                     "This writable selection change must be discarded.\n"
@@ -568,8 +605,17 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                         cwd.parent / "run-later-candidate-171" / "DURABLE_CHANGE"
                     ).write_text("selection reached outside its disposable worktree\n")
                 if selection_outcome == "runtime-failure":
-                    raise RuntimeError(
-                        "selection Runtime failed with private provider detail"
+                    raise AgentCrashError(
+                        "selection Runtime failed with private provider detail",
+                        node=node,
+                        exit_code=17,
+                        transcript="partial private Runtime transcript",
+                        telemetry=Telemetry(
+                            runtime=self.name,
+                            node=node,
+                            num_turns=1,
+                            is_error=True,
+                        ),
                     )
                 if selection_outcome == "cancelled":
                     raise KeyboardInterrupt
@@ -614,13 +660,8 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
 
     monkeypatch.setattr(cli, "run_loop", run_from_cli)
 
-    if selection_outcome == "durable-change":
-        with pytest.raises(
-            RunCheckpointError,
-            match="selection changed the durable Run branch or worktree",
-        ):
-            main(["run", "--sandbox", "host", "--runtime", "stub"])
-    elif selection_outcome in {
+    if selection_outcome in {
+        "durable-change",
         "runtime-failure",
         "invalid-response",
         "out-of-pool",
@@ -632,6 +673,25 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
         assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 130
     else:
         assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+
+    assert {
+        name: os.environ.get(name) for name in github_environment
+    } == github_environment
+    if selection_outcome != "candidate-overflow":
+        assert selection_environment["GH_TOKEN"] is None
+        assert selection_environment["GITHUB_TOKEN"] is None
+        assert selection_environment["GH_ENTERPRISE_TOKEN"] is None
+        assert selection_environment["GITHUB_ENTERPRISE_TOKEN"] is None
+        assert selection_environment["SSH_AUTH_SOCK"] is None
+        assert selection_environment["CODEX_HOME"] == "/tmp/runtime-auth-must-survive"
+        assert selection_environment["GIT_ASKPASS"] == "/bin/false"
+        assert selection_environment["GIT_CONFIG_COUNT"] == "1"
+        assert selection_environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert selection_environment["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert selection_environment["GIT_CONFIG_VALUE_0"] == ""
+        assert selection_environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert selection_environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert not Path(str(selection_environment["GH_CONFIG_DIR"])).exists()
 
     if selection_outcome != "valid":
         source.is_still_eligible.assert_not_called()
@@ -671,7 +731,10 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                 )
                 assert record["parsed_response"] is None
             elif selection_outcome == "runtime-failure":
-                assert record["runtime_transcript"] is None
+                assert record["runtime_transcript"] == (
+                    "partial private Runtime transcript"
+                )
+                assert record["runtime_telemetry"]["is_error"] is True
                 assert "private provider detail" in record["runtime_error"]
             elif selection_outcome == "out-of-pool":
                 assert record["parsed_response"] == {
@@ -728,6 +791,18 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                 ).returncode
                 != 0
             )
+        elif selection_outcome == "durable-change":
+            assert outcomes[0].selection_failure == "selection-infrastructure-failed"
+            record = json.loads(
+                (
+                    fixture / "runs" / "later-candidate-171" / "selection-001.json"
+                ).read_text()
+            )
+            assert record["validation"] == {
+                "status": "accepted",
+                "code": "selection-accepted",
+            }
+            assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
         return
 
     assert outcomes[0].completed == [42]
@@ -767,8 +842,15 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     assert len(selection_worktrees) == 1
     assert selection_worktrees[0].name == "selection-later-candidate-171"
     assert not selection_worktrees[0].exists()
+    selection_setup_records = list(
+        (fixture / "runs" / "later-candidate-171" / "executions").glob(
+            "item-selection-1-*-setup-1.json"
+        )
+    )
+    assert len(selection_setup_records) == 1
+    assert json.loads(selection_setup_records[0].read_text())["scope"] == "run"
     assert "behavioral guidance, not a security boundary" in selection_prompt
-    assert "GitHub credentials are not supplied" in selection_prompt
+    assert "withholds known GitHub token" in selection_prompt
     selection_change = subprocess.run(
         [
             "git",
@@ -782,6 +864,7 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     )
     assert selection_change.returncode != 0
     assert timeline.read_text().splitlines() == [
+        "setup:run",
         "setup:run",
         "setup:run",
         "setup:item",
@@ -896,10 +979,10 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
         checks=tuple(
             ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
         ),
-        eligible_items=tuple(
-            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        candidate_items=tuple(
+            CandidateItem(candidate.number, candidate.title) for candidate in candidates
         ),
-        selected_items=frozen.items,
+        candidate_pool=frozen.candidate_pool,
         frozen_inputs=frozen,
     )
 
@@ -1050,6 +1133,8 @@ def _run_stale_recheck_from_cli(
     tmp_path: Path,
     *,
     recheck_failure: OSError | None = None,
+    policy_choices: tuple[int | None, ...] = (11, 22),
+    eligibility: tuple[bool, ...] = (False, True),
 ) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str], list[str]]:
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
@@ -1143,10 +1228,10 @@ def _run_stale_recheck_from_cli(
         checks=tuple(
             ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
         ),
-        eligible_items=tuple(
-            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        candidate_items=tuple(
+            CandidateItem(candidate.number, candidate.title) for candidate in candidates
         ),
-        selected_items=frozen.items,
+        candidate_pool=frozen.candidate_pool,
         frozen_inputs=frozen,
     )
     candidates[0].body = "Changed after readiness."
@@ -1174,7 +1259,7 @@ def _run_stale_recheck_from_cli(
 
     selection_prompts: list[str] = []
     after_prompts: list[str] = []
-    choices = iter((11, 22))
+    choices = iter(policy_choices)
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, node: str):
@@ -1183,7 +1268,7 @@ def _run_stale_recheck_from_cli(
                 choice = next(choices)
                 return RuntimeResult(
                     output=(
-                        f'<selection>{{"item": {choice}, "reason": '
+                        f'<selection>{{"item": {json.dumps(choice)}, "reason": '
                         '"Project dependency order."}</selection>'
                     ),
                     telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
@@ -1197,7 +1282,7 @@ def _run_stale_recheck_from_cli(
 
     source = MagicMock()
     if recheck_failure is None:
-        source.is_still_eligible.side_effect = (False, True)
+        source.is_still_eligible.side_effect = eligibility
     else:
         source.is_still_eligible.side_effect = recheck_failure
     outcomes: list[RunOutcome] = []
@@ -1303,6 +1388,94 @@ def test_item_recheck_error_fails_run_instead_of_marking_item_stale(
     source.claim.assert_not_called()
     source.list_ready.assert_not_called()
     assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    assert not (tmp_path / ".pycastle/worktrees/run-stale-fallthrough-177").exists()
+    branch = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-stale-fallthrough-177"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branch.stdout == ""
+
+
+def test_stale_then_policy_halt_is_successful_and_leaves_no_run_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+    ) = _run_stale_recheck_from_cli(
+        monkeypatch,
+        tmp_path,
+        policy_choices=(11, None),
+        eligibility=(False,),
+    )
+
+    outcome = outcomes[0]
+    assert exit_code == 0
+    assert outcome.selected == [11]
+    assert outcome.stale == [11]
+    assert outcome.attempted == []
+    assert outcome.completed == []
+    assert outcome.selection_end == "project-policy-halted"
+    assert outcome.succeeded is True
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_not_called()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    assert not (tmp_path / ".pycastle/worktrees/run-stale-fallthrough-177").exists()
+    branch = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-stale-fallthrough-177"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branch.stdout == ""
+
+
+def test_all_stale_candidates_end_successfully_and_leave_no_run_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+    ) = _run_stale_recheck_from_cli(
+        monkeypatch,
+        tmp_path,
+        policy_choices=(11, 22),
+        eligibility=(False, False),
+    )
+
+    outcome = outcomes[0]
+    assert exit_code == 0
+    assert outcome.stale == [11, 22]
+    assert outcome.attempted == []
+    assert outcome.completed == []
+    assert outcome.selection_end == "candidate-pool-exhausted"
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_not_called()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    branch = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-stale-fallthrough-177"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branch.stdout == ""
 
 
 def _run_policy_halt_from_cli(
@@ -1311,6 +1484,7 @@ def _run_policy_halt_from_cli(
     *,
     after_integration: bool,
     fail_after_integration: bool = False,
+    claim_failure: OSError | None = None,
 ) -> tuple[
     int,
     MagicMock,
@@ -1406,10 +1580,10 @@ def _run_policy_halt_from_cli(
         checks=tuple(
             ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
         ),
-        eligible_items=tuple(
-            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        candidate_items=tuple(
+            CandidateItem(candidate.number, candidate.title) for candidate in candidates
         ),
-        selected_items=frozen.items,
+        candidate_pool=frozen.candidate_pool,
         frozen_inputs=frozen,
     )
 
@@ -1468,6 +1642,7 @@ def _run_policy_halt_from_cli(
 
     source = MagicMock()
     source.is_still_eligible.return_value = True
+    source.claim.side_effect = claim_failure
     outcomes: list[RunOutcome] = []
     run_id = (
         "later-selection-failure-179" if fail_after_integration else "policy-halt-176"
@@ -1533,7 +1708,7 @@ def test_project_policy_halts_before_integration_without_mutation_or_pr(
         check=True,
     )
     assert branches.stdout == ""
-    assert timeline.read_text().splitlines() == ["setup:run"]
+    assert timeline.read_text().splitlines() == ["setup:run", "setup:run"]
     assert "Project policy halted Item selection." in caplog.text
     assert "private model-authored halt reason" not in caplog.text
 
@@ -1693,6 +1868,156 @@ def test_later_selection_failure_preserves_completed_work_in_safe_draft(
     )
 
 
+def test_claim_failure_stops_before_item_work_and_cleans_unclaimed_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        claim_failure=OSError("private gh claim failure"),
+    )
+
+    outcome = outcomes[0]
+    assert exit_code == 1
+    assert outcome.selected == [3]
+    assert outcome.attempted == []
+    assert outcome.completed == []
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Item #3 infrastructure failure"
+    assert len(selection_prompts) == 1
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+    source.release.assert_called_once_with(3)
+    assert "setup:item" not in timeline.read_text().splitlines()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    assert not (tmp_path / ".pycastle/worktrees/run-policy-halt-176").exists()
+    branch = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-policy-halt-176"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branch.stdout == ""
+
+
+def test_selection_record_failure_before_integration_cleans_run_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_record(**_kwargs: object) -> None:
+        raise OSError("private record store failure")
+
+    monkeypatch.setattr(orchestrator, "_write_item_selection_record", fail_record)
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        _selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=False,
+    )
+
+    outcome = outcomes[0]
+    assert exit_code == 1
+    assert outcome.completed == []
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert after_prompts == []
+    source.claim.assert_not_called()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    assert not (tmp_path / ".pycastle/worktrees/run-policy-halt-176").exists()
+    branch = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-policy-halt-176"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branch.stdout == ""
+
+
+def test_later_selection_record_failure_preserves_safe_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = orchestrator._write_item_selection_record
+    writes = 0
+
+    def fail_second_record(**kwargs: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("private record store failure")
+        original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        orchestrator, "_write_item_selection_record", fail_second_record
+    )
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        _selection_prompts,
+        after_prompts,
+        timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+    )
+
+    outcome = outcomes[0]
+    assert exit_code == 1
+    assert outcome.completed == [3]
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+    assert timeline.read_text().splitlines().count("gate:run") == 0
+    create = next(call for call in process_calls if call[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+    comment = next(
+        call
+        for call in process_calls
+        if call[:2] == ["gh", "api"] and "--method" in call
+    )
+    comment_body = next(
+        argument.removeprefix("body=")
+        for argument in comment
+        if argument.startswith("body=")
+    )
+    published = create[create.index("--body") + 1] + comment_body
+    assert "Item selection failure: `selection-infrastructure-failed`" in published
+    assert "Run Gate: not run" in published
+    for private in (
+        "Untouched candidate",
+        "Private body for Item 1.",
+        "Choose an actionable Item or stop.",
+        "private model-authored halt reason",
+        "private transcript without a selection response",
+    ):
+        assert private not in published
+    assert not (tmp_path / ".pycastle/runs/policy-halt-176/selection-002.json").exists()
+
+
 def _run_cycle_from_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, repair: bool
 ) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str]]:
@@ -1806,7 +2131,7 @@ def test_cli_exhausted_gate_cycle_hands_item_to_human_without_publication(
     timeline = (tmp_path / "timeline").read_text().splitlines()
     assert timeline.count("gate") == 10
     # Run bootstrap, initial work, and ten visits to each cycle node.
-    assert timeline.count("setup") == 22
+    assert timeline.count("setup") == 23
     source.mark_for_human.assert_called_once_with(1)
     assert not any(call[:3] == ["gh", "pr", "create"] for call in calls)
 
@@ -1909,8 +2234,8 @@ def test_cli_setup_failure_preserves_only_safe_run_outcomes(
             checks=tuple(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
-            eligible_items=tuple(EligibleItem(x.number, x.title) for x in selected),
-            selected_items=selected,
+            candidate_items=tuple(CandidateItem(x.number, x.title) for x in selected),
+            candidate_pool=selected,
             frozen_inputs=frozen,
         ),
     )
@@ -2095,8 +2420,8 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
             checks=tuple(
                 ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
             ),
-            eligible_items=tuple(EligibleItem(x.number, x.title) for x in selected),
-            selected_items=selected,
+            candidate_items=tuple(CandidateItem(x.number, x.title) for x in selected),
+            candidate_pool=selected,
             frozen_inputs=frozen,
         ),
     )
@@ -2182,6 +2507,7 @@ def test_cli_multi_item_run_repairs_final_gate_and_publishes_draft_first(
                 run_id="all-skipped",
                 run_branch="pycastle/run-all-skipped",
                 selected=[106, 107],
+                attempted=[106, 107],
                 issues=[
                     IssueOutcome(
                         issue=IssueRef(number=106, title="Skipped"),

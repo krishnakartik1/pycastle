@@ -111,7 +111,7 @@ def test_initialized_project_selects_claims_completes_and_publishes_item(
     outcome = run_batch(
         runtime=RecordingStubRuntime(),
         issue_source=source,
-        selected=(item,),
+        candidates=(item,),
         fixture_dir=fixture,
         repo="owner/repo",
         base_branch="main",
