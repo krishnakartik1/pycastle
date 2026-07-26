@@ -452,8 +452,10 @@ class RunOutcome:
     run_id: str
     run_branch: str
     selected: list[int] = field(default_factory=list)
+    attempted: list[int] = field(default_factory=list)
     stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
+    selection_end: str | None = None
     pr_opened: bool = False
     pr_ready: bool = False
     succeeded: bool = True
@@ -467,9 +469,9 @@ class RunOutcome:
 
     @property
     def skipped(self) -> list[int]:
-        """Selected issue numbers not folded into the Run branch."""
+        """Claimed Item attempts not folded into the Run branch."""
         completed = set(self.completed)
-        return [number for number in self.selected if number not in completed]
+        return [number for number in self.attempted if number not in completed]
 
 
 @dataclass
@@ -545,6 +547,9 @@ def render_item_selection_prompt(
     candidates: Sequence[IssueRef],
     outcomes: Sequence[IssueOutcome],
     directions: str,
+    *,
+    attempted: Sequence[int] = (),
+    stale: Sequence[int] = (),
 ) -> str:
     """Compose frozen facts, project policy, and PyCastle's response contract."""
     facts = json.dumps(
@@ -552,14 +557,14 @@ def render_item_selection_prompt(
         indent=2,
         sort_keys=True,
     )
+    completed = [outcome.issue.number for outcome in outcomes if outcome.merged]
     progress = json.dumps(
-        [
-            {
-                "item": outcome.issue.number,
-                "outcome": "completed" if outcome.merged else "skipped",
-            }
-            for outcome in outcomes
-        ],
+        {
+            "attempted": list(attempted),
+            "completed": completed,
+            "skipped": [number for number in attempted if number not in set(completed)],
+            "stale": list(stale),
+        },
         indent=2,
         sort_keys=True,
     )
@@ -626,6 +631,8 @@ def _select_item(
     worktree: Path,
     prompt_name: str,
     execution: FrozenRunExecution,
+    attempted: Sequence[int] = (),
+    stale: Sequence[int] = (),
 ) -> IssueRef | None:
     try:
         directions = execution.prompts[prompt_name]
@@ -634,7 +641,13 @@ def _select_item(
             f"Frozen Item selection prompt is missing: {prompt_name!r}"
         ) from None
     result = runtime.run(
-        render_item_selection_prompt(candidates, outcomes, directions),
+        render_item_selection_prompt(
+            candidates,
+            outcomes,
+            directions,
+            attempted=attempted,
+            stale=stale,
+        ),
         cwd=worktree,
         node=ITEM_SELECTION_NODE,
     )
@@ -1250,20 +1263,32 @@ RUN_REPORT_LIMIT = 65_536
 
 
 def render_run_context(
-    run_id: str, selected: Sequence[IssueRef], outcomes: Sequence[IssueOutcome]
+    run_id: str,
+    selected: Sequence[IssueRef],
+    outcomes: Sequence[IssueOutcome],
+    *,
+    stale: Sequence[int] = (),
+    selection_end: str | None = None,
 ) -> str:
     """Render the bounded factual envelope supplied to each Run node."""
     outcome_by_number = {o.issue.number: o for o in outcomes}
+    stale_numbers = set(stale)
     rows = []
     for issue in selected:
         outcome = outcome_by_number.get(issue.number)
-        state = (
-            "pending"
-            if outcome is None
-            else ("completed" if outcome.merged else "skipped")
-        )
+        if outcome is not None:
+            state = "completed" if outcome.merged else "skipped"
+        elif issue.number in stale_numbers:
+            state = "stale"
+        elif selection_end is not None:
+            state = "not-selected"
+        else:
+            state = "pending"
         rows.append(f"- #{issue.number}: {issue.title} [{state}]")
-    return f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+    context = f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+    if selection_end is not None:
+        context += f"\n\n## Item selection\n\nEnded: {selection_end}"
+    return context
 
 
 def _checkpoint_run_node(
@@ -1659,6 +1684,8 @@ def run_batch(
                     worktree=run_worktree,
                     prompt_name=run_definition.item.selection.prompt,
                     execution=execution,
+                    attempted=outcome.attempted,
+                    stale=outcome.stale,
                 )
                 if issue is None:
                     break
@@ -1696,6 +1723,7 @@ def run_batch(
                     )
                     continue
                 claimed_attempts += 1
+                outcome.attempted.append(issue.number)
                 try:
                     item_outcome = _work_issue(
                         issue,
@@ -1748,6 +1776,11 @@ def run_batch(
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
                     break
                 outcome.issues.append(item_outcome)
+            if outcome.succeeded:
+                if claimed_attempts >= iterations:
+                    outcome.selection_end = "claimed-attempt-limit-reached"
+                elif not remaining:
+                    outcome.selection_end = "candidate-pool-exhausted"
         except KeyboardInterrupt:
             _cleanup_cancelled(
                 issue=cancellation.in_flight,
@@ -1778,7 +1811,11 @@ def run_batch(
                             graph=run_definition.after,
                             execution=execution,
                             context=render_run_context(
-                                run_id, selected, outcome.issues
+                                run_id,
+                                selected,
+                                outcome.issues,
+                                stale=outcome.stale,
+                                selection_end=outcome.selection_end,
                             ),
                             scope="run",
                             identity="after-run",

@@ -572,6 +572,243 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
+def test_project_policy_orders_items_until_claimed_attempt_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reselect with Run progress, then stop at capacity and publish normally."""
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose the next dependency-ready Item.")
+    (prompts / "prepare.md").write_text("Prepare this Run once.")
+    (prompts / "work.md").write_text("Implement this selected Item.")
+    (prompts / "summarize.md").write_text("Summarize the bounded Run outcomes.")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "gate_node,runtime_node,runtime_selection)\n"
+        "run=build_run("
+        "before=execution_graph(start='prepare',nodes=["
+        "runtime_node('prepare','prepare.md')]),"
+        "item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md',on_success='verify'),"
+        "gate_node('verify')])),"
+        "after=execution_graph(start='summarize',nodes=["
+        "runtime_node('summarize','summarize.md',on_success='verify-run'),"
+        "gate_node('verify-run')])"
+        ")\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(
+        f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        f"#!/bin/sh\nprintf 'gate:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    gate.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    candidates = tuple(
+        IssueRef(
+            number=number,
+            title=title,
+            body=f"Private body for Item {number}.",
+            comments=[
+                IssueComment(
+                    author="maintainer", body=f"Private comment for Item {number}."
+                )
+            ],
+            labels=["ready-for-agent"],
+            assignees=["krishna"],
+        )
+        for number, title in (
+            (1, "Foundation"),
+            (2, "Canonical middle"),
+            (3, "Highest-priority unblocker"),
+        )
+    )
+    configuration = ReadinessConfiguration(
+        repository="owner/repo",
+        base_branch="main",
+        github_default_branch="main",
+        runtime="stub",
+        sandbox="host",
+        agent_image=None,
+        assignee="krishna",
+        include_unassigned=False,
+        item_limit=2,
+    )
+    frozen = FrozenReadinessInputs(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(),
+        readiness._freeze_project_fixture(fixture, load_run(fixture)),
+        tuple(candidate.model_copy(deep=True) for candidate in candidates),
+        configuration.sandbox,
+        configuration.runtime,
+        configuration.agent_image,
+    )
+    report = ReadinessReport(
+        schema_version=1,
+        outcome=ReadinessOutcome.READY,
+        runner_version="0.1.0",
+        configuration=configuration,
+        checks=tuple(
+            ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+        ),
+        eligible_items=tuple(
+            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        ),
+        selected_items=frozen.items,
+        frozen_inputs=frozen,
+    )
+
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    selection_prompts: list[str] = []
+    before_prompts: list[str] = []
+    after_prompts: list[str] = []
+    choices = iter((3, 1))
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            if node == "item-selection":
+                selection_prompts.append(prompt)
+                choice = next(choices)
+                return RuntimeResult(
+                    output=(
+                        f'<selection>{{"item": {choice}, "reason": '
+                        '"Project dependency order."}</selection>'
+                    ),
+                    telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+                )
+            result = super().run(prompt, cwd=cwd, node=node)
+            if node == "prepare":
+                before_prompts.append(prompt)
+            elif node == "work":
+                (cwd / f"item-{cwd.name.removeprefix('issue-')}.txt").write_text(
+                    "done\n"
+                )
+            elif node == "summarize":
+                after_prompts.append(prompt)
+                assert (cwd / "item-1.txt").is_file()
+                assert (cwd / "item-3.txt").is_file()
+            return result
+
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "policy-order-175")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+
+    assert (
+        main(
+            [
+                "run",
+                "--sandbox",
+                "host",
+                "--runtime",
+                "stub",
+                "--iterations",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert outcomes[0].selected == [3, 1]
+    assert outcomes[0].attempted == [3, 1]
+    assert outcomes[0].completed == [3, 1]
+    assert outcomes[0].skipped == []
+    assert len(before_prompts) == 1
+    assert len(selection_prompts) == 2
+    assert selection_prompts[0].index('"number": 1') < selection_prompts[0].index(
+        '"number": 3'
+    )
+    assert all(
+        f"Private body for Item {number}." in selection_prompts[0]
+        for number in (1, 2, 3)
+    )
+    assert '"attempted": []' in selection_prompts[0]
+    assert '"completed": []' in selection_prompts[0]
+    assert '"skipped": []' in selection_prompts[0]
+    assert '"stale": []' in selection_prompts[0]
+    assert '"number": 3' not in selection_prompts[1]
+    assert "Private body for Item 3." not in selection_prompts[1]
+    assert '"attempted": [\n    3\n  ]' in selection_prompts[1]
+    assert '"completed": [\n    3\n  ]' in selection_prompts[1]
+    assert '"skipped": []' in selection_prompts[1]
+    assert '"stale": []' in selection_prompts[1]
+    source.claim.assert_has_calls(
+        [call(3, assignee="krishna"), call(1, assignee="krishna")]
+    )
+    assert len(after_prompts) == 1
+    after_prompt = after_prompts[0]
+    assert "#1: Foundation [completed]" in after_prompt
+    assert "#2: Canonical middle [not-selected]" in after_prompt
+    assert "#3: Highest-priority unblocker [completed]" in after_prompt
+    assert "claimed-attempt-limit-reached" in after_prompt
+    for number in (1, 2, 3):
+        assert f"Private body for Item {number}." not in before_prompts[0]
+        assert f"Private comment for Item {number}." not in before_prompts[0]
+        assert f"Private body for Item {number}." not in after_prompt
+        assert f"Private comment for Item {number}." not in after_prompt
+    assert timeline.read_text().splitlines().count("gate:item") == 2
+    assert timeline.read_text().splitlines().count("gate:run") == 1
+    assert any(
+        process_call[:3] == ["gh", "pr", "create"] and "--draft" in process_call
+        for process_call in process_calls
+    )
+    assert any(
+        process_call[:3] == ["gh", "pr", "ready"] for process_call in process_calls
+    )
+
+
 def _run_cycle_from_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, repair: bool
 ) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str]]:
