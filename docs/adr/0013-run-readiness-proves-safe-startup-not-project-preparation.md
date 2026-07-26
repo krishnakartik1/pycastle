@@ -1,10 +1,15 @@
 # ADR-0013: Run readiness proves safe startup, not project preparation
 
-Status: Accepted (2026-07-16)
+Status: Accepted (2026-07-16); partially superseded by ADR-0015 (2026-07-26)
 
 ADR-0014 defines the canonical Setup process, capture, repetition, and failure
 contract. This ADR owns readiness and the point at which a real Run first invokes
 that protocol.
+
+ADR-0015 replaces this ADR's exact ordered Item batch with a complete frozen
+Item candidate pool. Its project-owned Runtime policy selects one remaining
+Item before each Item execution graph; the pre-claim mechanical eligibility
+recheck and no-substitution safety boundary remain current.
 
 ## Context
 

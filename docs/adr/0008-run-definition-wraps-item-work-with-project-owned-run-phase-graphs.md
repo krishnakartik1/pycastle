@@ -13,6 +13,10 @@ ADR-0013 replaces this ADR's startup ordering where image preparation preceded
 Item selection. It also fixes the pre-claim bootstrap Setup record and stale
 frozen-Item handling; the surrounding Run lifecycle remains current.
 
+ADR-0015 replaces this ADR's fixed ordered Item batch and makes the required
+Item definition pair project-owned Runtime selection with the Item execution
+graph. The Before-Run and After-Run lifecycle remains current.
+
 ADR-0014 replaces this ADR's Setup scheduling, process, and failure rules. The
 checkpointing and publication rules remain current where later ADRs do not
 replace them.
