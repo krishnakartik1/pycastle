@@ -82,14 +82,16 @@ def _valid_fixture(path: Path) -> Path:
     prompts.mkdir(parents=True)
     (fixture / "version").write_text("0.1.2\n")
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run, execution_graph, runtime_node\n"
+        "from pycastle.graph import (build_item, build_run, execution_graph, "
+        "runtime_node, runtime_selection)\n"
         "run = build_run(\n"
         " before=execution_graph(start='prepare', nodes=[runtime_node('prepare', 'before.md')]),\n"
-        " item=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')]),\n"
+        " item=build_item(selection=runtime_selection('select.md'), "
+        "graph=execution_graph(start='work', nodes=[runtime_node('work', 'item.md')])),\n"
         " after=execution_graph(start='report', nodes=[runtime_node('report', 'after.md')]),\n"
         ")\n"
     )
-    for name in ("before.md", "item.md", "after.md"):
+    for name in ("select.md", "before.md", "item.md", "after.md"):
         (prompts / name).write_text(name)
     gate = fixture / "gate"
     gate.write_text("#!/bin/sh\nexit 0\n")
@@ -217,9 +219,11 @@ def test_fixture_structure_accepts_out_of_order_runtime_and_gate_nodes(
 ) -> None:
     fixture = _valid_fixture(tmp_path)
     (fixture / "main.py").write_text(
-        "from pycastle.graph import build_run,execution_graph,runtime_node,gate_node\n"
-        "run=build_run(item=execution_graph(start='work',nodes=["
-        "gate_node('verify'),runtime_node('work','item.md',on_success='verify')]))\n"
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "runtime_node,gate_node,runtime_selection)\n"
+        "run=build_run(item=build_item(selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=[gate_node('verify'),"
+        "runtime_node('work','item.md',on_success='verify')])))\n"
     )
 
     result = DefaultReadinessAdapter(fixture, tmp_path).check_fixture_structure(
