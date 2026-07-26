@@ -31,7 +31,7 @@ def assignee_logins(issue: dict[str, Any]) -> list[str]:
 
 def comment_author(comment: dict[str, Any]) -> str:
     """Return a comment author's login, or a stable deleted-user fallback."""
-    author = comment.get("author")
+    author = comment.get("author", comment.get("user"))
     if isinstance(author, str) and author:
         return author
     if isinstance(author, dict) and author.get("login"):
@@ -51,6 +51,24 @@ def filter_for_assignee(
         if assignee in issue.assignees or (include_unassigned and not issue.assignees):
             kept.append(issue)
     return kept
+
+
+def candidate_pool(
+    issues: list[IssueRef],
+    *,
+    assignee: str,
+    include_unassigned: bool = False,
+) -> list[IssueRef]:
+    """Return every eligible Item in canonical Item-number order.
+
+    Run capacity does not participate in readiness: it caps claimed attempts,
+    while the project-owned selection policy must see the complete mechanically
+    eligible pool.
+    """
+    eligible = filter_for_assignee(
+        issues, assignee, include_unassigned=include_unassigned
+    )
+    return sorted(eligible, key=lambda issue: issue.number)
 
 
 def select_next(
@@ -81,10 +99,9 @@ def select_batch(
     less yields an empty batch. This stays a pure function so the selection,
     assignee-filter, and ready-state logic can be tested without mocks.
     """
-    eligible = filter_for_assignee(
-        issues, assignee, include_unassigned=include_unassigned
+    ordered = candidate_pool(
+        issues, assignee=assignee, include_unassigned=include_unassigned
     )
-    ordered = sorted(eligible, key=lambda issue: issue.number)
     return ordered[:limit] if limit > 0 else []
 
 
@@ -134,36 +151,84 @@ class GitHubIssueSource(IssueSource):
         self.human_label = human_label
         self._run = runner
 
-    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
-        """Return open issues carrying the ready label."""
+    def _paginated_rows(
+        self,
+        endpoint: str,
+        *,
+        fields: tuple[str, ...] = (),
+        timeout: float | None,
+        failure: str,
+    ) -> list[dict[str, Any]]:
+        """Return every object from a paginated GitHub REST collection."""
         options: dict[str, Any] = {"capture": True}
         if timeout is not None:
             options["timeout"] = timeout
-        result = self._run(
-            [
-                "gh",
-                "issue",
-                "list",
-                "-R",
-                self.repo,
-                "--state",
-                "open",
-                "--label",
-                self.label,
-                "--limit",
-                "100",
-                "--json",
-                "number,title,body,labels,assignees,comments",
-            ],
-            **options,
-        )
+        argv = [
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            endpoint,
+        ]
+        for field in fields:
+            argv.extend(("-f", field))
+        result = self._run(argv, **options)
         if getattr(result, "returncode", 1) != 0:
-            raise OSError("GitHub ready-Item listing failed")
-        raw = (result.stdout or "").strip()
+            raise OSError(failure)
+        raw = (getattr(result, "stdout", "") or "").strip()
         if not raw:
             return []
+        document = json.loads(raw)
+        if not isinstance(document, list):
+            raise TypeError("GitHub paginated response is not a list")
+        pages = (
+            document if all(isinstance(page, list) for page in document) else [document]
+        )
+        rows = [row for page in pages for row in page]
+        if not all(isinstance(row, dict) for row in rows):
+            raise TypeError("GitHub paginated response contains invalid entries")
+        return rows
+
+    def _ready_rows(self, *, timeout: float | None) -> list[dict[str, Any]]:
+        rows = self._paginated_rows(
+            f"repos/{self.repo}/issues",
+            fields=("state=open", f"labels={self.label}", "per_page=100"),
+            timeout=timeout,
+            failure="GitHub ready-Item listing failed",
+        )
+        # GitHub's REST Issues endpoint also returns pull requests.
+        return [row for row in rows if "pull_request" not in row]
+
+    def _comments(
+        self, item: dict[str, Any], *, timeout: float | None
+    ) -> list[IssueComment]:
+        embedded = item.get("comments")
+        if isinstance(embedded, list):
+            rows = embedded
+        else:
+            rows = self._paginated_rows(
+                f"repos/{self.repo}/issues/{item['number']}/comments",
+                fields=("per_page=100",),
+                timeout=timeout,
+                failure="GitHub Item-comment listing failed",
+            )
+        return [
+            IssueComment(
+                author=comment_author(comment),
+                body=comment.get("body") or "",
+            )
+            for comment in sorted(
+                rows,
+                key=lambda value: value.get("created_at", value.get("createdAt", "")),
+            )
+        ]
+
+    def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
+        """Return every open Issue carrying the ready label, with full facts."""
         issues: list[IssueRef] = []
-        for item in json.loads(raw):
+        for item in self._ready_rows(timeout=timeout):
             labels = [
                 lbl["name"] if isinstance(lbl, dict) else lbl
                 for lbl in item.get("labels", [])
@@ -172,51 +237,22 @@ class GitHubIssueSource(IssueSource):
                 IssueRef(
                     number=item["number"],
                     title=item.get("title", ""),
-                    body=item.get("body", ""),
+                    body=item.get("body") or "",
                     labels=labels,
                     assignees=assignee_logins(item),
-                    comments=[
-                        IssueComment(
-                            author=comment_author(comment),
-                            body=comment.get("body", ""),
-                        )
-                        for comment in sorted(
-                            item.get("comments") or [],
-                            key=lambda value: value.get("createdAt", ""),
-                        )
-                    ],
+                    comments=self._comments(item, timeout=timeout),
                 )
             )
         return issues
 
     def list_ready_metadata(self, *, timeout: float | None = None) -> list[IssueRef]:
         """List ready Items without fetching bodies, comments, or other content."""
-        result = self._run(
-            [
-                "gh",
-                "issue",
-                "list",
-                "-R",
-                self.repo,
-                "--state",
-                "open",
-                "--label",
-                self.label,
-                "--limit",
-                "100",
-                "--json",
-                "number,title,labels,assignees",
-            ],
-            capture=True,
-            timeout=timeout,
-        )
-        if getattr(result, "returncode", 1) != 0:
-            raise OSError("GitHub ready-Item metadata listing failed")
-        raw = (result.stdout or "").strip()
-        if not raw:
-            return []
         issues: list[IssueRef] = []
-        for item in json.loads(raw):
+        try:
+            rows = self._ready_rows(timeout=timeout)
+        except OSError as exc:
+            raise OSError("GitHub ready-Item metadata listing failed") from exc
+        for item in rows:
             labels = [
                 label["name"] if isinstance(label, dict) else label
                 for label in item.get("labels", [])

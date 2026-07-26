@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pycastle import cli, sandbox
-from pycastle.models import IssueRef
+from pycastle.models import IssueComment, IssueRef
 from pycastle.readiness import (
     CHECK_IDS,
     CheckResult,
@@ -137,27 +137,29 @@ class RecordingRunner:
             output = '{"nameWithOwner":"owner/repo"}\n'
         elif call[:3] == ("gh", "label", "list"):
             output = '[{"name":"ready-for-agent"},{"name":"ready-for-human"}]'
-        elif call[:3] == ("gh", "issue", "list"):
+        elif "repos/owner/repo/issues" in call:
             output = json.dumps(
                 [
-                    {
-                        "number": 9,
-                        "title": "Nine",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "octocat"}],
-                    },
-                    {
-                        "number": 2,
-                        "title": "Two",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "octocat"}],
-                    },
-                    {
-                        "number": 1,
-                        "title": "Other",
-                        "labels": [{"name": "ready-for-agent"}],
-                        "assignees": [{"login": "someone"}],
-                    },
+                    [
+                        {
+                            "number": 9,
+                            "title": "Nine",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "octocat"}],
+                        },
+                        {
+                            "number": 2,
+                            "title": "Two",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "octocat"}],
+                        },
+                        {
+                            "number": 1,
+                            "title": "Other",
+                            "labels": [{"name": "ready-for-agent"}],
+                            "assignees": [{"login": "someone"}],
+                        },
+                    ]
                 ]
             )
         else:
@@ -721,6 +723,99 @@ def test_zero_items_is_a_successful_no_work_outcome() -> None:
     assert report.outcome is ReadinessOutcome.NO_WORK
 
 
+def test_readiness_builds_complete_candidate_pool_independent_of_run_limit() -> None:
+    payload = json.dumps(
+        [
+            {
+                "number": 9,
+                "title": "Assigned candidate",
+                "body": "higher priority",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "octocat"}],
+                "comments": [],
+            },
+            {
+                "number": 2,
+                "title": "Owned elsewhere",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [{"login": "someone"}],
+                "comments": [],
+            },
+            {
+                "number": 7,
+                "title": "Unassigned candidate",
+                "labels": [{"name": "ready-for-agent"}],
+                "assignees": [],
+                "comments": [],
+            },
+        ]
+    )
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+    )
+    config = ReadinessConfiguration(
+        **{
+            **configuration().__dict__,
+            "include_unassigned": True,
+            "item_limit": 1,
+        }
+    )
+    adapter = DefaultReadinessAdapter(
+        Path("."),
+        Path("."),
+        runner=runner,
+        include_item_content=True,
+    )
+
+    candidates = adapter.eligible_items(config)
+
+    assert [candidate.number for candidate in candidates] == [7, 9]
+
+
+def test_doctor_lists_candidate_metadata_without_loading_item_content() -> None:
+    item_pages = json.dumps(
+        [
+            [
+                {
+                    "number": 9,
+                    "title": "Later candidate",
+                    "body": "must not enter Doctor",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "assignees": [{"login": "octocat"}],
+                },
+                {
+                    "number": 2,
+                    "title": "Earlier candidate",
+                    "body": "must not enter Doctor",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "assignees": [{"login": "octocat"}],
+                },
+            ]
+        ]
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        endpoint = next(
+            (argument for argument in argv if argument.startswith("repos/")), ""
+        )
+        if endpoint != "repos/owner/repo/issues":
+            raise AssertionError(f"Doctor loaded Item content: {argv}")
+        return subprocess.CompletedProcess(argv, 0, item_pages, "")
+
+    adapter = DefaultReadinessAdapter(Path("."), Path("."), runner=runner)
+
+    candidates = adapter.eligible_items(configuration())
+
+    assert [(item.number, item.title) for item in candidates] == [
+        (2, "Earlier candidate"),
+        (9, "Later candidate"),
+    ]
+    assert all(not item.body and not item.comments for item in candidates)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -1083,22 +1178,32 @@ def test_readiness_freezes_full_items_but_reports_only_safe_metadata() -> None:
         number=7,
         title="Seven",
         body="private body",
+        labels=["ready-for-agent", "priority:high"],
         assignees=["octocat"],
+        comments=[IssueComment(author="reviewer", body="private comment")],
     )
+    source_items = [item]
     report = evaluate_readiness(
         configuration(),
         ReadinessDependencies(
             probe=lambda _id, _configuration: CheckResult(Status.PASS, "ready"),
-            eligible_items=lambda _configuration: [item],
+            eligible_items=lambda _configuration: source_items,
         ),
     )
 
+    source_items.append(IssueRef(number=8, title="Ready after snapshot"))
+    item.title = "mutated"
     item.body = "mutated"
+    item.labels.clear()
     item.assignees.append("someone")
+    item.comments[0].body = "mutated"
 
     assert report.eligible_items == (EligibleItem(7, "Seven"),)
+    assert report.selected_items[0].title == "Seven"
     assert report.selected_items[0].body == "private body"
+    assert report.selected_items[0].labels == ["ready-for-agent", "priority:high"]
     assert report.selected_items[0].assignees == ["octocat"]
+    assert report.selected_items[0].comments[0].body == "private comment"
     document = json.loads(render_json(report))
     assert document["eligible_items"] == [{"number": 7, "title": "Seven"}]
     assert "selected_items" not in document

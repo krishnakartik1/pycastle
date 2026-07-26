@@ -124,6 +124,76 @@ def test_github_source_parses_list_output() -> None:
     assert issues[0].assignees == ["krishna"]
 
 
+def test_github_source_follows_all_item_and_comment_pages() -> None:
+    item_pages = json.dumps(
+        [
+            [
+                {
+                    "number": 101,
+                    "title": "First page",
+                    "body": "first body",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "assignees": [{"login": "krishna"}],
+                }
+            ],
+            [
+                {
+                    "number": 199,
+                    "title": "Pull request is not an Item",
+                    "pull_request": {"url": "https://example.test/pulls/199"},
+                },
+                {
+                    "number": 205,
+                    "title": "Later page",
+                    "body": "later body",
+                    "labels": [
+                        {"name": "ready-for-agent"},
+                        {"name": "priority:high"},
+                    ],
+                    "assignees": [{"login": "krishna"}],
+                },
+            ],
+        ]
+    )
+    comment_pages = {
+        "101": json.dumps(
+            [
+                [{"user": {"login": "alice"}, "body": "first comment"}],
+                [{"user": {"login": "bob"}, "body": "later comment"}],
+            ]
+        ),
+        "205": json.dumps([[]]),
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        endpoint = next(
+            (argument for argument in argv if argument.startswith("repos/")), ""
+        )
+        if endpoint == "repos/owner/repo/issues":
+            output = item_pages
+        elif endpoint.endswith("/comments"):
+            output = comment_pages[endpoint.split("/")[-2]]
+        else:
+            raise AssertionError(f"unexpected GitHub request: {argv}")
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    issues = GitHubIssueSource("owner/repo", runner=runner).list_ready()
+
+    assert [issue.number for issue in issues] == [101, 205]
+    assert [comment.body for comment in issues[0].comments] == [
+        "first comment",
+        "later comment",
+    ]
+    assert issues[1].labels == ["ready-for-agent", "priority:high"]
+    assert all("--paginate" in call and "--slurp" in call for call in calls)
+    item_call = next(call for call in calls if "repos/owner/repo/issues" in call)
+    assert "state=open" in item_call
+    assert "labels=ready-for-agent" in item_call
+    assert "per_page=100" in item_call
+
+
 def test_github_source_surfaces_all_comments_in_chronological_order() -> None:
     payload = json.dumps(
         [
@@ -158,8 +228,6 @@ def test_github_source_surfaces_all_comments_in_chronological_order() -> None:
         {"author": "alice", "body": "first clarification"},
         {"author": "bob", "body": "second clarification"},
     ]
-    argv = runner.call_args.args[0]
-    assert "comments" in argv[argv.index("--json") + 1].split(",")
 
 
 def test_github_source_uses_unknown_for_a_missing_comment_author() -> None:

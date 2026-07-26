@@ -22,7 +22,7 @@ from .commands import command_exists, run_cmd
 from .compatibility import check_fixture_compatibility
 from .fixture_validation import validate_project_fixture_structure
 from .graph import RunDefinition, RuntimeNode
-from .issues import GitHubIssueSource, select_batch
+from .issues import GitHubIssueSource, candidate_pool
 from .models import IssueRef
 
 SCHEMA_VERSION = 1
@@ -1090,14 +1090,18 @@ test "$(tail -n 1 "$PWD/.pycastle-existing")" = modified
         if not config.assignee:
             raise ValueError("GitHub assignee could not be resolved")
         source = GitHubIssueSource(config.repository, runner=self.runner)
-        # Doctor and Run freeze the same complete authoritative Item snapshot;
-        # renderers project only number/title from these private copies.
-        issues = source.list_ready(timeout=SHORT_TIMEOUT)
-        selected = select_batch(
+        # Doctor shares the mechanical membership boundary without loading
+        # policy-only content. A Run freezes the complete authoritative facts.
+        loader = (
+            source.list_ready
+            if self.include_item_content
+            else source.list_ready_metadata
+        )
+        issues = loader(timeout=SHORT_TIMEOUT)
+        selected = candidate_pool(
             issues,
             assignee=config.assignee,
             include_unassigned=config.include_unassigned,
-            limit=config.item_limit,
         )
         return selected
 

@@ -360,12 +360,12 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
-def test_project_policy_selects_and_completes_one_item(
+def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Drive one explicit Item definition through selection and publication."""
+    """Select a later candidate using the complete facts frozen by readiness."""
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
@@ -406,6 +406,14 @@ def test_project_policy_selects_and_completes_one_item(
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
 
+    earlier = IssueRef(
+        number=1,
+        title="Lower-numbered candidate",
+        body="Lower candidate body.",
+        labels=["ready-for-agent"],
+        assignees=["krishna"],
+        comments=[IssueComment(author="author", body="Lower candidate comment.")],
+    )
     item = IssueRef(
         number=42,
         title="Project-owned choice",
@@ -433,10 +441,13 @@ def test_project_policy_selects_and_completes_one_item(
         text=True,
         check=True,
     ).stdout.strip()
+    frozen_items = tuple(
+        candidate.model_copy(deep=True) for candidate in (earlier, item)
+    )
     frozen = FrozenReadinessInputs(
         base_commit,
         project,
-        (item,),
+        frozen_items,
         configuration.sandbox,
         configuration.runtime,
         configuration.agent_image,
@@ -449,10 +460,15 @@ def test_project_policy_selects_and_completes_one_item(
         checks=tuple(
             ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
         ),
-        eligible_items=(EligibleItem(item.number, item.title),),
-        selected_items=(item,),
+        eligible_items=(
+            EligibleItem(earlier.number, earlier.title),
+            EligibleItem(item.number, item.title),
+        ),
+        selected_items=frozen_items,
         frozen_inputs=frozen,
     )
+    earlier.body = "changed after readiness"
+    item.body = "changed after readiness"
 
     process_calls: list[list[str]] = []
 
@@ -494,7 +510,7 @@ def test_project_policy_selects_and_completes_one_item(
     outcomes: list[RunOutcome] = []
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
-    monkeypatch.setattr(cli, "_make_run_id", lambda: "policy-one-170")
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "later-candidate-171")
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
     original_run_loop = cli.run_loop
@@ -510,7 +526,19 @@ def test_project_policy_selects_and_completes_one_item(
     assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
     assert outcomes[0].completed == [42]
     assert list(prompts_seen) == ["prepare", "item-selection", "work"]
+    before_prompt = prompts_seen["prepare"]
+    assert "#1: Lower-numbered candidate [pending]" in before_prompt
+    assert "#42: Project-owned choice [pending]" in before_prompt
+    assert "Lower candidate body." not in before_prompt
+    assert "The complete frozen body." not in before_prompt
+    assert "Frozen comment." not in before_prompt
+    assert "priority:high" not in before_prompt
     selection_prompt = prompts_seen["item-selection"]
+    assert selection_prompt.index('"number": 1') < selection_prompt.index(
+        '"number": 42'
+    )
+    assert "Lower candidate body." in selection_prompt
+    assert "Lower candidate comment." in selection_prompt
     assert selection_prompt.index("The complete frozen body.") < selection_prompt.index(
         "Choose the most actionable candidate."
     )
@@ -519,10 +547,13 @@ def test_project_policy_selects_and_completes_one_item(
     ) < selection_prompt.index("<selection>")
     assert "Frozen comment." in selection_prompt
     assert "priority:high" in selection_prompt
+    assert "changed after readiness" not in selection_prompt
     assert "Implement the selected Item." in prompts_seen["work"]
     assert "The complete frozen body." in prompts_seen["work"]
+    assert "changed after readiness" not in prompts_seen["work"]
+    assert "Lower candidate body." not in prompts_seen["work"]
     source.is_still_eligible.assert_called_once_with(
-        item, assignee="krishna", include_unassigned=False
+        frozen_items[1], assignee="krishna", include_unassigned=False
     )
     source.claim.assert_called_once_with(42, assignee="krishna")
     assert "Selected Item #42: Project-owned choice" in caplog.text
