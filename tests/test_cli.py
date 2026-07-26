@@ -16,7 +16,7 @@ from pycastle.cli import build_parser, main
 from pycastle.graph import load_run
 from pycastle.issues import IssueRef
 from pycastle.models import IssueComment, RuntimeResult, Telemetry
-from pycastle.orchestrator import IssueOutcome, RunOutcome
+from pycastle.orchestrator import IssueOutcome, RunCheckpointError, RunOutcome
 from pycastle.preflight import PreflightError
 from pycastle.readiness import (
     CHECK_IDS,
@@ -360,12 +360,23 @@ def test_cli_completes_host_item_through_explicit_runtime_gate_graph(
     assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
+@pytest.mark.parametrize(
+    "selection_outcome",
+    (
+        "valid",
+        "durable-change",
+        "runtime-failure",
+        "invalid-response",
+        "cancelled",
+    ),
+)
 def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    selection_outcome: str,
 ) -> None:
-    """Select a later candidate using the complete facts frozen by readiness."""
+    """Select from frozen facts only after writable selection is contained."""
     fixture = tmp_path / ".pycastle"
     prompts = fixture / "prompts"
     prompts.mkdir(parents=True)
@@ -491,15 +502,33 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
         )
 
     prompts_seen: dict[str, str] = {}
+    selection_worktrees: list[Path] = []
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, node: str):
             prompts_seen[node] = prompt
             if node == "item-selection":
+                selection_worktrees.append(cwd)
+                assert (cwd / "PYCASTLE_STUB.md").is_file()
+                (cwd / "SELECTION_ONLY.md").write_text(
+                    "This writable selection change must be discarded.\n"
+                )
+                if selection_outcome == "durable-change":
+                    (
+                        cwd.parent / "run-later-candidate-171" / "DURABLE_CHANGE"
+                    ).write_text("selection reached outside its disposable worktree\n")
+                if selection_outcome == "runtime-failure":
+                    raise RuntimeError("selection Runtime failed")
+                if selection_outcome == "cancelled":
+                    raise KeyboardInterrupt
                 return RuntimeResult(
                     output=(
-                        '<selection>{"item": 42, "reason": '
-                        '"Highest-priority actionable candidate."}</selection>'
+                        "not a selection response"
+                        if selection_outcome == "invalid-response"
+                        else (
+                            '<selection>{"item": 42, "reason": '
+                            '"Highest-priority actionable candidate."}</selection>'
+                        )
                     ),
                     telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
                 )
@@ -523,7 +552,31 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
 
     monkeypatch.setattr(cli, "run_loop", run_from_cli)
 
-    assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+    if selection_outcome == "durable-change":
+        with pytest.raises(
+            RunCheckpointError,
+            match="selection changed the durable Run branch or worktree",
+        ):
+            main(["run", "--sandbox", "host", "--runtime", "stub"])
+    elif selection_outcome == "runtime-failure":
+        with pytest.raises(RuntimeError, match="selection Runtime failed"):
+            main(["run", "--sandbox", "host", "--runtime", "stub"])
+    elif selection_outcome == "invalid-response":
+        with pytest.raises(ValueError, match="exactly one block"):
+            main(["run", "--sandbox", "host", "--runtime", "stub"])
+    elif selection_outcome == "cancelled":
+        assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 130
+    else:
+        assert main(["run", "--sandbox", "host", "--runtime", "stub"]) == 0
+
+    if selection_outcome != "valid":
+        source.is_still_eligible.assert_not_called()
+        source.claim.assert_not_called()
+        assert len(selection_worktrees) == 1
+        assert selection_worktrees[0].name == "selection-later-candidate-171"
+        assert not selection_worktrees[0].exists()
+        return
+
     assert outcomes[0].completed == [42]
     assert list(prompts_seen) == ["prepare", "item-selection", "work"]
     before_prompt = prompts_seen["prepare"]
@@ -558,6 +611,23 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     source.claim.assert_called_once_with(42, assignee="krishna")
     assert "Selected Item #42: Project-owned choice" in caplog.text
     assert "Highest-priority actionable candidate." not in caplog.text
+    assert len(selection_worktrees) == 1
+    assert selection_worktrees[0].name == "selection-later-candidate-171"
+    assert not selection_worktrees[0].exists()
+    assert "behavioral guidance, not a security boundary" in selection_prompt
+    assert "GitHub credentials are not supplied" in selection_prompt
+    selection_change = subprocess.run(
+        [
+            "git",
+            "cat-file",
+            "-e",
+            "pycastle/run-later-candidate-171:SELECTION_ONLY.md",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+    )
+    assert selection_change.returncode != 0
     assert timeline.read_text().splitlines() == [
         "setup:run",
         "setup:run",
@@ -703,12 +773,20 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
     selection_prompts: list[str] = []
     before_prompts: list[str] = []
     after_prompts: list[str] = []
+    selection_worktrees: list[Path] = []
     choices = iter((3, 1))
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, node: str):
             if node == "item-selection":
                 selection_prompts.append(prompt)
+                selection_worktrees.append(cwd)
+                if len(selection_worktrees) == 1:
+                    assert not (cwd / "item-3.txt").exists()
+                    (cwd / "FIRST_SELECTION_ONLY").write_text("discard me\n")
+                else:
+                    assert not (cwd / "FIRST_SELECTION_ONLY").exists()
+                    assert (cwd / "item-3.txt").is_file()
                 choice = next(choices)
                 return RuntimeResult(
                     output=(
@@ -767,6 +845,11 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
     assert outcomes[0].skipped == []
     assert len(before_prompts) == 1
     assert len(selection_prompts) == 2
+    assert [path.name for path in selection_worktrees] == [
+        "selection-policy-order-175",
+        "selection-policy-order-175",
+    ]
+    assert all(not path.exists() for path in selection_worktrees)
     assert selection_prompts[0].index('"number": 1') < selection_prompts[0].index(
         '"number": 3'
     )

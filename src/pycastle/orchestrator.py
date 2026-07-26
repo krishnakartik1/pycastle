@@ -572,8 +572,10 @@ def render_item_selection_prompt(
     allowed = [candidate.number for candidate in candidates]
     protocol = (
         "# PyCastle Item selection response contract\n\n"
-        "Inspect only. Do not modify files, commits, Git references, or external "
-        "systems.\n\n"
+        "The workspace has the ordinary writable permissions of the selected "
+        "Sandbox. Inspect only: do not modify files, commits, Git references, "
+        "or external systems. This is behavioral guidance, not a security "
+        "boundary. GitHub credentials are not supplied for Item selection.\n\n"
         f"Allowed Item numbers (JSON): {json.dumps(allowed)}\n\n"
         "Return exactly one tagged JSON object with only `item` and `reason`. "
         f"`reason` must be non-empty and no longer than {SELECTION_REASON_LIMIT} "
@@ -813,6 +815,119 @@ def cleanup_worktree(worktree: Path, *, runner: Runner, cwd: Path) -> None:
         cwd=cwd,
     )
     runner(["git", "worktree", "prune"], capture=True, cwd=cwd)
+
+
+def _git_checkpoint_value(
+    argv: list[str],
+    *,
+    runner: Runner,
+    cwd: Path,
+    description: str,
+) -> str:
+    """Read one required Git checkpoint fact or fail closed."""
+    result = runner(argv, capture=True, cwd=cwd)
+    value = getattr(result, "stdout", "")
+    if getattr(result, "returncode", 1) != 0 or not isinstance(value, str):
+        raise RunCheckpointError(
+            f"Could not verify the durable Run {description}"
+            f"{_git_failure_detail(result)}"
+        )
+    return value.strip()
+
+
+def _verify_durable_run_checkpoint(run: RunContext, expected_commit: str) -> None:
+    """Prove selection did not move or dirty the durable Run checkout."""
+    branch_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", f"{run.branch}^{{commit}}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="branch",
+    )
+    worktree_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree HEAD",
+    )
+    checked_out_branch = _git_checkpoint_value(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree branch",
+    )
+    status = _git_checkpoint_value(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="worktree status",
+    )
+    if (
+        branch_commit != expected_commit
+        or worktree_commit != expected_commit
+        or checked_out_branch != run.branch
+        or status
+    ):
+        raise RunCheckpointError(
+            "Item selection changed the durable Run branch or worktree"
+        )
+
+
+@contextmanager
+def _disposable_selection_worktree(
+    run: RunContext,
+    *,
+    worktree_root: Path,
+    workspace: Path,
+) -> Iterator[Path]:
+    """Yield a detached writable checkout and verify containment on exit."""
+    expected_commit = _git_checkpoint_value(
+        ["git", "rev-parse", "--verify", f"{run.branch}^{{commit}}"],
+        runner=run.runner,
+        cwd=run.worktree,
+        description="checkpoint",
+    )
+    _verify_durable_run_checkpoint(run, expected_commit)
+    selection_worktree = worktree_root / f"selection-{run.run_id}"
+    result = run.runner(
+        [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            str(selection_worktree),
+            expected_commit,
+        ],
+        capture=True,
+        cwd=workspace,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        raise WorktreeError(
+            f"git worktree add failed for Item selection at "
+            f"{selection_worktree}{_git_failure_detail(result)}"
+        )
+    try:
+        yield selection_worktree
+    finally:
+        remove = run.runner(
+            ["git", "worktree", "remove", str(selection_worktree), "--force"],
+            capture=True,
+            cwd=workspace,
+        )
+        prune = run.runner(
+            ["git", "worktree", "prune"],
+            capture=True,
+            cwd=workspace,
+        )
+        if (
+            getattr(remove, "returncode", 1) != 0
+            or getattr(prune, "returncode", 1) != 0
+            or selection_worktree.exists()
+        ):
+            raise WorktreeError(
+                "Could not remove the disposable Item selection worktree"
+                f"{_git_failure_detail(remove) or _git_failure_detail(prune)}"
+            )
+        _verify_durable_run_checkpoint(run, expected_commit)
 
 
 def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
@@ -1678,16 +1793,21 @@ def run_batch(
             remaining = list(selected)
             claimed_attempts = 0
             while remaining and claimed_attempts < iterations:
-                issue = _select_item(
-                    remaining,
-                    outcome.issues,
-                    runtime=runtime,
-                    worktree=run_worktree,
-                    prompt_name=run_definition.item.selection.prompt,
-                    execution=execution,
-                    attempted=outcome.attempted,
-                    stale=outcome.stale,
-                )
+                with _disposable_selection_worktree(
+                    run,
+                    worktree_root=worktree_root,
+                    workspace=workspace,
+                ) as selection_worktree:
+                    issue = _select_item(
+                        remaining,
+                        outcome.issues,
+                        runtime=runtime,
+                        worktree=selection_worktree,
+                        prompt_name=run_definition.item.selection.prompt,
+                        execution=execution,
+                        attempted=outcome.attempted,
+                        stale=outcome.stale,
+                    )
                 if issue is None:
                     outcome.selection_end = ITEM_SELECTION_END_POLICY_HALT
                     _append_log(
