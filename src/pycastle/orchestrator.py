@@ -827,6 +827,11 @@ def _append_run_telemetry(
 def _append_log(fixture_dir: Path, run_id: str, message: str) -> None:
     """Append one line to the run log and emit it through ``logging``."""
     logger.info(message)
+    _append_local_log(fixture_dir, run_id, message)
+
+
+def _append_local_log(fixture_dir: Path, run_id: str, message: str) -> None:
+    """Append private Run evidence without emitting it to the console."""
     run_dir = _telemetry_dir(fixture_dir, run_id)
     with (run_dir / "run.log").open("a") as handle:
         handle.write(message + "\n")
@@ -1156,10 +1161,14 @@ def _disposable_selection_worktree(
             f"git worktree add failed for Item selection at "
             f"{selection_worktree}{_git_failure_detail(result)}"
         )
-    body_failed = True
+    primary_error: BaseException | None = None
+    body_completed = False
     try:
         yield selection_worktree
-        body_failed = False
+        body_completed = True
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         # From this point onward, a failure may publish integrated work. Keep
         # its immutable source before either cleanup command can fail.
@@ -1214,13 +1223,34 @@ def _disposable_selection_worktree(
                     f"Durable Run restoration also failed: {restore_error}"
                 )
 
-        if cleanup_error is not None:
+        secondary_errors = tuple(
+            error for error in (cleanup_error, checkpoint_error) if error is not None
+        )
+        if primary_error is not None and secondary_errors:
+            for error in secondary_errors:
+                primary_error.add_note(
+                    f"Item selection containment also failed: {error}"
+                )
+            try:
+                _append_local_log(
+                    run.fixture_dir,
+                    run.run_id,
+                    "Item selection containment also failed while preserving "
+                    f"{type(primary_error).__name__}: "
+                    + "; ".join(str(error) for error in secondary_errors),
+                )
+            except BaseException as record_error:
+                primary_error.add_note(
+                    "Could not retain secondary Item selection containment "
+                    f"evidence: {record_error}"
+                )
+        elif cleanup_error is not None:
             if checkpoint_error is not None:
                 cleanup_error.add_note(str(checkpoint_error))
             raise cleanup_error
-        if checkpoint_error is not None:
+        elif checkpoint_error is not None:
             raise checkpoint_error
-        if not body_failed:
+        if body_completed and not secondary_errors:
             run.selection_failure_checkpoint = None
 
 

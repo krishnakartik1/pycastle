@@ -1504,6 +1504,8 @@ def _run_policy_halt_from_cli(
     mutate_run_ref_after_integration: bool = False,
     mutate_ignored_publication_after_integration: bool = False,
     fail_selection_cleanup: bool = False,
+    cancel_after_integration: bool = False,
+    fail_selection_setup: bool = False,
     claim_failure: OSError | None = None,
 ) -> tuple[
     int,
@@ -1540,9 +1542,24 @@ def _run_policy_halt_from_cli(
     )
     timeline = tmp_path / "timeline"
     setup = fixture / "setup"
-    setup.write_text(
+    setup_body = (
         f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
     )
+    if fail_selection_setup:
+        run_setup_count = tmp_path / "run-setup-count"
+        failing_run_setup = 3 if after_integration else 2
+        setup_body += (
+            'if test "$PYCASTLE_SCOPE" = run; then\n'
+            f"  count=$(cat '{run_setup_count}' 2>/dev/null || printf 0)\n"
+            "  count=$((count + 1))\n"
+            f"  printf %s \"$count\" > '{run_setup_count}'\n"
+            f'  if test "$count" -eq {failing_run_setup}; then\n'
+            "    printf 'private selection Setup detail\\n' >&2\n"
+            "    exit 23\n"
+            "  fi\n"
+            "fi\n"
+        )
+    setup.write_text(setup_body)
     setup.chmod(0o755)
     gate = fixture / "gate"
     gate.write_text(
@@ -1611,11 +1628,12 @@ def _run_policy_halt_from_cli(
 
     process_calls: list[list[str]] = []
     fail_next_selection_prune = False
+    selection_cleanup_round = 0
 
     def runner(
         argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
     ) -> subprocess.CompletedProcess[str]:
-        nonlocal fail_next_selection_prune
+        nonlocal fail_next_selection_prune, selection_cleanup_round
         process_calls.append(argv)
         if argv[:2] == ["git", "push"]:
             if (
@@ -1647,13 +1665,14 @@ def _run_policy_halt_from_cli(
         result = subprocess.run(
             argv, cwd=cwd, capture_output=capture, text=True, check=False
         )
-        if (
-            fail_selection_cleanup
-            and argv[:3] == ["git", "worktree", "remove"]
-            and Path(argv[3]).name.startswith("selection-")
-            and selection_round == (2 if after_integration else 1)
+        if argv[:3] == ["git", "worktree", "remove"] and Path(argv[3]).name.startswith(
+            "selection-"
         ):
-            fail_next_selection_prune = True
+            selection_cleanup_round += 1
+            if fail_selection_cleanup and selection_cleanup_round == (
+                2 if after_integration else 1
+            ):
+                fail_next_selection_prune = True
         elif fail_next_selection_prune and argv == ["git", "worktree", "prune"]:
             fail_next_selection_prune = False
             return subprocess.CompletedProcess(
@@ -1753,6 +1772,8 @@ def _run_policy_halt_from_cli(
                         output="private transcript without a selection response",
                         telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
                     )
+                if cancel_after_integration and selection_round == 2:
+                    raise KeyboardInterrupt
                 choice = next(choices)
                 item = "null" if choice is None else str(choice)
                 return RuntimeResult(
@@ -2025,7 +2046,12 @@ def test_selection_cannot_publish_mutated_ignored_project_artifacts(
     assert exit_code == 1
     outcome = outcomes[0]
     assert outcome.completed == [3]
-    assert outcome.selection_failure == "selection-infrastructure-failed"
+    expected_failure = (
+        "selection-block-count"
+        if malformed_response
+        else "selection-infrastructure-failed"
+    )
+    assert outcome.selection_failure == expected_failure
     assert outcome.pr_opened is True
     assert outcome.pr_ready is False
     assert len(selection_prompts) == 2
@@ -2052,11 +2078,17 @@ def test_selection_cannot_publish_mutated_ignored_project_artifacts(
         for argument in comment
         if argument.startswith("body=")
     )
-    assert "Item selection failure: `selection-infrastructure-failed`" in published
+    assert f"Item selection failure: `{expected_failure}`" in published
     assert "private selection report" not in published
     assert "private new ignored selection artifact" not in published
     assert "trusted pre-selection report" not in published
     assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+    if malformed_response:
+        run_log = (
+            tmp_path / ".pycastle/runs/ignored-publication-failure/run.log"
+        ).read_text()
+        assert "preserving ItemSelectionError" in run_log
+        assert "changed the durable Run branch or worktree" in run_log
 
 
 def test_later_selection_ref_mutation_publishes_last_expected_checkpoint(
@@ -2284,6 +2316,90 @@ def test_selection_cleanup_failure_before_integration_does_not_claim_or_publish(
     )
     assert record["validation"]["status"] == "accepted"
     assert record["parsed_response"]["item"] is None
+
+
+def test_later_selection_cancellation_wins_over_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        fail_selection_cleanup=True,
+        cancel_after_integration=True,
+    )
+
+    assert exit_code == 130
+    assert outcomes == []
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+    run_log = (
+        tmp_path / ".pycastle/runs/selection-cleanup-before-178/run.log"
+    ).read_text()
+    assert "preserving KeyboardInterrupt" in run_log
+    assert "private selection prune failure" in run_log
+
+
+@pytest.mark.parametrize("after_integration", (False, True))
+def test_selection_setup_failure_wins_over_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    after_integration: bool,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=after_integration,
+        fail_selection_cleanup=True,
+        fail_selection_setup=True,
+    )
+
+    assert exit_code == 1
+    outcome = outcomes[0]
+    assert outcome.completed == ([3] if after_integration else [])
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.setup_failure is not None
+    assert outcome.setup_failure.command == ".pycastle/setup"
+    assert outcome.setup_failure.termination["kind"] == "exited"
+    assert outcome.setup_failure.termination["code"] == 23
+    assert outcome.pr_opened is after_integration
+    assert outcome.pr_ready is False
+    assert len(selection_prompts) == (1 if after_integration else 0)
+    assert after_prompts == []
+    assert source.claim.call_count == (1 if after_integration else 0)
+    assert (
+        any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+        is after_integration
+    )
+    published = "\n".join(argument for call in process_calls for argument in call)
+    if after_integration:
+        assert "Setup: `.pycastle/setup` — exit 23" in published
+    assert "private selection Setup detail" not in published
+    assert "private selection prune failure" not in published
+    run_log = (
+        tmp_path / ".pycastle/runs/selection-cleanup-before-178/run.log"
+    ).read_text()
+    assert "preserving SetupError" in run_log
+    assert "private selection prune failure" in run_log
 
 
 def test_claim_failure_stops_before_item_work_and_cleans_unclaimed_run(
