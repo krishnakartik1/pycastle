@@ -1503,6 +1503,7 @@ def _run_policy_halt_from_cli(
     fail_after_integration: bool = False,
     mutate_run_ref_after_integration: bool = False,
     mutate_ignored_publication_after_integration: bool = False,
+    fail_selection_add: bool = False,
     fail_selection_cleanup: bool = False,
     cancel_after_integration: bool = False,
     fail_selection_setup: bool = False,
@@ -1629,11 +1630,13 @@ def _run_policy_halt_from_cli(
     process_calls: list[list[str]] = []
     fail_next_selection_prune = False
     selection_cleanup_round = 0
+    selection_add_round = 0
 
     def runner(
         argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
     ) -> subprocess.CompletedProcess[str]:
         nonlocal fail_next_selection_prune, selection_cleanup_round
+        nonlocal selection_add_round
         process_calls.append(argv)
         if argv[:2] == ["git", "push"]:
             if (
@@ -1662,6 +1665,39 @@ def _run_policy_halt_from_cli(
             return subprocess.CompletedProcess(argv, 0, "[]", "")
         if argv[0] == "gh":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:4] == ["git", "worktree", "add", "--detach"] and Path(
+            argv[4]
+        ).name.startswith("selection-"):
+            selection_add_round += 1
+            if fail_selection_add and selection_add_round == (
+                2 if after_integration else 1
+            ):
+                partial = subprocess.run(
+                    argv, cwd=cwd, capture_output=capture, text=True, check=False
+                )
+                assert partial.returncode == 0
+                expected_checkpoint = argv[5]
+                if after_integration:
+                    subprocess.run(
+                        [
+                            "git",
+                            "update-ref",
+                            f"refs/heads/pycastle/run-{run_id}",
+                            "main",
+                        ],
+                        cwd=cwd,
+                        check=True,
+                    )
+                process_calls.append(
+                    [
+                        "selection-add-failure",
+                        expected_checkpoint,
+                        str(Path(argv[4])),
+                    ]
+                )
+                return subprocess.CompletedProcess(
+                    argv, 1, partial.stdout, "private selection add failure"
+                )
         result = subprocess.run(
             argv, cwd=cwd, capture_output=capture, text=True, check=False
         )
@@ -1688,18 +1724,26 @@ def _run_policy_halt_from_cli(
         )
         if mutate_ignored_publication_after_integration
         else (
-            "later-selection-cleanup-179"
-            if mutate_run_ref_after_integration and fail_selection_cleanup
+            (
+                "later-selection-add-failure-179"
+                if after_integration
+                else "selection-add-before-178"
+            )
+            if fail_selection_add
             else (
-                "later-selection-mutation-179"
-                if mutate_run_ref_after_integration
+                "later-selection-cleanup-179"
+                if mutate_run_ref_after_integration and fail_selection_cleanup
                 else (
-                    "later-selection-failure-179"
-                    if fail_after_integration
+                    "later-selection-mutation-179"
+                    if mutate_run_ref_after_integration
                     else (
-                        "selection-cleanup-before-178"
-                        if fail_selection_cleanup
-                        else "policy-halt-176"
+                        "later-selection-failure-179"
+                        if fail_after_integration
+                        else (
+                            "selection-cleanup-before-178"
+                            if fail_selection_cleanup
+                            else "policy-halt-176"
+                        )
                     )
                 )
             )
@@ -2316,6 +2360,136 @@ def test_selection_cleanup_failure_before_integration_does_not_claim_or_publish(
     )
     assert record["validation"]["status"] == "accepted"
     assert record["parsed_response"]["item"] is None
+
+
+def test_later_selection_add_failure_restores_and_publishes_expected_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        fail_selection_add=True,
+    )
+
+    assert exit_code == 1
+    outcome = outcomes[0]
+    assert outcome.completed == [3]
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert len(selection_prompts) == 1
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+
+    failure = next(call for call in process_calls if call[0] == "selection-add-failure")
+    expected_checkpoint = failure[1]
+    partial_worktree = Path(failure[2])
+    run_branch = "pycastle/run-later-selection-add-failure-179"
+    final_push = next(
+        call
+        for call in process_calls
+        if call[:3] == ["git", "push", "origin"]
+        and len(call) == 4
+        and call[3].endswith(f":refs/heads/{run_branch}")
+    )
+    assert final_push[3] == f"{expected_checkpoint}:refs/heads/{run_branch}"
+    assert outcome.selection_failure_checkpoint == expected_checkpoint
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", run_branch],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        == expected_checkpoint
+    )
+    assert (
+        subprocess.run(
+            ["git", "show", f"{expected_checkpoint}:integrated.txt"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == "done\n"
+    )
+    assert not partial_worktree.exists()
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert str(partial_worktree) not in worktrees
+    create = next(call for call in process_calls if call[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+
+
+def test_selection_add_failure_before_integration_cleans_up_without_claim_or_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=False,
+        fail_selection_add=True,
+    )
+
+    assert exit_code == 1
+    outcome = outcomes[0]
+    assert outcome.completed == []
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.selection_failure_checkpoint is not None
+    assert outcome.pr_opened is False
+    assert selection_prompts == []
+    assert after_prompts == []
+    source.is_still_eligible.assert_not_called()
+    source.claim.assert_not_called()
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
+
+    failure = next(call for call in process_calls if call[0] == "selection-add-failure")
+    partial_worktree = Path(failure[2])
+    assert not partial_worktree.exists()
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert str(partial_worktree) not in worktrees
+    assert (
+        subprocess.run(
+            ["git", "branch", "--list", "pycastle/run-selection-add-before-178"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == ""
+    )
 
 
 def test_later_selection_cancellation_wins_over_cleanup_failure(

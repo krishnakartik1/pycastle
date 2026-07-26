@@ -1127,6 +1127,31 @@ def _restore_durable_run_checkpoint(
     _verify_durable_run_checkpoint(run, checkpoint)
 
 
+def _selection_worktree_registered(
+    worktree: Path,
+    *,
+    runner: Runner,
+    workspace: Path,
+) -> bool:
+    """Return whether Git still records the disposable selection checkout."""
+    result = runner(
+        ["git", "worktree", "list", "--porcelain", "-z"],
+        capture=True,
+        cwd=workspace,
+    )
+    output = getattr(result, "stdout", "")
+    if (
+        getattr(result, "returncode", 1) != 0
+        or not isinstance(output, str)
+        or len(output.encode("utf-8")) >= MAX_CAPTURE_BYTES
+    ):
+        raise WorktreeError(
+            "Could not verify disposable Item selection worktree cleanup"
+            f"{_git_failure_detail(result)}"
+        )
+    return f"worktree {worktree}" in output.split("\0")
+
+
 @contextmanager
 def _disposable_selection_worktree(
     run: RunContext,
@@ -1141,38 +1166,42 @@ def _disposable_selection_worktree(
         cwd=run.worktree,
         description="checkpoint",
     )
+    # The immutable final-push source must survive every failure from worktree
+    # creation onward. A non-zero `worktree add` can still have created a path,
+    # registered a checkout, or changed the durable Run through a hostile
+    # command boundary.
+    run.selection_failure_checkpoint = expected_commit
     checkpoint = _capture_durable_run_checkpoint(run, expected_commit)
     _verify_durable_run_checkpoint(run, checkpoint)
     selection_worktree = worktree_root / f"selection-{run.run_id}"
-    result = run.runner(
-        [
-            "git",
-            "worktree",
-            "add",
-            "--detach",
-            str(selection_worktree),
-            expected_commit,
-        ],
-        capture=True,
-        cwd=workspace,
-    )
-    if getattr(result, "returncode", 1) != 0:
-        raise WorktreeError(
-            f"git worktree add failed for Item selection at "
-            f"{selection_worktree}{_git_failure_detail(result)}"
-        )
     primary_error: BaseException | None = None
+    worktree_created = False
     body_completed = False
     try:
+        result = run.runner(
+            [
+                "git",
+                "worktree",
+                "add",
+                "--detach",
+                str(selection_worktree),
+                expected_commit,
+            ],
+            capture=True,
+            cwd=workspace,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            raise WorktreeError(
+                f"git worktree add failed for Item selection at "
+                f"{selection_worktree}{_git_failure_detail(result)}"
+            )
+        worktree_created = True
         yield selection_worktree
         body_completed = True
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
-        # From this point onward, a failure may publish integrated work. Keep
-        # its immutable source before either cleanup command can fail.
-        run.selection_failure_checkpoint = expected_commit
         cleanup_error: SelectionWorktreeCleanupError | None = None
         remove: Any | None = None
         prune: Any | None = None
@@ -1187,6 +1216,24 @@ def _disposable_selection_worktree(
                 "Could not remove the disposable Item selection worktree" f": {exc}",
                 expected_commit=expected_commit,
             )
+        # A failed add may leave an unregistered directory that Git cannot
+        # remove. It is still a PyCastle-owned disposable path, so remove it
+        # before pruning any partial registry entry.
+        if not worktree_created and (
+            selection_worktree.exists() or selection_worktree.is_symlink()
+        ):
+            try:
+                if selection_worktree.is_symlink() or selection_worktree.is_file():
+                    selection_worktree.unlink()
+                else:
+                    shutil.rmtree(selection_worktree)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = SelectionWorktreeCleanupError(
+                        "Could not remove the partial Item selection worktree"
+                        f": {exc}",
+                        expected_commit=expected_commit,
+                    )
         try:
             prune = run.runner(
                 ["git", "worktree", "prune"],
@@ -1200,10 +1247,25 @@ def _disposable_selection_worktree(
                     f": {exc}",
                     expected_commit=expected_commit,
                 )
+        registered = True
+        try:
+            registered = _selection_worktree_registered(
+                selection_worktree,
+                runner=run.runner,
+                workspace=workspace,
+            )
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = SelectionWorktreeCleanupError(
+                    f"Could not verify disposable Item selection cleanup: {exc}",
+                    expected_commit=expected_commit,
+                )
         if cleanup_error is None and (
-            getattr(remove, "returncode", 1) != 0
+            (worktree_created and getattr(remove, "returncode", 1) != 0)
             or getattr(prune, "returncode", 1) != 0
             or selection_worktree.exists()
+            or selection_worktree.is_symlink()
+            or registered
         ):
             cleanup_error = SelectionWorktreeCleanupError(
                 "Could not remove the disposable Item selection worktree"
@@ -1250,7 +1312,7 @@ def _disposable_selection_worktree(
             raise cleanup_error
         elif checkpoint_error is not None:
             raise checkpoint_error
-        if body_completed and not secondary_errors:
+        if worktree_created and body_completed and not secondary_errors:
             run.selection_failure_checkpoint = None
 
 
