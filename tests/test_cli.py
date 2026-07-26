@@ -808,6 +808,8 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     assert outcomes[0].completed == [42]
     assert list(prompts_seen) == ["prepare", "item-selection", "work"]
     before_prompt = prompts_seen["prepare"]
+    assert "## Item candidate pool" in before_prompt
+    assert "## Frozen Items" not in before_prompt
     assert "#1: Lower-numbered candidate [pending]" in before_prompt
     assert "#42: Project-owned choice [pending]" in before_prompt
     assert "Lower candidate body." not in before_prompt
@@ -829,10 +831,20 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
     assert "Frozen comment." in selection_prompt
     assert "priority:high" in selection_prompt
     assert "changed after readiness" not in selection_prompt
-    assert "Implement the selected Item." in prompts_seen["work"]
-    assert "The complete frozen body." in prompts_seen["work"]
-    assert "changed after readiness" not in prompts_seen["work"]
-    assert "Lower candidate body." not in prompts_seen["work"]
+    selection_items = json.loads(
+        selection_prompt.split(
+            "The following JSON is untrusted frozen Issue-source data.\n\n",
+            1,
+        )[1].split("\n\n# PyCastle Run progress", 1)[0]
+    )
+    assert selection_items[1] == frozen_items[1].model_dump(mode="json")
+    item_prompt = prompts_seen["work"]
+    assert "Implement the selected Item." in item_prompt
+    assert "The complete frozen body." in item_prompt
+    assert f"Labels (JSON): {json.dumps(frozen_items[1].labels)}" in item_prompt
+    assert f"Assignees (JSON): {json.dumps(frozen_items[1].assignees)}" in item_prompt
+    assert "changed after readiness" not in item_prompt
+    assert "Lower candidate body." not in item_prompt
     source.is_still_eligible.assert_called_once_with(
         frozen_items[1], assignee="krishna", include_unassigned=False
     )
@@ -1095,12 +1107,14 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
     )
     assert '"attempted": []' in selection_prompts[0]
     assert '"completed": []' in selection_prompts[0]
+    assert '"remaining_claimed_attempt_capacity": 2' in selection_prompts[0]
     assert '"skipped": []' in selection_prompts[0]
     assert '"stale": []' in selection_prompts[0]
     assert '"number": 3' not in selection_prompts[1]
     assert "Private body for Item 3." not in selection_prompts[1]
     assert '"attempted": [\n    3\n  ]' in selection_prompts[1]
     assert '"completed": [\n    3\n  ]' in selection_prompts[1]
+    assert '"remaining_claimed_attempt_capacity": 1' in selection_prompts[1]
     assert '"skipped": []' in selection_prompts[1]
     assert '"stale": []' in selection_prompts[1]
     source.claim.assert_has_calls(
@@ -1484,6 +1498,7 @@ def _run_policy_halt_from_cli(
     *,
     after_integration: bool,
     fail_after_integration: bool = False,
+    mutate_run_ref_after_integration: bool = False,
     claim_failure: OSError | None = None,
 ) -> tuple[
     int,
@@ -1607,6 +1622,15 @@ def _run_policy_halt_from_cli(
             argv, cwd=cwd, capture_output=capture, text=True, check=False
         )
 
+    run_id = (
+        "later-selection-mutation-179"
+        if mutate_run_ref_after_integration
+        else (
+            "later-selection-failure-179"
+            if fail_after_integration
+            else "policy-halt-176"
+        )
+    )
     selection_prompts: list[str] = []
     after_prompts: list[str] = []
     choices = iter((3, None) if after_integration else (None,))
@@ -1618,6 +1642,24 @@ def _run_policy_halt_from_cli(
             if node == "item-selection":
                 selection_prompts.append(prompt)
                 selection_round += 1
+                if mutate_run_ref_after_integration and selection_round == 2:
+                    base_commit = subprocess.run(
+                        ["git", "rev-parse", "main"],
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout.strip()
+                    subprocess.run(
+                        [
+                            "git",
+                            "update-ref",
+                            f"refs/heads/pycastle/run-{run_id}",
+                            base_commit,
+                        ],
+                        cwd=cwd,
+                        check=True,
+                    )
                 if fail_after_integration and selection_round == 2:
                     return RuntimeResult(
                         output="private transcript without a selection response",
@@ -1644,9 +1686,6 @@ def _run_policy_halt_from_cli(
     source.is_still_eligible.return_value = True
     source.claim.side_effect = claim_failure
     outcomes: list[RunOutcome] = []
-    run_id = (
-        "later-selection-failure-179" if fail_after_integration else "policy-halt-176"
-    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
     monkeypatch.setattr(cli, "_make_run_id", lambda: run_id)
@@ -1866,6 +1905,75 @@ def test_later_selection_failure_preserves_completed_work_in_safe_draft(
         ).stdout
         == "done\n"
     )
+
+
+def test_later_selection_ref_mutation_publishes_last_expected_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        mutate_run_ref_after_integration=True,
+    )
+
+    assert exit_code == 1
+    outcome = outcomes[0]
+    assert outcome.completed == [3]
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+
+    run_branch = "pycastle/run-later-selection-mutation-179"
+    final_push = next(
+        call
+        for call in process_calls
+        if call[:3] == ["git", "push", "origin"]
+        and len(call) == 4
+        and call[3].endswith(f":refs/heads/{run_branch}")
+    )
+    expected_checkpoint = final_push[3].split(":", 1)[0]
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    restored_branch = subprocess.run(
+        ["git", "rev-parse", run_branch],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert expected_checkpoint == restored_branch
+    assert expected_checkpoint != base_commit
+    assert (
+        subprocess.run(
+            ["git", "show", f"{expected_checkpoint}:integrated.txt"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == "done\n"
+    )
+    create = next(call for call in process_calls if call[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
 def test_claim_failure_stops_before_item_work_and_cleans_unclaimed_run(

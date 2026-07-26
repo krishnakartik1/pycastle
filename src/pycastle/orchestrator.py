@@ -489,6 +489,7 @@ class RunContext:
     fixture_dir: Path
     runner: Runner
     remote_checkpoint_succeeded: bool = False
+    selection_failure_checkpoint: str | None = None
 
 
 @dataclass
@@ -524,15 +525,18 @@ def render_issue_context(issue: IssueRef) -> str:
 
     The node prompts tell the runtime to read the issue's "What to build" and
     "Acceptance criteria", so it must actually be handed the issue. This renders
-    a ``# Issue #<n>: <title>`` header followed by the body when non-empty, then
-    every author-attributed issue comment in source order. The title keeps its
-    punctuation and markdown (unlike :func:`slugify`). Missing parts are omitted,
-    so an issue with no comments renders byte-for-byte as it did before comments
-    were added to :class:`~pycastle.models.IssueRef`.
+    a ``# Issue #<n>: <title>`` header followed by the complete frozen labels and
+    assignees, the body when non-empty, then every author-attributed issue
+    comment in source order. The title keeps its punctuation and markdown
+    (unlike :func:`slugify`).
     """
     header = f"# Issue #{issue.number}: {issue.title}".rstrip()
     body = issue.body.strip()
-    parts = [header]
+    facts = (
+        f"Labels (JSON): {json.dumps(issue.labels, ensure_ascii=False)}\n\n"
+        f"Assignees (JSON): {json.dumps(issue.assignees, ensure_ascii=False)}"
+    )
+    parts = [header, f"## Frozen Item facts\n\n{facts}"]
     if body:
         parts.append(body)
     if issue.comments:
@@ -637,6 +641,7 @@ def render_item_selection_prompt(
     outcomes: Sequence[IssueOutcome],
     directions: str,
     *,
+    remaining_attempt_capacity: int,
     attempted: Sequence[int] = (),
     stale: Sequence[int] = (),
 ) -> str:
@@ -647,6 +652,7 @@ def render_item_selection_prompt(
         {
             "attempted": list(attempted),
             "completed": completed,
+            "remaining_claimed_attempt_capacity": remaining_attempt_capacity,
             "skipped": [number for number in attempted if number not in set(completed)],
             "stale": list(stale),
         },
@@ -659,9 +665,10 @@ def render_item_selection_prompt(
         "The workspace has the ordinary writable permissions of the selected "
         "Sandbox. Inspect only: do not modify files, commits, Git references, "
         "or external systems. This is behavioral guidance, not a security "
-        "boundary. PyCastle withholds known GitHub token, gh configuration, "
-        "Git credential-helper, askpass, and SSH-agent channels. The Sandbox "
-        "does not make arbitrary readable host files inaccessible.\n\n"
+        "boundary. PyCastle does not inject Issue-source credentials and "
+        "withholds known GitHub token, gh configuration, Git credential-helper, "
+        "askpass, and SSH-agent channels. The Sandbox does not make arbitrary "
+        "readable host files inaccessible.\n\n"
         f"Allowed Item numbers (JSON): {json.dumps(allowed)}\n\n"
         "Return exactly one tagged JSON object with only `item` and `reason`. "
         f"`reason` must be non-empty and no longer than {SELECTION_REASON_LIMIT} "
@@ -805,6 +812,7 @@ def _select_item(
     fixture_dir: Path,
     run_id: str,
     round_number: int,
+    remaining_attempt_capacity: int,
     attempted: Sequence[int] = (),
     stale: Sequence[int] = (),
 ) -> IssueRef | None:
@@ -859,6 +867,7 @@ def _select_item(
         candidates,
         outcomes,
         directions,
+        remaining_attempt_capacity=remaining_attempt_capacity,
         attempted=attempted,
         stale=stale,
     )
@@ -1124,6 +1133,28 @@ def _verify_durable_run_checkpoint(run: RunContext, expected_commit: str) -> Non
         )
 
 
+def _restore_durable_run_checkpoint(run: RunContext, expected_commit: str) -> None:
+    """Restore only PyCastle-owned Run state to its last verified checkpoint."""
+    commands = (
+        [
+            "git",
+            "update-ref",
+            f"refs/heads/{run.branch}",
+            expected_commit,
+        ],
+        ["git", "reset", "--hard", expected_commit],
+        ["git", "clean", "-fd"],
+    )
+    for argv in commands:
+        result = run.runner(argv, capture=True, cwd=run.worktree)
+        if getattr(result, "returncode", 1) != 0:
+            raise RunCheckpointError(
+                "Could not restore the durable Run checkpoint"
+                f"{_git_failure_detail(result)}"
+            )
+    _verify_durable_run_checkpoint(run, expected_commit)
+
+
 @contextmanager
 def _disposable_selection_worktree(
     run: RunContext,
@@ -1179,7 +1210,15 @@ def _disposable_selection_worktree(
                 "Could not remove the disposable Item selection worktree"
                 f"{_git_failure_detail(remove) or _git_failure_detail(prune)}"
             )
-        _verify_durable_run_checkpoint(run, expected_commit)
+        try:
+            _verify_durable_run_checkpoint(run, expected_commit)
+        except RunCheckpointError:
+            # Keep an immutable publication source even if restoring the local
+            # Run worktree fails. The final push must not trust a ref changed by
+            # selection.
+            run.selection_failure_checkpoint = expected_commit
+            _restore_durable_run_checkpoint(run, expected_commit)
+            raise
 
 
 def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
@@ -1672,7 +1711,7 @@ def render_run_context(
         else:
             state = "pending"
         rows.append(f"- #{issue.number}: {issue.title} [{state}]")
-    context = f"# PyCastle Run {run_id}\n\n## Frozen Items\n\n" + "\n".join(rows)
+    context = f"# PyCastle Run {run_id}\n\n## Item candidate pool\n\n" + "\n".join(rows)
     if selection_end is not None:
         context += f"\n\n## Item selection\n\nEnded: {selection_end}"
     return context
@@ -2087,6 +2126,7 @@ def run_batch(
                             fixture_dir=fixture_dir,
                             run_id=run_id,
                             round_number=selection_round,
+                            remaining_attempt_capacity=iterations - claimed_attempts,
                             attempted=outcome.attempted,
                             stale=outcome.stale,
                         )
@@ -2649,7 +2689,15 @@ def _push_run_branch(
     node: str | None = None,
 ) -> bool:
     """Push the current Run checkpoint, logging failures without raising."""
-    argv = ["git", "push", "-u", "origin", run.branch]
+    if final and run.selection_failure_checkpoint is not None:
+        argv = [
+            "git",
+            "push",
+            "origin",
+            (f"{run.selection_failure_checkpoint}:refs/heads/{run.branch}"),
+        ]
+    else:
+        argv = ["git", "push", "-u", "origin", run.branch]
     node_name = node or ("final-push" if final else "durability-push")
     try:
         result = run.runner(

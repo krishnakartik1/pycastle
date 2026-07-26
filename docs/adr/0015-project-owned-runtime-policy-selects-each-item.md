@@ -13,8 +13,8 @@ expand project scheduling semantics.
 
 AgentRoster instead presents the current candidates and repository context to a
 project-authored Runtime prompt before each Item. That permits semantic judgments
-about priority and dependencies without giving Issue-source credentials or
-mutations to project execution.
+about priority and dependencies while keeping Issue-source mutation ownership in
+the runner.
 
 ## Decision
 
@@ -147,8 +147,19 @@ not a security boundary. Each invocation runs after Run-scope Setup in a fresh
 disposable worktree at the latest Run-branch checkpoint. PyCastle captures the
 structured response, removes the entire selection worktree regardless of its
 contents, verifies that the durable Run branch and worktree did not change, and
-only then may claim the selected Item. GitHub credentials are never supplied to
-the selection Runtime.
+only then may claim the selected Item. PyCastle does not inject Issue-source
+credentials into selection and scrubs the standard GitHub token environment,
+`gh` configuration, Git credential-helper and askpass paths, and SSH-agent
+channel for the invocation. On a host Sandbox, this narrows the conventional
+credential channels but cannot hide arbitrary files already readable by the
+user; the selected Sandbox remains the security boundary.
+
+If verification detects a selection-time mutation, PyCastle restores only its
+own Run branch and Run worktree to the captured pre-selection commit. When
+integrated work must be preserved in a draft pull request, the final push names
+that captured commit explicitly rather than trusting the mutable branch ref.
+PyCastle does not reset the operator's checkout or other user-owned refs or
+worktrees.
 
 Selection uses the Run's one selected Runtime, model, Sandbox, pinned Agent
 image, and authentication path. The Item definition declares only the selection

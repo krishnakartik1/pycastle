@@ -191,49 +191,45 @@ class GitHubIssueSource(IssueSource):
             )
         ]
 
+    def _issue_ref(
+        self,
+        item: dict[str, Any],
+        *,
+        body: str,
+        comments: list[IssueComment],
+    ) -> IssueRef:
+        """Normalize one GitHub Issue row into PyCastle's frozen Item facts."""
+        labels = [
+            label["name"] if isinstance(label, dict) else label
+            for label in item.get("labels", [])
+        ]
+        return IssueRef(
+            number=item["number"],
+            title=item.get("title", ""),
+            body=body,
+            labels=labels,
+            assignees=assignee_logins(item),
+            comments=comments,
+        )
+
     def list_ready(self, *, timeout: float | None = None) -> list[IssueRef]:
         """Return every open Issue carrying the ready label, with full facts."""
-        issues: list[IssueRef] = []
-        for item in self._ready_rows(timeout=timeout):
-            labels = [
-                lbl["name"] if isinstance(lbl, dict) else lbl
-                for lbl in item.get("labels", [])
-            ]
-            issues.append(
-                IssueRef(
-                    number=item["number"],
-                    title=item.get("title", ""),
-                    body=item.get("body") or "",
-                    labels=labels,
-                    assignees=assignee_logins(item),
-                    comments=self._comments(item, timeout=timeout),
-                )
+        return [
+            self._issue_ref(
+                item,
+                body=item.get("body") or "",
+                comments=self._comments(item, timeout=timeout),
             )
-        return issues
+            for item in self._ready_rows(timeout=timeout)
+        ]
 
     def list_ready_metadata(self, *, timeout: float | None = None) -> list[IssueRef]:
         """List ready Items without fetching bodies, comments, or other content."""
-        issues: list[IssueRef] = []
         try:
             rows = self._ready_rows(timeout=timeout)
         except OSError as exc:
             raise OSError("GitHub ready-Item metadata listing failed") from exc
-        for item in rows:
-            labels = [
-                label["name"] if isinstance(label, dict) else label
-                for label in item.get("labels", [])
-            ]
-            issues.append(
-                IssueRef(
-                    number=item["number"],
-                    title=item.get("title", ""),
-                    body="",
-                    labels=labels,
-                    assignees=assignee_logins(item),
-                    comments=[],
-                )
-            )
-        return issues
+        return [self._issue_ref(item, body="", comments=[]) for item in rows]
 
     def is_still_eligible(
         self,
