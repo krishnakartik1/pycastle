@@ -320,7 +320,7 @@ def test_migrated_fixture_selects_claims_completes_and_publishes_an_item(
     with pytest.raises(FixtureUpgradeError, match="owner-authored"):
         upgrade_fixture(
             tmp_path,
-            runner_version="0.1.3",
+            runner_version="0.1.4",
             migrations=fixture_migrations.MIGRATIONS,
         )
     assert (fixture / "version").read_text() == "0.1.2\n"
@@ -343,11 +343,11 @@ def test_migrated_fixture_selects_claims_completes_and_publishes_an_item(
     )
     upgraded = upgrade_fixture(
         tmp_path,
-        runner_version="0.1.3",
+        runner_version="0.1.4",
         migrations=fixture_migrations.MIGRATIONS,
     )
     assert upgraded.marker_updated
-    assert (fixture / "version").read_text() == "0.1.3\n"
+    assert (fixture / "version").read_text() == "0.1.4\n"
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(
         ["git", "commit", "-m", "advance fixture release"],

@@ -83,7 +83,7 @@ def fixture_declares_project_owned_item_selection(fixture: Path) -> bool:
 
 def _require_owner_item_selection_adoption(_fixture: Path) -> None:
     raise FixtureUpgradeError(
-        "PyCastle 0.1.3 requires an owner-authored Project fixture migration. "
+        "PyCastle 0.1.4 requires an owner-authored Project fixture migration. "
         "Add and review a project-owned selection prompt under "
         "`.pycastle/prompts/`, then wrap the existing Item execution graph in "
         "an Item definition with `build_item`, pairing that graph with "
@@ -101,7 +101,7 @@ MIGRATIONS: tuple[FixtureMigration, ...] = (
         dockerfile_declares_host_identity,
     ),
     FixtureMigration(
-        "0.1.3",
+        "0.1.4",
         fixture_declares_project_owned_item_selection,
         _require_owner_item_selection_adoption,
         fixture_declares_project_owned_item_selection,

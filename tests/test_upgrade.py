@@ -401,7 +401,19 @@ def test_012_manual_migration_accepts_owner_authored_args_and_only_advances_mark
     assert result.applied_versions == ()
 
 
-def test_013_manual_migration_requires_owner_authored_item_selection(
+def test_013_runner_patch_does_not_require_a_fixture_migration(
+    tmp_path: Path,
+) -> None:
+    project, fixture = _project(tmp_path, marker="0.1.2\n")
+
+    result = upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+
+    assert (fixture / "version").read_text() == "0.1.2\n"
+    assert result.applied_versions == ()
+    assert not result.marker_updated
+
+
+def test_014_manual_migration_requires_owner_authored_item_selection(
     tmp_path: Path,
 ) -> None:
     project, fixture = _project(tmp_path, marker="0.1.2\n")
@@ -425,7 +437,7 @@ def test_013_manual_migration_requires_owner_authored_item_selection(
         FixtureUpgradeError,
         match="owner-authored.*selection prompt.*wrap.*Item definition",
     ):
-        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+        upgrade_fixture(project, runner_version="0.1.4", migrations=MIGRATIONS)
 
     after = {
         path.relative_to(fixture): path.read_bytes()
@@ -452,16 +464,16 @@ def test_013_manual_migration_requires_owner_authored_item_selection(
         check=True,
     )
 
-    result = upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+    result = upgrade_fixture(project, runner_version="0.1.4", migrations=MIGRATIONS)
 
     assert (fixture / "main.py").read_text() == item_definition
     assert (fixture / "prompts" / "select-item.md").read_text() == selection_prompt
-    assert (fixture / "version").read_text() == "0.1.3\n"
+    assert (fixture / "version").read_text() == "0.1.4\n"
     assert result.applied_versions == ()
     assert result.marker_updated
 
 
-def test_013_manual_migration_keeps_partial_owner_changes_blocked(
+def test_014_manual_migration_keeps_partial_owner_changes_blocked(
     tmp_path: Path,
 ) -> None:
     project, fixture = _project(tmp_path, marker="0.1.2\n")
@@ -479,12 +491,12 @@ def test_013_manual_migration_keeps_partial_owner_changes_blocked(
     )
 
     with pytest.raises(FixtureUpgradeError, match="owner-authored"):
-        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+        upgrade_fixture(project, runner_version="0.1.4", migrations=MIGRATIONS)
 
     assert (fixture / "version").read_text() == "0.1.2\n"
 
 
-def test_013_manual_migration_keeps_invalid_owner_changes_blocked(
+def test_014_manual_migration_keeps_invalid_owner_changes_blocked(
     tmp_path: Path,
 ) -> None:
     project, fixture = _project(tmp_path, marker="0.1.2\n")
@@ -495,6 +507,6 @@ def test_013_manual_migration_keeps_invalid_owner_changes_blocked(
     )
 
     with pytest.raises(FixtureUpgradeError, match="owner-authored"):
-        upgrade_fixture(project, runner_version="0.1.3", migrations=MIGRATIONS)
+        upgrade_fixture(project, runner_version="0.1.4", migrations=MIGRATIONS)
 
     assert (fixture / "version").read_text() == "0.1.2\n"
