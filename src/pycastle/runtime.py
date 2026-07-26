@@ -42,6 +42,7 @@ class AgentCrashError(RuntimeError):
         node: str,
         exit_code: int,
         transcript: str = "",
+        stderr: str = "",
         telemetry: Telemetry | None = None,
     ) -> None:
         """Record the failure and any output parsed before process exit."""
@@ -49,7 +50,35 @@ class AgentCrashError(RuntimeError):
         self.node = node
         self.exit_code = exit_code
         self.transcript = transcript
+        self.stderr = stderr
         self.telemetry = telemetry
+
+
+def _log_crash(
+    runtime: str,
+    node: str,
+    exit_code: int,
+    stderr: str,
+    *,
+    verbose: bool,
+) -> None:
+    """Log safe selection failures while retaining ordinary diagnostics."""
+    if node == "item-selection" and not verbose:
+        logger.error(
+            "[%s] %s exited with code %s; private details retained locally",
+            node,
+            runtime,
+            exit_code,
+        )
+        return
+    detail = stderr if node == "item-selection" else stderr[:500]
+    logger.error(
+        "[%s] %s exited with code %s: %s",
+        node,
+        runtime,
+        exit_code,
+        detail,
+    )
 
 
 @runtime_checkable
@@ -284,17 +313,19 @@ class ClaudeRuntime:
         if is_error:
             output = "".join(output_buf) if output_buf else result_text
             telemetry = _build_telemetry(self.name, node, result_info)
-            logger.error(
-                "[%s] claude exited with code %s: %s",
+            _log_crash(
+                self.name,
                 node,
                 proc.returncode,
-                stderr_text[:500],
+                stderr_text,
+                verbose=self.verbose,
             )
             raise AgentCrashError(
                 f"claude crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
                 transcript=output,
+                stderr=stderr_text,
                 telemetry=telemetry,
             )
 
@@ -668,17 +699,19 @@ class CodexRuntime:
                 num_turns=num_turns,
                 elapsed_ms=elapsed_ms,
             )
-            logger.error(
-                "[%s] codex exited with code %s: %s",
+            _log_crash(
+                self.name,
                 node,
                 proc.returncode,
-                stderr_text[:500],
+                stderr_text,
+                verbose=self.verbose,
             )
             raise AgentCrashError(
                 f"codex crashed during {node} (exit code {proc.returncode})",
                 node=node,
                 exit_code=proc.returncode,
                 transcript="".join(output_buf),
+                stderr=stderr_text,
                 telemetry=telemetry,
             )
 

@@ -610,6 +610,7 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                         node=node,
                         exit_code=17,
                         transcript="partial private Runtime transcript",
+                        stderr="complete private provider stderr",
                         telemetry=Telemetry(
                             runtime=self.name,
                             node=node,
@@ -734,6 +735,7 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                 assert record["runtime_transcript"] == (
                     "partial private Runtime transcript"
                 )
+                assert record["runtime_stderr"] == "complete private provider stderr"
                 assert record["runtime_telemetry"]["is_error"] is True
                 assert "private provider detail" in record["runtime_error"]
             elif selection_outcome == "out-of-pool":
@@ -750,6 +752,7 @@ def test_project_policy_selects_and_completes_later_item_from_frozen_pool(
                 assert record["runtime_transcript"] is None
             assert "private transcript" not in caplog.text
             assert "private provider detail" not in caplog.text
+            assert "complete private provider stderr" not in caplog.text
             assert "private out-of-pool reason" not in caplog.text
             assert not any(call[:3] == ["gh", "pr", "create"] for call in process_calls)
             assert [
@@ -1499,6 +1502,7 @@ def _run_policy_halt_from_cli(
     after_integration: bool,
     fail_after_integration: bool = False,
     mutate_run_ref_after_integration: bool = False,
+    mutate_ignored_publication_after_integration: bool = False,
     fail_selection_cleanup: bool = False,
     claim_failure: OSError | None = None,
 ) -> tuple[
@@ -1517,7 +1521,9 @@ def _run_policy_halt_from_cli(
     (prompts / "select.md").write_text("Choose an actionable Item or stop.")
     (prompts / "work.md").write_text("Implement this selected Item.")
     (prompts / "summarize.md").write_text("Summarize the bounded Run outcomes.")
-    (fixture / ".gitignore").write_text("/runs/\n")
+    (fixture / ".gitignore").write_text(
+        "/runs/\n/run-report.md\n/selection-created.md\n"
+    )
     (fixture / "main.py").write_text(
         "from pycastle.graph import (build_item,build_run,execution_graph,"
         "gate_node,runtime_node,runtime_selection)\n"
@@ -1612,6 +1618,23 @@ def _run_policy_halt_from_cli(
         nonlocal fail_next_selection_prune
         process_calls.append(argv)
         if argv[:2] == ["git", "push"]:
+            if (
+                mutate_ignored_publication_after_integration
+                and cwd is not None
+                and (cwd / "integrated.txt").is_file()
+            ):
+                report_path = cwd / ".pycastle/run-report.md"
+                created_path = cwd / ".pycastle/selection-created.md"
+                if "-u" in argv and not report_path.exists():
+                    report_path.write_text("trusted pre-selection report\n")
+                elif "-u" not in argv:
+                    process_calls.append(
+                        [
+                            "ignored-publication-state",
+                            report_path.read_text(),
+                            str(created_path.exists()),
+                        ]
+                    )
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(argv, 0, "[]", "")
@@ -1639,18 +1662,26 @@ def _run_policy_halt_from_cli(
         return result
 
     run_id = (
-        "later-selection-cleanup-179"
-        if mutate_run_ref_after_integration and fail_selection_cleanup
+        (
+            "ignored-publication-failure"
+            if fail_after_integration
+            else "ignored-publication-halt"
+        )
+        if mutate_ignored_publication_after_integration
         else (
-            "later-selection-mutation-179"
-            if mutate_run_ref_after_integration
+            "later-selection-cleanup-179"
+            if mutate_run_ref_after_integration and fail_selection_cleanup
             else (
-                "later-selection-failure-179"
-                if fail_after_integration
+                "later-selection-mutation-179"
+                if mutate_run_ref_after_integration
                 else (
-                    "selection-cleanup-before-178"
-                    if fail_selection_cleanup
-                    else "policy-halt-176"
+                    "later-selection-failure-179"
+                    if fail_after_integration
+                    else (
+                        "selection-cleanup-before-178"
+                        if fail_selection_cleanup
+                        else "policy-halt-176"
+                    )
                 )
             )
         )
@@ -1666,6 +1697,17 @@ def _run_policy_halt_from_cli(
             if node == "item-selection":
                 selection_prompts.append(prompt)
                 selection_round += 1
+                if (
+                    mutate_ignored_publication_after_integration
+                    and selection_round == 2
+                ):
+                    durable_fixture = cwd.parent / f"run-{run_id}" / ".pycastle"
+                    (durable_fixture / "run-report.md").write_text(
+                        "private selection report must not publish\n"
+                    )
+                    (durable_fixture / "selection-created.md").write_text(
+                        "private new ignored selection artifact\n"
+                    )
                 if mutate_run_ref_after_integration and selection_round == 2:
                     if fail_selection_cleanup:
                         (cwd / "MALICIOUS_SELECTION_CHANGE").write_text(
@@ -1951,6 +1993,70 @@ def test_later_selection_failure_preserves_completed_work_in_safe_draft(
         ).stdout
         == "done\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("malformed_response", "cleanup_failure"),
+    ((False, False), (True, False), (False, True)),
+)
+def test_selection_cannot_publish_mutated_ignored_project_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    malformed_response: bool,
+    cleanup_failure: bool,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        _timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        fail_after_integration=malformed_response,
+        mutate_ignored_publication_after_integration=True,
+        fail_selection_cleanup=cleanup_failure,
+    )
+
+    assert exit_code == 1
+    outcome = outcomes[0]
+    assert outcome.completed == [3]
+    assert outcome.selection_failure == "selection-infrastructure-failed"
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+
+    restored = next(
+        call for call in process_calls if call[0] == "ignored-publication-state"
+    )
+    assert restored == [
+        "ignored-publication-state",
+        "trusted pre-selection report\n",
+        "False",
+    ]
+
+    create = next(call for call in process_calls if call[:3] == ["gh", "pr", "create"])
+    comment = next(
+        call
+        for call in process_calls
+        if call[:2] == ["gh", "api"] and "--method" in call
+    )
+    published = create[create.index("--body") + 1] + next(
+        argument.removeprefix("body=")
+        for argument in comment
+        if argument.startswith("body=")
+    )
+    assert "Item selection failure: `selection-infrastructure-failed`" in published
+    assert "private selection report" not in published
+    assert "private new ignored selection artifact" not in published
+    assert "trusted pre-selection report" not in published
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
 
 
 def test_later_selection_ref_mutation_publishes_last_expected_checkpoint(

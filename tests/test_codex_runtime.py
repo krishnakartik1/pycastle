@@ -362,6 +362,7 @@ def test_nonzero_exit_raises_crash(mock_popen: MagicMock, tmp_path: Path) -> Non
     assert exc_info.value.node == "implement"
     assert exc_info.value.exit_code == 1
     assert exc_info.value.transcript == "partial answer"
+    assert exc_info.value.stderr == "boom"
     assert exc_info.value.telemetry is not None
     assert exc_info.value.telemetry.runtime == "codex"
 
@@ -379,6 +380,53 @@ def test_nonzero_exit_reads_stderr_for_logging(
 
     assert "permission denied" in caplog.text
     proc.wait.assert_called_once()
+
+
+def test_item_selection_crash_retains_private_output_without_normal_logging(
+    mock_popen: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = _fake_proc(
+        [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "private candidate body",
+                },
+            }
+        ],
+        returncode=2,
+    )
+    proc.stderr = io.StringIO("private provider stderr\n")
+    mock_popen.return_value = proc
+
+    with caplog.at_level("ERROR", logger="pycastle.runtime"):
+        with pytest.raises(AgentCrashError) as exc_info:
+            CodexRuntime().run("p", cwd=tmp_path, node="item-selection")
+
+    assert exc_info.value.transcript == "private candidate body"
+    assert exc_info.value.stderr == "private provider stderr\n"
+    assert "private candidate body" not in caplog.text
+    assert "private provider stderr" not in caplog.text
+    assert "private details retained locally" in caplog.text
+
+
+def test_verbose_item_selection_crash_may_stream_private_stderr(
+    mock_popen: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = _fake_proc([], returncode=2)
+    proc.stderr = io.StringIO("private verbose stderr\n")
+    mock_popen.return_value = proc
+
+    with caplog.at_level("ERROR", logger="pycastle.runtime"):
+        with pytest.raises(AgentCrashError):
+            CodexRuntime(verbose=True).run("p", cwd=tmp_path, node="item-selection")
+
+    assert "private verbose stderr" in caplog.text
 
 
 def test_empty_stream_with_clean_exit_degrades_gracefully(

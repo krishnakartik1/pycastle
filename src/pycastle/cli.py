@@ -15,11 +15,7 @@ from . import __version__, sandbox
 from .commands import run_cmd
 from .compatibility import FixtureCompatibilityError
 from .issues import GitHubIssueSource
-from .orchestrator import (
-    ITEM_SELECTION_END_POLICY_HALT,
-    PruneError,
-    prune_run_branches,
-)
+from .orchestrator import PruneError, prune_run_branches
 from .orchestrator import run_batch as run_loop
 from .preflight import (
     PreflightError,
@@ -44,6 +40,7 @@ from .scaffold import (
     read_sandbox,
     scaffold_fixture,
 )
+from .selection import ITEM_SELECTION_END_POLICY_HALT
 from .upgrade import FixtureUpgradeError, upgrade_fixture
 
 logger = logging.getLogger("pycastle")

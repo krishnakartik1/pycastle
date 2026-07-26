@@ -159,7 +159,16 @@ own Run branch and Run worktree to the captured pre-selection commit. When
 integrated work must be preserved in a draft pull request, the final push names
 that captured commit explicitly rather than trusting the mutable branch ref.
 PyCastle does not reset the operator's checkout or other user-owned refs or
-worktrees.
+worktrees. The durable-state invariant covers Git-visible state across the
+whole Run worktree and every ignored file under the `.pycastle` Project fixture
+namespace, because ignored Run reports and related artifacts are possible
+publication inputs. PyCastle snapshots, verifies, and restores that bounded
+ignored namespace on every selection exit; any difference fails selection
+before claim even when restoration succeeds. Other ignored project-local state,
+such as dependency caches outside `.pycastle`, is not a publication source and
+remains governed by the selected Sandbox rather than copied or hashed by the
+runner. Normal Item and After-Run work retain ownership of producing the Run
+report outside selection.
 
 Selection uses the Run's one selected Runtime, model, Sandbox, pinned Agent
 image, and authentication path. The Item definition declares only the selection

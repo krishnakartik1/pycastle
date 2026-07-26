@@ -24,19 +24,22 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal
 
 from . import sandbox as sandbox_mod
-from .commands import run_cmd
+from . import selection
+from .commands import MAX_CAPTURE_BYTES, run_cmd
 from .execution import (
     ExecutionRecord,
     execute_hook,
@@ -57,10 +60,22 @@ from .issues import IssueSource
 from .models import IssueRef, RuntimeResult, Telemetry
 from .readiness import FrozenReadinessInputs
 from .runtime import AgentCrashError, Runtime
+from .selection import ItemSelectionError, SelectionEnd, SelectionFailure
 
 logger = logging.getLogger(__name__)
 
 Runner = Callable[..., Any]
+ITEM_SELECTION_NODE = selection.ITEM_SELECTION_NODE
+SELECTION_REASON_LIMIT = selection.SELECTION_REASON_LIMIT
+SELECTION_RESPONSE_LIMIT_BYTES = selection.SELECTION_RESPONSE_LIMIT_BYTES
+SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES = (
+    selection.SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES
+)
+_parse_item_selection = selection.parse_response
+_render_item_candidate_envelope = selection.render_candidate_envelope
+_render_item_selection_prompt = selection.render_prompt
+_without_github_credentials_for_selection = selection.without_github_credentials
+_write_item_selection_record = selection.write_audit_record
 
 
 @dataclass(frozen=True)
@@ -126,6 +141,23 @@ class PruneError(RuntimeError):
 
 class RunCheckpointError(RuntimeError):
     """A successful Run node could not be committed durably."""
+
+
+@dataclass(frozen=True)
+class IgnoredPublicationArtifact:
+    """One ignored file whose contents can affect Run publication."""
+
+    kind: Literal["file", "symlink"]
+    content: bytes | str
+    mode: int | None = None
+
+
+@dataclass(frozen=True)
+class DurableRunCheckpoint:
+    """Git-visible state plus ignored publication state for a Run worktree."""
+
+    commit: str
+    ignored_publication: tuple[tuple[str, IgnoredPublicationArtifact], ...]
 
 
 class ItemClaimError(RuntimeError):
@@ -467,8 +499,8 @@ class RunOutcome:
     attempted: list[int] = field(default_factory=list)
     stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
-    selection_end: str | None = None
-    selection_failure: str | None = None
+    selection_end: SelectionEnd | None = None
+    selection_failure: SelectionFailure | None = None
     selection_failure_checkpoint: str | None = None
     pr_opened: bool = False
     pr_ready: bool = False
@@ -557,94 +589,6 @@ def render_issue_context(issue: IssueRef) -> str:
     return "\n\n".join(parts)
 
 
-ITEM_SELECTION_NODE = "item-selection"
-SELECTION_REASON_LIMIT = 4_096
-SELECTION_RESPONSE_LIMIT_BYTES = 64 * 1_024
-SELECTION_CANDIDATE_ENVELOPE_LIMIT_BYTES = 1_024 * 1_024
-ITEM_SELECTION_END_POLICY_HALT = "project-policy-halted"
-_SELECTION_REMOVED_ENV = (
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-    "SSH_AUTH_SOCK",
-)
-_SELECTION_PROTECTED_ENV = {
-    "GIT_ASKPASS": "/bin/false",
-    "GIT_CONFIG_COUNT": "1",
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_KEY_0": "credential.helper",
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_SYSTEM": os.devnull,
-    "GIT_CONFIG_VALUE_0": "",
-    "GIT_TERMINAL_PROMPT": "0",
-    "SSH_ASKPASS": "/bin/false",
-}
-
-
-@dataclass(frozen=True)
-class ItemSelectionDecision:
-    """One validated project-policy response retained for local audit."""
-
-    item: int | None
-    reason: str
-
-
-class ItemSelectionError(Exception):
-    """A safe orchestration failure from one Item selection invocation."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str,
-        parsed_response: object | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.parsed_response = parsed_response
-
-
-@contextmanager
-def _without_github_credentials_for_selection() -> Iterator[None]:
-    """Hide known host GitHub credential channels for one Runtime invocation.
-
-    Runtime authentication locations (HOME, CODEX_HOME, and CLAUDE_CONFIG_DIR)
-    remain available. This narrows inherited host authority through documented
-    token, gh-config, Git credential-helper, askpass, and SSH-agent paths. The
-    selected Sandbox remains the security boundary: arbitrary readable host
-    files cannot be made inaccessible by a process-environment contract.
-    """
-    names = (
-        *_SELECTION_REMOVED_ENV,
-        *_SELECTION_PROTECTED_ENV,
-        "GH_CONFIG_DIR",
-    )
-    previous = {name: os.environ.get(name) for name in names}
-    with tempfile.TemporaryDirectory(prefix="pycastle-selection-gh-") as gh_config:
-        try:
-            for name in _SELECTION_REMOVED_ENV:
-                os.environ.pop(name, None)
-            os.environ.update(_SELECTION_PROTECTED_ENV)
-            os.environ["GH_CONFIG_DIR"] = gh_config
-            yield
-        finally:
-            for name, value in previous.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-
-
-def _render_item_candidate_envelope(candidates: Sequence[IssueRef]) -> str:
-    """Serialize the exact frozen candidate facts supplied to project policy."""
-    return json.dumps(
-        [candidate.model_dump(mode="json") for candidate in candidates],
-        indent=2,
-        sort_keys=True,
-    )
-
-
 def render_item_selection_prompt(
     candidates: Sequence[IssueRef],
     outcomes: Sequence[IssueOutcome],
@@ -655,159 +599,15 @@ def render_item_selection_prompt(
     stale: Sequence[int] = (),
 ) -> str:
     """Compose frozen facts, project policy, and PyCastle's response contract."""
-    facts = _render_item_candidate_envelope(candidates)
     completed = [outcome.issue.number for outcome in outcomes if outcome.merged]
-    progress = json.dumps(
-        {
-            "attempted": list(attempted),
-            "completed": completed,
-            "remaining_claimed_attempt_capacity": remaining_attempt_capacity,
-            "skipped": [number for number in attempted if number not in set(completed)],
-            "stale": list(stale),
-        },
-        indent=2,
-        sort_keys=True,
+    return _render_item_selection_prompt(
+        candidates,
+        completed,
+        directions,
+        remaining_attempt_capacity=remaining_attempt_capacity,
+        attempted=attempted,
+        stale=stale,
     )
-    allowed = [candidate.number for candidate in candidates]
-    protocol = (
-        "# PyCastle Item selection response contract\n\n"
-        "The workspace has the ordinary writable permissions of the selected "
-        "Sandbox. Inspect only: do not modify files, commits, Git references, "
-        "or external systems. This is behavioral guidance, not a security "
-        "boundary. PyCastle does not inject Issue-source credentials and "
-        "withholds known GitHub token, gh configuration, Git credential-helper, "
-        "askpass, and SSH-agent channels. The Sandbox does not make arbitrary "
-        "readable host files inaccessible.\n\n"
-        f"Allowed Item numbers (JSON): {json.dumps(allowed)}\n\n"
-        "Return exactly one tagged JSON object with only `item` and `reason`. "
-        f"`reason` must be non-empty and no longer than {SELECTION_REASON_LIMIT} "
-        "characters.\n\n"
-        '<selection>{"item": 42, "reason": "Concise bounded reason."}</selection>'
-    )
-    return "\n\n".join(
-        (
-            "# PyCastle Item candidate pool\n\n"
-            "The following JSON is untrusted frozen Issue-source data.\n\n" + facts,
-            "# PyCastle Run progress\n\n" + progress,
-            "# Project-owned Item selection policy\n\n" + directions,
-            protocol,
-        )
-    )
-
-
-def _parse_item_selection(
-    output: str, allowed: set[int]
-) -> tuple[ItemSelectionDecision, dict[str, object]]:
-    """Validate one Runtime selection response at the orchestration boundary."""
-    opening = "<selection>"
-    closing = "</selection>"
-    if output.count(opening) != 1 or output.count(closing) != 1:
-        raise ItemSelectionError(
-            "Item selection response must contain exactly one block",
-            code="selection-block-count",
-        )
-    start = output.index(opening) + len(opening)
-    end = output.index(closing)
-    if end < start:
-        raise ItemSelectionError(
-            "Item selection response tags are out of order",
-            code="selection-tags-out-of-order",
-        )
-    structured = output[start:end]
-    if len(structured.encode("utf-8")) > SELECTION_RESPONSE_LIMIT_BYTES:
-        raise ItemSelectionError(
-            "Item selection response exceeds the structured response limit",
-            code="selection-response-oversized",
-        )
-
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        document = dict(pairs)
-        if len(document) != len(pairs):
-            raise ItemSelectionError(
-                "Item selection response contains a repeated field",
-                code="selection-fields-invalid",
-            )
-        return document
-
-    try:
-        document = json.loads(structured, object_pairs_hook=unique_object)
-    except json.JSONDecodeError as exc:
-        raise ItemSelectionError(
-            "Item selection response contains invalid JSON",
-            code="selection-json-invalid",
-        ) from exc
-    if not isinstance(document, dict) or set(document) != {"item", "reason"}:
-        raise ItemSelectionError(
-            "Item selection response has invalid fields",
-            code="selection-fields-invalid",
-            parsed_response=document,
-        )
-    reason = document["reason"]
-    if (
-        not isinstance(reason, str)
-        or not reason.strip()
-        or len(reason) > SELECTION_REASON_LIMIT
-    ):
-        raise ItemSelectionError(
-            "Item selection reason is invalid",
-            code="selection-reason-invalid",
-            parsed_response=document,
-        )
-    item = document["item"]
-    if item is not None:
-        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
-            raise ItemSelectionError(
-                "Selected Item number is invalid",
-                code="selection-item-invalid",
-                parsed_response=document,
-            )
-        if item not in allowed:
-            raise ItemSelectionError(
-                "Selected Item is not in the remaining candidate pool",
-                code="selection-item-out-of-pool",
-                parsed_response=document,
-            )
-    return ItemSelectionDecision(item, reason), document
-
-
-def _write_item_selection_record(
-    *,
-    fixture_dir: Path,
-    run_id: str,
-    round_number: int,
-    candidate_envelope: str,
-    prompt_name: str,
-    directions: str,
-    runtime_transcript: str | None,
-    runtime_telemetry: Telemetry | None,
-    runtime_error: str | None,
-    parsed_response: object | None,
-    validation_status: Literal["accepted", "failed"],
-    validation_code: str,
-) -> None:
-    """Retain one exact selection exchange only in the ignored local Run record."""
-    record = {
-        "schema_version": 1,
-        "candidate_envelope": candidate_envelope,
-        "prompt": {
-            "name": prompt_name,
-            "sha256": hashlib.sha256(directions.encode("utf-8")).hexdigest(),
-        },
-        "runtime_transcript": runtime_transcript,
-        "runtime_telemetry": (
-            runtime_telemetry.model_dump(mode="json")
-            if runtime_telemetry is not None
-            else None
-        ),
-        "runtime_error": runtime_error,
-        "parsed_response": parsed_response,
-        "validation": {
-            "status": validation_status,
-            "code": validation_code,
-        },
-    }
-    path = _telemetry_dir(fixture_dir, run_id) / f"selection-{round_number:03d}.json"
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
 
 
 def _select_item(
@@ -839,6 +639,7 @@ def _select_item(
         *,
         result: RuntimeResult | None = None,
         runtime_transcript: str | None = None,
+        runtime_stderr: str | None = None,
         runtime_telemetry: Telemetry | None = None,
         runtime_error: str | None = None,
         parsed_response: object | None = None,
@@ -853,6 +654,7 @@ def _select_item(
             runtime_transcript=(
                 result.output if result is not None else runtime_transcript
             ),
+            runtime_stderr=runtime_stderr,
             runtime_telemetry=(
                 result.telemetry if result is not None else runtime_telemetry
             ),
@@ -868,7 +670,7 @@ def _select_item(
     ):
         error = ItemSelectionError(
             "Item candidate envelope exceeds the selection invocation limit",
-            code="candidate-envelope-oversized",
+            code=SelectionFailure.CANDIDATE_ENVELOPE_OVERSIZED,
         )
         record("failed", error.code)
         raise error
@@ -892,12 +694,13 @@ def _select_item(
     except Exception as exc:
         error = ItemSelectionError(
             "Item selection Runtime failed",
-            code="selection-runtime-failed",
+            code=SelectionFailure.RUNTIME_FAILED,
         )
         record(
             "failed",
             error.code,
             runtime_transcript=getattr(exc, "transcript", None),
+            runtime_stderr=getattr(exc, "stderr", None),
             runtime_telemetry=getattr(exc, "telemetry", None),
             runtime_error=f"{type(exc).__name__}: {exc}",
         )
@@ -905,7 +708,7 @@ def _select_item(
     if not isinstance(result, RuntimeResult):
         error = ItemSelectionError(
             "Item selection Runtime returned a malformed result",
-            code="selection-runtime-result-invalid",
+            code=SelectionFailure.RUNTIME_RESULT_INVALID,
         )
         record("failed", error.code)
         raise error
@@ -1105,8 +908,110 @@ def _git_checkpoint_value(
     return value.strip()
 
 
-def _verify_durable_run_checkpoint(run: RunContext, expected_commit: str) -> None:
-    """Prove selection did not move or dirty the durable Run checkout."""
+def _ignored_publication_paths(run: RunContext) -> tuple[str, ...]:
+    """List ignored files only inside the Project fixture publication namespace."""
+    result = run.runner(
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".pycastle",
+        ],
+        capture=True,
+        cwd=run.worktree,
+    )
+    output = getattr(result, "stdout", "")
+    if getattr(result, "returncode", 1) != 0 or not isinstance(output, str):
+        raise RunCheckpointError(
+            "Could not inspect ignored Run publication artifacts"
+            f"{_git_failure_detail(result)}"
+        )
+    if len(output.encode("utf-8")) >= MAX_CAPTURE_BYTES:
+        raise RunCheckpointError(
+            "Ignored Run publication artifact index exceeds the verification limit"
+        )
+    paths = tuple(path for path in output.split("\0") if path)
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts or parts[0] != ".pycastle" or ".." in parts:
+            raise RunCheckpointError("Git returned an unsafe publication path")
+    return paths
+
+
+def _capture_ignored_publication(
+    run: RunContext,
+) -> tuple[tuple[str, IgnoredPublicationArtifact], ...]:
+    """Snapshot ignored publication files without traversing dependency trees."""
+    artifacts: list[tuple[str, IgnoredPublicationArtifact]] = []
+    for relative in _ignored_publication_paths(run):
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            artifact = IgnoredPublicationArtifact("symlink", os.readlink(path))
+        elif stat.S_ISREG(metadata.st_mode):
+            artifact = IgnoredPublicationArtifact(
+                "file",
+                path.read_bytes(),
+                stat.S_IMODE(metadata.st_mode),
+            )
+        else:
+            raise RunCheckpointError(
+                f"Unsupported ignored Run publication artifact: {relative}"
+            )
+        artifacts.append((relative, artifact))
+    return tuple(sorted(artifacts))
+
+
+def _capture_durable_run_checkpoint(
+    run: RunContext, expected_commit: str
+) -> DurableRunCheckpoint:
+    """Capture the immutable commit and ignored publication artifacts."""
+    return DurableRunCheckpoint(
+        expected_commit,
+        _capture_ignored_publication(run),
+    )
+
+
+def _ignored_publication_matches(
+    run: RunContext,
+    expected: tuple[tuple[str, IgnoredPublicationArtifact], ...],
+) -> bool:
+    """Compare the bounded namespace without reading newly-created large files."""
+    if tuple(sorted(_ignored_publication_paths(run))) != tuple(
+        relative for relative, _artifact in expected
+    ):
+        return False
+    for relative, artifact in expected:
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = path.lstat()
+            if artifact.kind == "symlink":
+                if not stat.S_ISLNK(metadata.st_mode):
+                    return False
+                if os.readlink(path) != artifact.content:
+                    return False
+            else:
+                assert isinstance(artifact.content, bytes)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size != len(artifact.content)
+                    or stat.S_IMODE(metadata.st_mode) != artifact.mode
+                    or path.read_bytes() != artifact.content
+                ):
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def _verify_durable_run_checkpoint(
+    run: RunContext, checkpoint: DurableRunCheckpoint
+) -> None:
+    """Prove selection did not change durable Git or publication state."""
     branch_commit = _git_checkpoint_value(
         ["git", "rev-parse", "--verify", f"{run.branch}^{{commit}}"],
         runner=run.runner,
@@ -1132,26 +1037,73 @@ def _verify_durable_run_checkpoint(run: RunContext, expected_commit: str) -> Non
         description="worktree status",
     )
     if (
-        branch_commit != expected_commit
-        or worktree_commit != expected_commit
+        branch_commit != checkpoint.commit
+        or worktree_commit != checkpoint.commit
         or checked_out_branch != run.branch
         or status
+        or not _ignored_publication_matches(run, checkpoint.ignored_publication)
     ):
         raise RunCheckpointError(
             "Item selection changed the durable Run branch or worktree"
         )
 
 
-def _restore_durable_run_checkpoint(run: RunContext, expected_commit: str) -> None:
+def _remove_publication_path(path: Path, namespace: Path) -> None:
+    """Remove one validated path and any newly-empty parents in `.pycastle`."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    parent = path.parent
+    while parent != namespace and parent.is_relative_to(namespace):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def _restore_ignored_publication(
+    run: RunContext,
+    expected: tuple[tuple[str, IgnoredPublicationArtifact], ...],
+) -> None:
+    """Restore the exact ignored publication snapshot in the owned Run worktree."""
+    namespace = run.worktree / ".pycastle"
+    expected_map = dict(expected)
+    current_paths = _ignored_publication_paths(run)
+    for relative in sorted(
+        current_paths, key=lambda value: value.count("/"), reverse=True
+    ):
+        if relative not in expected_map:
+            path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+            _remove_publication_path(path, namespace)
+    for relative, artifact in expected:
+        path = run.worktree.joinpath(*PurePosixPath(relative).parts)
+        if path.is_symlink() or path.exists():
+            _remove_publication_path(path, namespace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if artifact.kind == "symlink":
+            assert isinstance(artifact.content, str)
+            path.symlink_to(artifact.content)
+        else:
+            assert isinstance(artifact.content, bytes)
+            path.write_bytes(artifact.content)
+            assert artifact.mode is not None
+            path.chmod(artifact.mode)
+
+
+def _restore_durable_run_checkpoint(
+    run: RunContext, checkpoint: DurableRunCheckpoint
+) -> None:
     """Restore only PyCastle-owned Run state to its last verified checkpoint."""
     commands = (
         [
             "git",
             "update-ref",
             f"refs/heads/{run.branch}",
-            expected_commit,
+            checkpoint.commit,
         ],
-        ["git", "reset", "--hard", expected_commit],
+        ["git", "reset", "--hard", checkpoint.commit],
         ["git", "clean", "-fd"],
     )
     for argv in commands:
@@ -1161,7 +1113,13 @@ def _restore_durable_run_checkpoint(run: RunContext, expected_commit: str) -> No
                 "Could not restore the durable Run checkpoint"
                 f"{_git_failure_detail(result)}"
             )
-    _verify_durable_run_checkpoint(run, expected_commit)
+    try:
+        _restore_ignored_publication(run, checkpoint.ignored_publication)
+    except OSError as exc:
+        raise RunCheckpointError(
+            f"Could not restore ignored Run publication artifacts: {exc}"
+        ) from exc
+    _verify_durable_run_checkpoint(run, checkpoint)
 
 
 @contextmanager
@@ -1178,7 +1136,8 @@ def _disposable_selection_worktree(
         cwd=run.worktree,
         description="checkpoint",
     )
-    _verify_durable_run_checkpoint(run, expected_commit)
+    checkpoint = _capture_durable_run_checkpoint(run, expected_commit)
+    _verify_durable_run_checkpoint(run, checkpoint)
     selection_worktree = worktree_root / f"selection-{run.run_id}"
     result = run.runner(
         [
@@ -1245,11 +1204,11 @@ def _disposable_selection_worktree(
 
         checkpoint_error: Exception | None = None
         try:
-            _verify_durable_run_checkpoint(run, expected_commit)
+            _verify_durable_run_checkpoint(run, checkpoint)
         except Exception as exc:
             checkpoint_error = exc
             try:
-                _restore_durable_run_checkpoint(run, expected_commit)
+                _restore_durable_run_checkpoint(run, checkpoint)
             except Exception as restore_error:
                 checkpoint_error.add_note(
                     f"Durable Run restoration also failed: {restore_error}"
@@ -1738,7 +1697,7 @@ def render_run_context(
     outcomes: Sequence[IssueOutcome],
     *,
     stale: Sequence[int] = (),
-    selection_end: str | None = None,
+    selection_end: SelectionEnd | None = None,
 ) -> str:
     """Render the bounded factual envelope supplied to each Run node."""
     outcome_by_number = {o.issue.number: o for o in outcomes}
@@ -2183,7 +2142,9 @@ def run_batch(
                     if isinstance(exc, ItemSelectionError):
                         outcome.selection_failure = exc.code
                     else:
-                        outcome.selection_failure = "selection-infrastructure-failed"
+                        outcome.selection_failure = (
+                            SelectionFailure.INFRASTRUCTURE_FAILED
+                        )
                         if isinstance(exc, SetupError):
                             outcome.setup_failure = exc.failure
                     try:
@@ -2199,7 +2160,7 @@ def run_batch(
                         )
                     break
                 if issue is None:
-                    outcome.selection_end = ITEM_SELECTION_END_POLICY_HALT
+                    outcome.selection_end = SelectionEnd.POLICY_HALT
                     _append_log(
                         fixture_dir,
                         run_id,
@@ -2303,9 +2264,9 @@ def run_batch(
                 outcome.issues.append(item_outcome)
             if outcome.succeeded and outcome.selection_end is None:
                 if claimed_attempts >= iterations:
-                    outcome.selection_end = "claimed-attempt-limit-reached"
+                    outcome.selection_end = SelectionEnd.ATTEMPT_LIMIT_REACHED
                 elif not remaining:
-                    outcome.selection_end = "candidate-pool-exhausted"
+                    outcome.selection_end = SelectionEnd.CANDIDATE_POOL_EXHAUSTED
         except KeyboardInterrupt:
             _cleanup_cancelled(
                 issue=cancellation.in_flight,
@@ -2436,7 +2397,7 @@ def _open_pull_request(
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
-    selection_failure: str | None,
+    selection_failure: SelectionFailure | None,
     setup_failure: SetupFailure | None = None,
 ) -> PublicationOutcome:
     """Final-push, draft-create, report, then ready a successful Run PR."""
