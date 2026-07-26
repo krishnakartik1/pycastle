@@ -809,6 +809,280 @@ def test_project_policy_orders_items_until_claimed_attempt_capacity(
     )
 
 
+def _run_policy_halt_from_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    after_integration: bool,
+) -> tuple[
+    int,
+    MagicMock,
+    list[list[str]],
+    list[RunOutcome],
+    list[str],
+    list[str],
+    Path,
+]:
+    """Run the complete CLI policy-halt journey against a temporary Git repo."""
+    fixture = tmp_path / ".pycastle"
+    prompts = fixture / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "select.md").write_text("Choose an actionable Item or stop.")
+    (prompts / "work.md").write_text("Implement this selected Item.")
+    (prompts / "summarize.md").write_text("Summarize the bounded Run outcomes.")
+    (fixture / "main.py").write_text(
+        "from pycastle.graph import (build_item,build_run,execution_graph,"
+        "gate_node,runtime_node,runtime_selection)\n"
+        "run=build_run("
+        "item=build_item("
+        "selection=runtime_selection('select.md'),"
+        "graph=execution_graph(start='work',nodes=["
+        "runtime_node('work','work.md',on_success='verify'),"
+        "gate_node('verify')])),"
+        "after=execution_graph(start='summarize',nodes=["
+        "runtime_node('summarize','summarize.md',on_success='verify-run'),"
+        "gate_node('verify-run')])"
+        ")\n"
+    )
+    timeline = tmp_path / "timeline"
+    setup = fixture / "setup"
+    setup.write_text(
+        f"#!/bin/sh\nprintf 'setup:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    setup.chmod(0o755)
+    gate = fixture / "gate"
+    gate.write_text(
+        f"#!/bin/sh\nprintf 'gate:%s\\n' \"$PYCASTLE_SCOPE\" >> '{timeline}'\n"
+    )
+    gate.chmod(0o755)
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "PyCastle Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=tmp_path, check=True)
+
+    candidates = tuple(
+        IssueRef(
+            number=number,
+            title=title,
+            body=f"Private body for Item {number}.",
+            labels=["ready-for-agent"],
+            assignees=["krishna"],
+        )
+        for number, title in ((1, "Untouched candidate"), (3, "Selected foundation"))
+    )
+    configuration = ReadinessConfiguration(
+        repository="owner/repo",
+        base_branch="main",
+        github_default_branch="main",
+        runtime="stub",
+        sandbox="host",
+        agent_image=None,
+        assignee="krishna",
+        include_unassigned=False,
+        item_limit=2,
+    )
+    frozen = FrozenReadinessInputs(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(),
+        readiness._freeze_project_fixture(fixture, load_run(fixture)),
+        tuple(candidate.model_copy(deep=True) for candidate in candidates),
+        configuration.sandbox,
+        configuration.runtime,
+        configuration.agent_image,
+    )
+    report = ReadinessReport(
+        schema_version=1,
+        outcome=ReadinessOutcome.READY,
+        runner_version="0.1.0",
+        configuration=configuration,
+        checks=tuple(
+            ReadinessCheck(check_id, Status.PASS, "ready") for check_id in CHECK_IDS
+        ),
+        eligible_items=tuple(
+            EligibleItem(candidate.number, candidate.title) for candidate in candidates
+        ),
+        selected_items=frozen.items,
+        frozen_inputs=frozen,
+    )
+
+    process_calls: list[list[str]] = []
+
+    def runner(
+        argv: list[str], *, capture: bool = False, cwd: Path | None = None, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_calls.append(argv)
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, "42\n", "")
+        if argv[:2] == ["gh", "api"] and "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == "gh":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=capture, text=True, check=False
+        )
+
+    selection_prompts: list[str] = []
+    after_prompts: list[str] = []
+    choices = iter((3, None) if after_integration else (None,))
+
+    class Runtime(StubRuntime):
+        def run(self, prompt: str, *, cwd: Path, node: str):
+            if node == "item-selection":
+                selection_prompts.append(prompt)
+                choice = next(choices)
+                item = "null" if choice is None else str(choice)
+                return RuntimeResult(
+                    output=(
+                        f'<selection>{{"item": {item}, "reason": '
+                        '"private model-authored halt reason"}</selection>'
+                    ),
+                    telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+                )
+            result = super().run(prompt, cwd=cwd, node=node)
+            if node == "work":
+                (cwd / "integrated.txt").write_text("done\n")
+            elif node == "summarize":
+                after_prompts.append(prompt)
+                assert (cwd / "integrated.txt").is_file()
+            return result
+
+    source = MagicMock()
+    source.is_still_eligible.return_value = True
+    outcomes: list[RunOutcome] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
+    monkeypatch.setattr(cli, "_make_run_id", lambda: "policy-halt-176")
+    monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
+    monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
+    original_run_loop = cli.run_loop
+
+    def run_from_cli(**kwargs: object) -> RunOutcome:
+        outcome = original_run_loop(**kwargs, runner=runner)  # type: ignore[arg-type]
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cli, "run_loop", run_from_cli)
+    exit_code = main(
+        ["run", "--sandbox", "host", "--runtime", "stub", "--iterations", "2"]
+    )
+    return (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        timeline,
+    )
+
+
+def test_project_policy_halts_before_integration_without_mutation_or_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        timeline,
+    ) = _run_policy_halt_from_cli(monkeypatch, tmp_path, after_integration=False)
+
+    assert exit_code == 0
+    assert outcomes[0].selection_end == "project-policy-halted"
+    assert outcomes[0].selected == []
+    assert outcomes[0].completed == []
+    assert outcomes[0].pr_opened is False
+    assert len(selection_prompts) == 1
+    assert after_prompts == []
+    assert source.method_calls == []
+    assert not any(call[0] == "gh" for call in process_calls)
+    assert not (tmp_path / ".pycastle/worktrees/run-policy-halt-176").exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "pycastle/run-policy-halt-176"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branches.stdout == ""
+    assert timeline.read_text().splitlines() == ["setup:run"]
+    assert "Project policy halted Item selection." in caplog.text
+    assert "private model-authored halt reason" not in caplog.text
+
+
+def test_project_policy_halts_after_integration_then_publishes_normally(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        timeline,
+    ) = _run_policy_halt_from_cli(monkeypatch, tmp_path, after_integration=True)
+
+    assert exit_code == 0
+    assert outcomes[0].selection_end == "project-policy-halted"
+    assert outcomes[0].selected == [3]
+    assert outcomes[0].attempted == [3]
+    assert outcomes[0].completed == [3]
+    assert outcomes[0].pr_opened is True
+    assert outcomes[0].pr_ready is True
+    assert len(selection_prompts) == 2
+    assert '"number": 1' in selection_prompts[1]
+    assert '"number": 3' not in selection_prompts[1]
+    assert len(after_prompts) == 1
+    assert "#1: Untouched candidate [not-selected]" in after_prompts[0]
+    assert "#3: Selected foundation [completed]" in after_prompts[0]
+    assert "Ended: project-policy-halted" in after_prompts[0]
+    assert "private model-authored halt reason" not in after_prompts[0]
+    source.is_still_eligible.assert_called_once_with(
+        outcomes[0].issues[0].issue,
+        assignee="krishna",
+        include_unassigned=False,
+    )
+    source.claim.assert_called_once_with(3, assignee="krishna")
+    assert not any(1 in call.args for call in source.method_calls)
+    assert timeline.read_text().splitlines().count("gate:item") == 1
+    assert timeline.read_text().splitlines().count("gate:run") == 1
+    assert any(
+        call[:3] == ["gh", "pr", "create"] and "--draft" in call
+        for call in process_calls
+    )
+    assert any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+    assert "Project policy halted Item selection." in caplog.text
+    assert "private model-authored halt reason" not in caplog.text
+    assert all(
+        "private model-authored halt reason" not in argument
+        for call in process_calls
+        for argument in call
+    )
+
+
 def _run_cycle_from_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, repair: bool
 ) -> tuple[int, MagicMock, list[list[str]], list[RunOutcome], list[str]]:

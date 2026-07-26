@@ -16,6 +16,7 @@ from .commands import run_cmd
 from .compatibility import FixtureCompatibilityError
 from .issues import GitHubIssueSource
 from .orchestrator import (
+    ITEM_SELECTION_END_POLICY_HALT,
     PruneError,
     prune_run_branches,
 )
@@ -423,7 +424,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         frozen_inputs=report.frozen_inputs,
     )
     if not outcome.selected:
-        logger.info("Nothing to do.")
+        if outcome.selection_end == ITEM_SELECTION_END_POLICY_HALT:
+            logger.info("Project policy halted Item selection.")
+        else:
+            logger.info("Nothing to do.")
         return 0
     logger.info(
         "Run %s worked %d issue(s), merged %s; PR opened: %s",

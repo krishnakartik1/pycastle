@@ -541,6 +541,7 @@ def render_issue_context(issue: IssueRef) -> str:
 
 ITEM_SELECTION_NODE = "item-selection"
 SELECTION_REASON_LIMIT = 4_096
+ITEM_SELECTION_END_POLICY_HALT = "project-policy-halted"
 
 
 def render_item_selection_prompt(
@@ -1688,6 +1689,12 @@ def run_batch(
                     stale=outcome.stale,
                 )
                 if issue is None:
+                    outcome.selection_end = ITEM_SELECTION_END_POLICY_HALT
+                    _append_log(
+                        fixture_dir,
+                        run_id,
+                        "Project policy halted Item selection.",
+                    )
                     break
                 remaining.remove(issue)
                 outcome.selected.append(issue.number)
@@ -1776,7 +1783,7 @@ def run_batch(
                     _append_log(fixture_dir, run_id, outcome.stopping_point)
                     break
                 outcome.issues.append(item_outcome)
-            if outcome.succeeded:
+            if outcome.succeeded and outcome.selection_end is None:
                 if claimed_attempts >= iterations:
                     outcome.selection_end = "claimed-attempt-limit-reached"
                 elif not remaining:
@@ -1892,6 +1899,8 @@ def run_batch(
         _append_log(fixture_dir, run_id, "No issues merged; opening no pull request.")
 
     cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
+    if not completed and outcome.selection_end == ITEM_SELECTION_END_POLICY_HALT:
+        delete_local_branch(run_branch, runner=runner, cwd=workspace)
     return outcome
 
 
