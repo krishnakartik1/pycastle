@@ -103,6 +103,14 @@ class WorktreeError(RuntimeError):
     """
 
 
+class SelectionWorktreeCleanupError(WorktreeError):
+    """Selection cleanup failed after PyCastle captured a durable checkpoint."""
+
+    def __init__(self, message: str, *, expected_commit: str) -> None:
+        super().__init__(message)
+        self.expected_commit = expected_commit
+
+
 class BranchError(RuntimeError):
     """A prerequisite ``git branch`` exited non-zero.
 
@@ -461,6 +469,7 @@ class RunOutcome:
     issues: list[IssueOutcome] = field(default_factory=list)
     selection_end: str | None = None
     selection_failure: str | None = None
+    selection_failure_checkpoint: str | None = None
     pr_opened: bool = False
     pr_ready: bool = False
     succeeded: bool = True
@@ -1188,37 +1197,72 @@ def _disposable_selection_worktree(
             f"git worktree add failed for Item selection at "
             f"{selection_worktree}{_git_failure_detail(result)}"
         )
+    body_failed = True
     try:
         yield selection_worktree
+        body_failed = False
     finally:
-        remove = run.runner(
-            ["git", "worktree", "remove", str(selection_worktree), "--force"],
-            capture=True,
-            cwd=workspace,
-        )
-        prune = run.runner(
-            ["git", "worktree", "prune"],
-            capture=True,
-            cwd=workspace,
-        )
-        if (
+        # From this point onward, a failure may publish integrated work. Keep
+        # its immutable source before either cleanup command can fail.
+        run.selection_failure_checkpoint = expected_commit
+        cleanup_error: SelectionWorktreeCleanupError | None = None
+        remove: Any | None = None
+        prune: Any | None = None
+        try:
+            remove = run.runner(
+                ["git", "worktree", "remove", str(selection_worktree), "--force"],
+                capture=True,
+                cwd=workspace,
+            )
+        except Exception as exc:
+            cleanup_error = SelectionWorktreeCleanupError(
+                "Could not remove the disposable Item selection worktree" f": {exc}",
+                expected_commit=expected_commit,
+            )
+        try:
+            prune = run.runner(
+                ["git", "worktree", "prune"],
+                capture=True,
+                cwd=workspace,
+            )
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = SelectionWorktreeCleanupError(
+                    "Could not remove the disposable Item selection worktree"
+                    f": {exc}",
+                    expected_commit=expected_commit,
+                )
+        if cleanup_error is None and (
             getattr(remove, "returncode", 1) != 0
             or getattr(prune, "returncode", 1) != 0
             or selection_worktree.exists()
         ):
-            raise WorktreeError(
+            cleanup_error = SelectionWorktreeCleanupError(
                 "Could not remove the disposable Item selection worktree"
-                f"{_git_failure_detail(remove) or _git_failure_detail(prune)}"
+                f"{_git_failure_detail(remove) or _git_failure_detail(prune)}",
+                expected_commit=expected_commit,
             )
+
+        checkpoint_error: Exception | None = None
         try:
             _verify_durable_run_checkpoint(run, expected_commit)
-        except RunCheckpointError:
-            # Keep an immutable publication source even if restoring the local
-            # Run worktree fails. The final push must not trust a ref changed by
-            # selection.
-            run.selection_failure_checkpoint = expected_commit
-            _restore_durable_run_checkpoint(run, expected_commit)
-            raise
+        except Exception as exc:
+            checkpoint_error = exc
+            try:
+                _restore_durable_run_checkpoint(run, expected_commit)
+            except Exception as restore_error:
+                checkpoint_error.add_note(
+                    f"Durable Run restoration also failed: {restore_error}"
+                )
+
+        if cleanup_error is not None:
+            if checkpoint_error is not None:
+                cleanup_error.add_note(str(checkpoint_error))
+            raise cleanup_error
+        if checkpoint_error is not None:
+            raise checkpoint_error
+        if not body_failed:
+            run.selection_failure_checkpoint = None
 
 
 def delete_local_branch(branch: str, *, runner: Runner, cwd: Path) -> None:
@@ -2133,6 +2177,9 @@ def run_batch(
                 except Exception as exc:
                     outcome.succeeded = False
                     outcome.stopping_point = "Item selection"
+                    outcome.selection_failure_checkpoint = (
+                        run.selection_failure_checkpoint
+                    )
                     if isinstance(exc, ItemSelectionError):
                         outcome.selection_failure = exc.code
                     else:
