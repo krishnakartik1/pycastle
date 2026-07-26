@@ -456,6 +456,7 @@ class RunOutcome:
     stale: list[int] = field(default_factory=list)
     issues: list[IssueOutcome] = field(default_factory=list)
     selection_end: str | None = None
+    selection_failure: str | None = None
     pr_opened: bool = False
     pr_ready: bool = False
     succeeded: bool = True
@@ -2011,16 +2012,17 @@ def run_batch(
                             attempted=outcome.attempted,
                             stale=outcome.stale,
                         )
-                except ItemSelectionError:
-                    if outcome.completed:
-                        raise
+                except ItemSelectionError as exc:
                     outcome.succeeded = False
                     outcome.stopping_point = "Item selection"
+                    outcome.selection_failure = exc.code
                     _append_log(
                         fixture_dir,
                         run_id,
                         "Item selection failed; details retained in local Run records.",
                     )
+                    if outcome.completed:
+                        break
                     cleanup_worktree(run_worktree, runner=runner, cwd=workspace)
                     _delete_failed_run_branch(run, workspace=workspace)
                     return outcome
@@ -2135,7 +2137,7 @@ def run_batch(
     if completed:
         run_gate: GateOutcome | None = None
         publication_error: str | None = None
-        suppress_report_harvest = False
+        suppress_report_harvest = outcome.selection_failure is not None
         try:
             with _sigint_as_keyboard_interrupt():
                 if outcome.succeeded:
@@ -2205,13 +2207,14 @@ def run_batch(
             base_branch=base_branch,
             run=run,
             completed=completed,
-            selected=selected,
+            selected=outcome.selected,
             skipped=outcome.skipped,
             gate=run_gate,
             report=report,
             publication_error=publication_error,
             successful=outcome.succeeded,
             stopping_point=outcome.stopping_point,
+            selection_failure=outcome.selection_failure,
             setup_failure=outcome.setup_failure,
         )
         outcome.pr_opened = publication.pr_opened
@@ -2243,13 +2246,14 @@ def _open_pull_request(
     base_branch: str,
     run: RunContext,
     completed: list[int],
-    selected: Sequence[IssueRef],
+    selected: Sequence[int],
     skipped: list[int],
     gate: GateOutcome | None,
     report: str | None,
     publication_error: str | None,
     successful: bool,
     stopping_point: str | None,
+    selection_failure: str | None,
     setup_failure: SetupFailure | None = None,
 ) -> PublicationOutcome:
     """Final-push, draft-create, report, then ready a successful Run PR."""
@@ -2399,18 +2403,19 @@ def _open_pull_request(
             f"`{gate.command}` — {'PASS' if gate.passed else 'FAIL'} "
             f"({result}, {gate.duration_seconds:.2f}s)"
         )
-    selected_numbers = [issue.number for issue in selected]
     marker = f"<!-- pycastle-run-report:{run.run_id} -->"
     comment = (
         f"{marker}\n## PyCastle Run {run.run_id}\n\n"
         f"- State: **{state}**\n"
-        f"- Selected Items: {', '.join(f'#{n}' for n in selected_numbers) or 'none'}\n"
+        f"- Selected Items: {', '.join(f'#{n}' for n in selected) or 'none'}\n"
         f"- Completed Items: {', '.join(f'#{n}' for n in completed) or 'none'}\n"
         f"- Skipped Items: {', '.join(f'#{n}' for n in skipped) or 'none'}\n"
         f"- Run Gate: {gate_line}\n"
     )
     if stopping_point:
         comment += f"- Stopping point: {stopping_point}\n"
+    if selection_failure:
+        comment += f"- Item selection failure: `{selection_failure}`\n"
     if setup_failure is not None:
         termination = setup_failure.termination
         kind = termination.get("kind")

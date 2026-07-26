@@ -1269,6 +1269,7 @@ def _run_policy_halt_from_cli(
     tmp_path: Path,
     *,
     after_integration: bool,
+    fail_after_integration: bool = False,
 ) -> tuple[
     int,
     MagicMock,
@@ -1285,6 +1286,7 @@ def _run_policy_halt_from_cli(
     (prompts / "select.md").write_text("Choose an actionable Item or stop.")
     (prompts / "work.md").write_text("Implement this selected Item.")
     (prompts / "summarize.md").write_text("Summarize the bounded Run outcomes.")
+    (fixture / ".gitignore").write_text("/runs/\n")
     (fixture / "main.py").write_text(
         "from pycastle.graph import (build_item,build_run,execution_graph,"
         "gate_node,runtime_node,runtime_selection)\n"
@@ -1393,11 +1395,19 @@ def _run_policy_halt_from_cli(
     selection_prompts: list[str] = []
     after_prompts: list[str] = []
     choices = iter((3, None) if after_integration else (None,))
+    selection_round = 0
 
     class Runtime(StubRuntime):
         def run(self, prompt: str, *, cwd: Path, node: str):
+            nonlocal selection_round
             if node == "item-selection":
                 selection_prompts.append(prompt)
+                selection_round += 1
+                if fail_after_integration and selection_round == 2:
+                    return RuntimeResult(
+                        output="private transcript without a selection response",
+                        telemetry=Telemetry(runtime=self.name, node=node, num_turns=1),
+                    )
                 choice = next(choices)
                 item = "null" if choice is None else str(choice)
                 return RuntimeResult(
@@ -1418,9 +1428,12 @@ def _run_policy_halt_from_cli(
     source = MagicMock()
     source.is_still_eligible.return_value = True
     outcomes: list[RunOutcome] = []
+    run_id = (
+        "later-selection-failure-179" if fail_after_integration else "policy-halt-176"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_evaluate_cli_readiness", lambda _args: report)
-    monkeypatch.setattr(cli, "_make_run_id", lambda: "policy-halt-176")
+    monkeypatch.setattr(cli, "_make_run_id", lambda: run_id)
     monkeypatch.setattr(cli, "_build_runtime", lambda *_args, **_kwargs: Runtime())
     monkeypatch.setattr(cli, "GitHubIssueSource", lambda _repo: source)
     original_run_loop = cli.run_loop
@@ -1535,6 +1548,107 @@ def test_project_policy_halts_after_integration_then_publishes_normally(
         "private model-authored halt reason" not in argument
         for call in process_calls
         for argument in call
+    )
+
+
+def test_later_selection_failure_preserves_completed_work_in_safe_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        exit_code,
+        source,
+        process_calls,
+        outcomes,
+        selection_prompts,
+        after_prompts,
+        timeline,
+    ) = _run_policy_halt_from_cli(
+        monkeypatch,
+        tmp_path,
+        after_integration=True,
+        fail_after_integration=True,
+    )
+
+    assert exit_code == 1
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.selected == [3]
+    assert outcome.attempted == [3]
+    assert outcome.completed == [3]
+    assert outcome.succeeded is False
+    assert outcome.stopping_point == "Item selection"
+    assert outcome.selection_failure == "selection-block-count"
+    assert outcome.pr_opened is True
+    assert outcome.pr_ready is False
+    assert len(selection_prompts) == 2
+    assert after_prompts == []
+    source.claim.assert_called_once_with(3, assignee="krishna")
+    assert timeline.read_text().splitlines().count("gate:item") == 1
+    assert timeline.read_text().splitlines().count("gate:run") == 0
+
+    create = next(call for call in process_calls if call[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create
+    assert not any(call[:3] == ["gh", "pr", "ready"] for call in process_calls)
+    comment = next(
+        call
+        for call in process_calls
+        if call[:2] == ["gh", "api"] and "--method" in call
+    )
+    comment_body = next(
+        argument.removeprefix("body=")
+        for argument in comment
+        if argument.startswith("body=")
+    )
+    published = create[create.index("--body") + 1] + comment_body
+    assert "Selected Items: #3" in published
+    assert "Completed Items: #3" in published
+    assert "Skipped Items: none" in published
+    assert "Item selection failure: `selection-block-count`" in published
+    assert "Run Gate: not run" in published
+    assert "#1" not in published
+    for private in (
+        "Untouched candidate",
+        "Private body for Item 1.",
+        "Choose an actionable Item or stop.",
+        "private model-authored halt reason",
+        "private transcript without a selection response",
+    ):
+        assert private not in published
+
+    record_path = (
+        tmp_path / ".pycastle/runs/later-selection-failure-179/selection-002.json"
+    )
+    record = json.loads(record_path.read_text())
+    assert "Private body for Item 1." in record["candidate_envelope"]
+    assert record["prompt"]["name"] == "select.md"
+    assert len(record["prompt"]["sha256"]) == 64
+    assert (
+        record["runtime_transcript"]
+        == "private transcript without a selection response"
+    )
+    assert record["validation"] == {
+        "status": "failed",
+        "code": "selection-block-count",
+    }
+    assert (
+        subprocess.run(
+            ["git", "check-ignore", str(record_path)],
+            cwd=tmp_path,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "show", "pycastle/run-later-selection-failure-179:integrated.txt"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == "done\n"
     )
 
 
